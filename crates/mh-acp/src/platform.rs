@@ -50,6 +50,180 @@ pub fn probe_executable(cmd: &str) -> Option<PathBuf> {
     }
 }
 
+/// Locates an AI harness CLI executable on `PATH` or standard per-OS user installation paths.
+pub fn find_cli_binary(name: &str) -> Option<PathBuf> {
+    if let Some(found) = probe_executable(name) {
+        return Some(found);
+    }
+
+    let mut candidates: Vec<PathBuf> = Vec::new();
+    #[cfg(windows)]
+    {
+        if let Some(local) = std::env::var_os("LOCALAPPDATA").map(PathBuf::from) {
+            if name.eq_ignore_ascii_case("codex") {
+                candidates.push(local.join("Programs/OpenAI/Codex/bin/codex.exe"));
+            } else if name.eq_ignore_ascii_case("claude") {
+                candidates.push(local.join("Programs/claude-code/claude.exe"));
+            } else if name.eq_ignore_ascii_case("agy") {
+                candidates.push(local.join("Programs/Antigravity/bin/agy.exe"));
+            }
+        }
+        if let Some(appdata) = std::env::var_os("APPDATA").map(PathBuf::from) {
+            candidates.push(appdata.join(format!("npm/{name}.cmd")));
+            candidates.push(appdata.join(format!("npm/{name}.exe")));
+        }
+        if let Some(home) = dirs::home_dir() {
+            candidates.push(home.join(format!(".local/bin/{name}.exe")));
+            candidates.push(home.join(format!(".claude/local/{name}.exe")));
+        }
+    }
+    #[cfg(not(windows))]
+    {
+        if let Some(home) = dirs::home_dir() {
+            candidates.push(home.join(format!(".local/bin/{name}")));
+            candidates.push(home.join(format!(".npm-global/bin/{name}")));
+            candidates.push(home.join(format!(".claude/local/{name}")));
+        }
+        candidates.push(PathBuf::from(format!("/opt/homebrew/bin/{name}")));
+        candidates.push(PathBuf::from(format!("/usr/local/bin/{name}")));
+        if name == "agy" {
+            candidates.push(PathBuf::from(
+                "/Applications/Antigravity.app/Contents/Resources/app/bin/agy",
+            ));
+        }
+    }
+
+    candidates
+        .into_iter()
+        .find(|p| p.is_file())
+        .map(|p| dunce::simplified(&p).to_path_buf())
+}
+
+/// Opens a native OS folder selection dialog on the local desktop machine.
+/// Returns `Ok(Some(path))` if selected, `Ok(None)` if the user cancelled, or
+/// `Err(...)` when no GUI dialog provider is available.
+pub async fn pick_folder_native() -> Result<Option<PathBuf>, AcpError> {
+    #[cfg(windows)]
+    {
+        let script = r#"
+[Console]::OutputEncoding = [System.Text.Encoding]::UTF8
+Add-Type -AssemblyName System.Windows.Forms
+[System.Windows.Forms.Application]::EnableVisualStyles()
+$owner = New-Object System.Windows.Forms.Form
+$owner.TopMost = $true
+$owner.ShowInTaskbar = $false
+$owner.FormBorderStyle = [System.Windows.Forms.FormBorderStyle]::FixedToolWindow
+$owner.StartPosition = [System.Windows.Forms.FormStartPosition]::CenterScreen
+$owner.Opacity = 0
+$owner.Size = New-Object System.Drawing.Size(1, 1)
+$dlg = New-Object System.Windows.Forms.FolderBrowserDialog
+$dlg.Description = 'Select Project Folder for Meta-Harness'
+$dlg.UseDescriptionForTitle = $true
+$dlg.ShowNewFolderButton = $true
+$owner.Show()
+$res = $dlg.ShowDialog($owner)
+$owner.Dispose()
+if ($res -eq [System.Windows.Forms.DialogResult]::OK -and $dlg.SelectedPath) {
+    [Console]::Out.Write($dlg.SelectedPath)
+}
+"#;
+        let output = Command::new("powershell.exe")
+            .args([
+                "-NoProfile",
+                "-NonInteractive",
+                "-WindowStyle",
+                "Hidden",
+                "-STA",
+                "-Command",
+                script,
+            ])
+            .output()
+            .await?;
+        let chosen = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        if chosen.is_empty() {
+            Ok(None)
+        } else {
+            Ok(Some(PathBuf::from(chosen)))
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        let output = Command::new("osascript")
+            .args([
+                "-e",
+                r#"POSIX path of (choose folder with prompt "Select Project Folder for Meta-Harness")"#,
+            ])
+            .output()
+            .await?;
+        if !output.status.success() {
+            return Ok(None);
+        }
+        let chosen = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        if chosen.is_empty() {
+            Ok(None)
+        } else {
+            Ok(Some(PathBuf::from(chosen)))
+        }
+    }
+
+    #[cfg(all(unix, not(target_os = "macos")))]
+    {
+        let has_display = std::env::var_os("DISPLAY").is_some_and(|v| !v.is_empty())
+            || std::env::var_os("WAYLAND_DISPLAY").is_some_and(|v| !v.is_empty());
+        if !has_display {
+            return Err(AcpError::CommandNotFound(
+                "no X11/Wayland display available for native folder dialog".into(),
+            ));
+        }
+
+        if let Ok(bin) = which::which("zenity") {
+            let output = Command::new(bin)
+                .args([
+                    "--file-selection",
+                    "--directory",
+                    "--title=Select Project Folder for Meta-Harness",
+                ])
+                .output()
+                .await?;
+            let chosen = String::from_utf8_lossy(&output.stdout).trim().to_string();
+            return Ok(
+                (output.status.success() && !chosen.is_empty()).then(|| PathBuf::from(chosen))
+            );
+        }
+
+        if let Ok(bin) = which::which("kdialog") {
+            let output = Command::new(bin)
+                .args(["--getexistingdirectory", "."])
+                .output()
+                .await?;
+            let chosen = String::from_utf8_lossy(&output.stdout).trim().to_string();
+            return Ok(
+                (output.status.success() && !chosen.is_empty()).then(|| PathBuf::from(chosen))
+            );
+        }
+
+        if let Ok(bin) = which::which("yad") {
+            let output = Command::new(bin)
+                .args([
+                    "--file",
+                    "--directory",
+                    "--title=Select Project Folder for Meta-Harness",
+                ])
+                .output()
+                .await?;
+            let chosen = String::from_utf8_lossy(&output.stdout).trim().to_string();
+            return Ok(
+                (output.status.success() && !chosen.is_empty()).then(|| PathBuf::from(chosen))
+            );
+        }
+
+        Err(AcpError::CommandNotFound(
+            "zenity, kdialog, or yad is required for native folder selection".into(),
+        ))
+    }
+}
+
 /// Returns the user's preferred interactive shell `(program, args)` on Windows, macOS, and Linux.
 pub fn default_shell() -> (String, Vec<String>) {
     #[cfg(windows)]

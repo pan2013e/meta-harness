@@ -10,4 +10,4 @@ pub use dag::WaitForGraph;
 pub use domain::*;
 pub use error::CoreError;
 pub use mention::{ParsedMentionTarget, ParsedMentions, parse_mentions};
-pub use paths::{AppPaths, is_path_within, normalize_for_create, normalize_path};
+pub use paths::{AppPaths, expand_user_path, is_path_within, normalize_for_create, normalize_path};

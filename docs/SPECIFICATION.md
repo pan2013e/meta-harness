@@ -168,11 +168,13 @@ In addition to async group-chat handoffs (`chat_send_message`), an active harnes
 
 ### 5.1 Layered Subscription Usage Tracker (`mh-acp::quota`)
 Tracked per `HarnessAdapter` (so multiple personas of the same CLI share one quota pool):
-1. **Default Safe Local Telemetry (Always On)**:
-   - Reads local session/token logs (`~/.codex/sessions`, `~/.claude/projects`, `~/.gemini/`) + Meta-Harness turn accounting + cached non-LLM ACP status metadata, normalized against user-selected plan tiers (`Plus`, `Pro`, `Max 5x`, `Max 20x`, `AI Pro`, `AI Ultra`).
+1. **Default Live Provider Quota APIs (`exact_quota_probe_opt_in = true`)**:
+   - **Codex (`codex_local`)**: Queries `codex app-server --stdio` (`account/rateLimits/read`) via JSON-RPC, falling back to `GET https://chatgpt.com/backend-api/wham/usage` with local OAuth credentials from `~/.codex/auth.json`. Surfaces exact plan tier (`ProLite`, `Plus`, `Pro`, `Team`), 5h/weekly windows, and reset timestamps with a 5-minute TTL cache (plus post-turn invalidation & manual `POST /api/quotas/refresh`).
+   - **Claude Code (`claude_local`)**: Reads OAuth credentials from `~/.claude/.credentials.json` (or macOS Keychain) and queries `GET https://api.anthropic.com/api/oauth/usage` with 5-minute caching (10-minute backoff on HTTP 429).
+   - **Google / Antigravity (`google_local`)**: Verifies API keys via Generative Language API or reports local account connection status honestly (`QuotaSource::Unavailable` rather than fabricating `100%` when no public OAuth percentage API exists).
    - **Reactive `429` Circuit Breaker**: Immediately marks `rate_limited_until` upon rate-limit errors and triggers automatic Orchestrator failover.
-2. **Opt-In Exact Probes (`exact_quota_probe_opt_in = true`)**:
-   - Per-adapter user toggle enabling live account usage endpoint queries or localhost transparent rate-limit header inspection (`anthropic-ratelimit-*` / Codex usage status) where supported.
+2. **Manual Calibration & Offline Mode**:
+   - Users can disable live probes (`exact_probe_opt_in = false`) or supply manual calibration percentages; offline integration tests use deterministic `quota_provider = "manual"` accounting.
 
 ### 5.2 Orchestrator Decision Modes & Self-Brand Dispatch
 When an unmentioned user prompt arrives:
@@ -346,7 +348,7 @@ CREATE TABLE project_facts (
   - Automatically enforces Bearer/Cookie authentication using a cryptographically random access token printed to the terminal (plus a convenient pairing URL `http://<lan-or-tailscale-ip>:4410/?token=...` that exchanges for an `HttpOnly; SameSite=Strict` session cookie).
 
 ### 7.2 REST & Multiplexed WebSocket API
-- **Projects & Git Onboarding**: `GET/POST/DELETE /api/projects`, `POST /api/projects/:id/git-init`, `GET /api/fs/list`.
+- **Projects & Git Onboarding**: `GET/POST/DELETE /api/projects`, `POST /api/projects/:id/git-init`, `GET /api/fs/list`, `POST /api/fs/pick-folder` (localhost native OS folder chooser on Windows/macOS/Linux).
 - **Sessions & Personas**: `GET/POST /api/projects/:id/sessions`, `GET/PATCH/DELETE /api/sessions/:id`, `POST/PATCH/DELETE /api/sessions/:id/members` (add/configure `@codex-reviewer` personas, assign Orchestrator).
 - **Session Git Integration & Promotion**:
   - `GET /api/sessions/:id/diff` — Cumulative diff of `integration_branch` vs `base_branch` + per-member unmerged status.
@@ -355,18 +357,20 @@ CREATE TABLE project_facts (
 - **Chat, Permissions & Cancellation**:
   - `GET/POST /api/sessions/:id/messages`, `POST /api/sessions/:id/cancel` (Stop All <250ms), `POST /api/sessions/:id/permissions/:req_id` (`allow_once` | `allow_pattern_session` | `reject`).
 - **Trajectories, Memory & Quotas**:
-  - `GET /api/trajectories/:turn_id`, `GET/POST/PATCH/DELETE /api/projects/:id/memory/*`, `GET /api/adapters`, `GET /api/quotas`, `PATCH /api/adapters/:id/quota-config`.
+  - `GET /api/trajectories/:turn_id`, `GET/POST/PATCH/DELETE /api/projects/:id/memory/*`, `GET /api/adapters`, `GET /api/quotas`, `POST /api/quotas/refresh`, `PATCH /api/adapters/:id/quota`.
 - **WebSocket (`/api/ws?session_id=...`)**: Streams 25ms-coalesced deltas for parallel active turns (`chat.*`, `switch.dispatch_decided`, `switch.consult_updated`, `switch.activity_pill`, `git.branch_updated`, `git.conflict_escalated`, `permission.requested`, `quota.updated`, `memory.job_curated`).
 
 ### 7.3 Three-Column Responsive UI Layout (`web/`)
-1. **Left Rail**:
-   - Project switcher (with Git status badge), Session list, and **Member Roster** (`@codex`, `@claude`, `@antigravity`, `+ Add Persona`) showing live parallel work states, Orchestrator crown toggle, and shared adapter **5h / Weekly Quota Bars**.
+Supports four selectable themes (`Obsidian Studio`, `Tokyo Night`, `Catppuccin Mocha`, `Paper Daylight`) persisted in `localStorage`:
+1. **Collapsible Left Rail (`Ctrl+B`)**:
+   - Custom project dropdown & dual folder open (localhost native OS chooser + in-app directory browser supporting `~` & quoted paths), Session list, and **Member Roster** (`@codex`, `@claude`, `@antigravity`, `+ Add Persona`) showing `HarnessAvatar` status indicators, plan badges, Orchestrator crown toggle, and shared adapter **Live Quota Windows + Reset Countdowns**.
 2. **Center Canvas**:
-   - **Top Session Changes Bar**: Shows `mh/s-8f3a` ahead of `main` (`+142 / -31 · 5 files`), **[View Diff]**, **[Run/Preview in Session Worktree]**, and **[Promote ▾]** (`Fast-Forward / Merge`, `Squash Merge`, `Apply Patch`).
-   - **Virtualized Group Chat Stream**:
-     - Clean multi-agent messages, **Orchestrator Dispatch Cards** (with live Cancel/Reroute button), **Collapsible `peer_consult` Threads**, subtle **Trajectory Read Pills** (`@claude read @codex's trajectory`), **Git Clean-Merge / Conflict Resolution Notices**, and **Worktree-Smart Permission Cards** (`Allow Once` / `Allow 'cargo test*' for Session` / `Reject`).
-   - **Smart `@mention` Composer**: Autocompletes `@member`, `@member[model:effort]`, `@all`, `@orchestrator`, and `#file` paths, with a live routing indicator above Send.
+   - **Welcome Studio Dashboard**: Primary Open Project Folder CTA, recent projects grid, and live connected harness quota cards.
+   - **Top Session Changes Bar**: Shows `mh/<sid>/integration` ahead of `main` (`+142 / -31 · 5 files`), **[Diff]** (`DiffViewer` per-file +/- view), **[Preview / Shell]**, and **[Promote ▾]** (`Fast-Forward / Merge`, `Squash Merge`, `Apply Uncommitted Patch`).
+   - **Developer Thread Group Chat Stream**:
+     - Full-width aligned message rows with harness avatars, rich Markdown rendering (headings, lists, pipe tables, copyable code/diff blocks), **Orchestrator Dispatch Cards**, **Collapsible `peer_consult` Threads**, subtle **Trajectory Read Pills**, **Git Clean-Merge / Conflict Notices**, and **Worktree-Smart Permission Cards**.
+   - **Keyboard-Navigable `@mention` Composer**: Auto-resizing input autocompleting `@member` with live quota % badges, `@all`, `@orchestrator`, and `Confirm Plan First` pill toggle.
 3. **Right Inspector Drawer**:
-   - **Trajectory**: Step-by-step thoughts, tool calls, terminal logs, and worktree commit diffs for any selected turn (supports switching between parallel running agents!).
+   - **Trajectory**: Step-by-step thoughts, tool calls, terminal logs, and `DiffViewer` file patches for any selected turn.
    - **Memory Ledger**: Orchestrator-curated job history & pinned architectural/affinity facts.
-   - **Switch & Quotas**: Plan tier calibration, opt-in exact quota probe toggles, session permission rules, and hop/consult timeout sliders.
+   - **Switch & Quotas**: Live API quota refresh, plan tier selection, `Live API` probe toggles, segmented permission mode cards, and session rules.

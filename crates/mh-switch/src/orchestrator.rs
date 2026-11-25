@@ -44,10 +44,16 @@ pub async fn build_orchestrator_telemetry_block(
             .weekly_remaining_pct
             .map(|p| format!("{p:.0}%"))
             .unwrap_or_else(|| "n/a".into());
-        let limited = q.rate_limited_until.is_some();
+        let exhausted = q.rate_limited_until.is_some()
+            || q.window_5h_remaining_pct.is_some_and(|p| p <= 0.5)
+            || q.weekly_remaining_pct.is_some_and(|p| p <= 0.5);
         out.push_str(&format!(
-            "    - adapter={} 5h_rem={} weekly_rem={} rate_limited={}\n",
-            q.adapter_id, p5, pw, limited
+            "    - adapter={} plan={} 5h_rem={} weekly_rem={} exhausted={}\n",
+            q.adapter_id,
+            q.plan_label.as_deref().unwrap_or("unknown"),
+            p5,
+            pw,
+            exhausted
         ));
     }
     out.push_str("  </quotas>\n");
@@ -99,7 +105,7 @@ pub async fn build_orchestrator_telemetry_block(
          For trivial questions or repo lookups, answer directly. \
          For coding work, call `orchestrator_dispatch` choosing the best member(s), `model`, and `effort` \
          (`low` for simple edits, `medium` for features/tests, `high` for complex architecture/debugging; \
-         avoid adapters with 5h_rem < 15% or rate_limited=true). \
+         avoid adapters with exhausted=true or remaining quota < 15%). \
          Use your own harness brand's executor member if it is the strongest fit.\n\
          </instructions>\n",
     );
@@ -184,11 +190,22 @@ pub fn pick_fallback_executor(
             continue;
         }
         let q = quotas.iter().find(|q| q.adapter_id == m.adapter_id);
-        if q.is_some_and(|snap| snap.rate_limited_until.is_some()) {
+        if q.is_some_and(|snap| {
+            snap.rate_limited_until.is_some()
+                || snap.window_5h_remaining_pct.is_some_and(|p| p <= 0.5)
+                || snap.weekly_remaining_pct.is_some_and(|p| p <= 0.5)
+        }) {
             continue;
         }
         let score = q
-            .and_then(|snap| snap.window_5h_remaining_pct)
+            .and_then(
+                |snap| match (snap.window_5h_remaining_pct, snap.weekly_remaining_pct) {
+                    (Some(a), Some(b)) => Some(a.min(b)),
+                    (Some(a), None) => Some(a),
+                    (None, Some(b)) => Some(b),
+                    (None, None) => None,
+                },
+            )
             .unwrap_or(50.0);
         if best.as_ref().is_none_or(|(b_score, _)| score > *b_score) {
             best = Some((score, m.clone()));

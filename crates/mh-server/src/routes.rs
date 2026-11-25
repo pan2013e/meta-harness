@@ -11,9 +11,12 @@ use serde_json::{Value, json};
 
 use mh_acp::{
     ensure_session_integration_worktree, get_session_diff, init_git_repo, inspect_repo,
-    open_terminal_in_dir, probe_installed_adapters, promote_session, prune_session_worktrees,
+    open_terminal_in_dir, pick_folder_native, probe_installed_adapters, promote_session,
+    prune_session_worktrees,
 };
-use mh_core::{IsolationMode, MemberRole, PermissionPolicy, PromoteMode, normalize_path};
+use mh_core::{
+    IsolationMode, MemberRole, PermissionPolicy, PromoteMode, expand_user_path, normalize_path,
+};
 use mh_store::{CreateSessionParams, PatchSessionParams, UpsertMemberParams};
 use mh_switch::{SwitchError, execute_mcp_tool, list_switch_tools};
 
@@ -66,14 +69,41 @@ pub async fn list_fs(Query(q): Query<FsListQuery>) -> ApiResult<Value> {
     let raw = q.path.unwrap_or_default().trim().to_string();
 
     if raw.is_empty() {
-        let mut entries = Vec::new();
-        let home_str = dunce::simplified(&home).to_string_lossy().into_owned();
-        entries.push(FsEntry {
-            name: format!("Home ({home_str})"),
-            path: home_str,
-            is_dir: true,
-            is_git_repo: home.join(".git").exists(),
-        });
+        let mut entries: Vec<FsEntry> = Vec::new();
+        let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+
+        let mut push_root = |label: String, p: PathBuf| {
+            if !p.is_dir() {
+                return;
+            }
+            let norm = normalize_path(&p).unwrap_or(p);
+            let clean = dunce::simplified(&norm).to_string_lossy().into_owned();
+            let key = clean.to_lowercase();
+            if seen.insert(key) {
+                entries.push(FsEntry {
+                    name: label,
+                    path: clean,
+                    is_dir: true,
+                    is_git_repo: norm.join(".git").exists(),
+                });
+            }
+        };
+
+        let home_clean = dunce::simplified(&home).to_string_lossy().into_owned();
+        push_root(format!("Home ({home_clean})"), home.clone());
+
+        if let Some(desktop) = dirs::desktop_dir() {
+            push_root("Desktop".into(), desktop);
+        }
+        if let Some(docs) = dirs::document_dir() {
+            push_root("Documents".into(), docs);
+        }
+        for sub in ["repos", "projects", "code", "workspace", "dev", "src"] {
+            let candidate = home.join(sub);
+            if candidate.is_dir() {
+                push_root(format!("~/{sub}"), candidate);
+            }
+        }
 
         #[cfg(windows)]
         {
@@ -81,23 +111,28 @@ pub async fn list_fs(Query(q): Query<FsListQuery>) -> ApiResult<Value> {
                 let drive = format!("{}:\\", letter as char);
                 let p = Path::new(&drive);
                 if p.exists() {
-                    entries.push(FsEntry {
-                        name: drive.clone(),
-                        path: drive,
-                        is_dir: true,
-                        is_git_repo: false,
-                    });
+                    let key = drive.to_lowercase();
+                    if seen.insert(key) {
+                        entries.push(FsEntry {
+                            name: format!("Drive ({})", &drive[..2]),
+                            path: drive,
+                            is_dir: true,
+                            is_git_repo: false,
+                        });
+                    }
                 }
             }
         }
         #[cfg(not(windows))]
         {
-            entries.push(FsEntry {
-                name: "/".into(),
-                path: "/".into(),
-                is_dir: true,
-                is_git_repo: false,
-            });
+            if seen.insert("/".into()) {
+                entries.push(FsEntry {
+                    name: "/".into(),
+                    path: "/".into(),
+                    is_dir: true,
+                    is_git_repo: false,
+                });
+            }
         }
 
         return Ok(Json(json!({
@@ -107,9 +142,12 @@ pub async fn list_fs(Query(q): Query<FsListQuery>) -> ApiResult<Value> {
         })));
     }
 
-    let dir = PathBuf::from(&raw);
+    let dir = expand_user_path(&raw);
     if !dir.is_dir() {
-        return Err(err_resp(StatusCode::BAD_REQUEST, "path is not a directory"));
+        return Err(err_resp(
+            StatusCode::BAD_REQUEST,
+            format!("not a directory: {}", dir.display()),
+        ));
     }
 
     let norm = normalize_path(&dir).unwrap_or(dir);
@@ -121,12 +159,9 @@ pub async fn list_fs(Query(q): Query<FsListQuery>) -> ApiResult<Value> {
     let Ok(rd) = std::fs::read_dir(&norm) else {
         return Err(err_resp(StatusCode::FORBIDDEN, "cannot read directory"));
     };
-    for entry in rd.flatten().take(300) {
+    for entry in rd.flatten().take(400) {
         let p = entry.path();
-        let Ok(meta) = entry.metadata() else {
-            continue;
-        };
-        if !meta.is_dir() {
+        if !p.is_dir() {
             continue;
         }
         let name = entry.file_name().to_string_lossy().into_owned();
@@ -150,6 +185,52 @@ pub async fn list_fs(Query(q): Query<FsListQuery>) -> ApiResult<Value> {
     })))
 }
 
+pub async fn pick_fs_folder(
+    State(state): State<AppState>,
+    headers: axum::http::HeaderMap,
+) -> ApiResult<Value> {
+    let host_is_local = headers
+        .get(header::HOST)
+        .and_then(|v| v.to_str().ok())
+        .map(|h| {
+            let h_lower = h.to_ascii_lowercase();
+            h_lower.starts_with("127.0.0.1")
+                || h_lower.starts_with("localhost")
+                || h_lower.starts_with("[::1]")
+        })
+        .unwrap_or(true);
+
+    if state.auth.required || !host_is_local {
+        return Ok(Json(json!({
+            "supported": false,
+            "cancelled": false,
+            "path": null,
+        })));
+    }
+
+    match pick_folder_native().await {
+        Ok(Some(chosen)) => {
+            let norm = normalize_path(&chosen).unwrap_or(chosen);
+            let clean = dunce::simplified(&norm).to_string_lossy().into_owned();
+            Ok(Json(json!({
+                "supported": true,
+                "cancelled": false,
+                "path": clean,
+            })))
+        }
+        Ok(None) => Ok(Json(json!({
+            "supported": true,
+            "cancelled": true,
+            "path": null,
+        }))),
+        Err(_) => Ok(Json(json!({
+            "supported": false,
+            "cancelled": false,
+            "path": null,
+        }))),
+    }
+}
+
 pub async fn list_adapters(State(state): State<AppState>) -> Json<Value> {
     let cfg = state.switch.config.read().await.clone();
     Json(json!({ "adapters": cfg.adapters }))
@@ -164,6 +245,17 @@ pub async fn probe_adapters(State(state): State<AppState>) -> Json<Value> {
 pub async fn list_quotas(State(state): State<AppState>) -> Json<Value> {
     let cfg = state.switch.config.read().await.clone();
     let snapshots = state.switch.quota.all_snapshots(&cfg).await;
+    Json(json!({ "quotas": snapshots }))
+}
+
+pub async fn refresh_quotas(State(state): State<AppState>) -> Json<Value> {
+    let cfg = state.switch.config.read().await.clone();
+    let snapshots = state.switch.quota.refresh_all(&cfg).await;
+    for snap in &snapshots {
+        let _ = state.switch.events_tx.send(mh_core::WsEvent::QuotaUpdated {
+            snapshot: snap.clone(),
+        });
+    }
     Json(json!({ "quotas": snapshots }))
 }
 
@@ -192,7 +284,7 @@ pub async fn update_adapter_quota(
         .or_else(|| prev.as_ref().and_then(|p| p.plan_label.clone()));
     let opt_in = body
         .exact_probe_opt_in
-        .unwrap_or_else(|| prev.as_ref().is_some_and(|p| p.exact_probe_opt_in));
+        .unwrap_or_else(|| prev.as_ref().map(|p| p.exact_probe_opt_in).unwrap_or(true));
     let m5 = body
         .manual_5h_pct
         .or_else(|| prev.as_ref().and_then(|p| p.manual_5h_pct));
@@ -247,22 +339,26 @@ pub async fn create_project(
     State(state): State<AppState>,
     Json(body): Json<CreateProjectRequest>,
 ) -> ApiResult<Value> {
-    let raw = PathBuf::from(body.root_path.trim());
+    let raw = expand_user_path(&body.root_path);
     if !raw.exists() || !raw.is_dir() {
         return Err(err_resp(
             StatusCode::BAD_REQUEST,
-            "project root_path does not exist or is not a directory",
+            format!("project folder does not exist: {}", raw.display()),
         ));
     }
     let norm =
         normalize_path(&raw).map_err(|e| err_resp(StatusCode::BAD_REQUEST, e.to_string()))?;
     let clean_str = dunce::simplified(&norm).to_string_lossy().into_owned();
-    let name = body.name.unwrap_or_else(|| {
-        norm.file_name()
-            .and_then(|n| n.to_str())
-            .unwrap_or("project")
-            .to_string()
-    });
+    let name = body
+        .name
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or_else(|| {
+            norm.file_name()
+                .and_then(|n| n.to_str())
+                .filter(|n| !n.is_empty())
+                .unwrap_or(&clean_str)
+                .to_string()
+        });
     let repo = inspect_repo(&norm).await;
     let project = state
         .switch

@@ -1,11 +1,18 @@
 <!doctype html>
-<html lang="en" class="dark">
+<html lang="en" data-theme="obsidian" class="dark">
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>Meta-Harness · Multi-Agent ACP Group Chat</title>
+    <title>Meta-Harness · Multi-Agent ACP Switch</title>
+    <script>
+      try {
+        var t = localStorage.getItem("mh_theme") || "obsidian";
+        document.documentElement.setAttribute("data-theme", t);
+        document.documentElement.className = t === "daylight" ? "light" : "dark";
+      } catch (e) {}
+    </script>
   </head>
-  <body class="bg-zinc-950 text-zinc-100 antialiased selection:bg-indigo-500/30">
+  <body class="bg-app text-ink antialiased selection:bg-brand/30">
     <div id="root"></div>
     <script type="module" src="/src/main.tsx"></script>
   </body>

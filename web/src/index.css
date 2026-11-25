@@ -1,7 +1,136 @@
 @import "tailwindcss";
 
-:root {
+@theme {
+  --color-app: var(--mh-app);
+  --color-panel: var(--mh-panel);
+  --color-elevated: var(--mh-elevated);
+  --color-hover: var(--mh-hover);
+  --color-inset: var(--mh-inset);
+  --color-line: var(--mh-line);
+  --color-line-strong: var(--mh-line-strong);
+  --color-ink: var(--mh-ink);
+  --color-ink-soft: var(--mh-ink-soft);
+  --color-ink-muted: var(--mh-ink-muted);
+  --color-brand: var(--mh-brand);
+  --color-brand-hover: var(--mh-brand-hover);
+  --color-brand-soft: var(--mh-brand-soft);
+  --color-brand-ink: var(--mh-brand-ink);
+  --color-pos: var(--mh-pos);
+  --color-pos-soft: var(--mh-pos-soft);
+  --color-warn: var(--mh-warn);
+  --color-warn-soft: var(--mh-warn-soft);
+  --color-neg: var(--mh-neg);
+  --color-neg-soft: var(--mh-neg-soft);
+
+  --font-sans: "Inter", "Plus Jakarta Sans", -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif;
+  --font-mono: "JetBrains Mono", "Cascadia Code", "Fira Code", ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+}
+
+/* 1. Obsidian Studio (default dark) */
+:root,
+[data-theme="obsidian"] {
   color-scheme: dark;
+  --mh-app: #090b10;
+  --mh-panel: #0e1219;
+  --mh-elevated: #151b26;
+  --mh-hover: #1c2433;
+  --mh-inset: #06080c;
+  --mh-line: rgba(148, 163, 184, 0.14);
+  --mh-line-strong: rgba(148, 163, 184, 0.26);
+  --mh-ink: #f1f5f9;
+  --mh-ink-soft: #b8c4d6;
+  --mh-ink-muted: #78869b;
+  --mh-brand: #6366f1;
+  --mh-brand-hover: #4f46e5;
+  --mh-brand-soft: rgba(99, 102, 241, 0.15);
+  --mh-brand-ink: #a5b4fc;
+  --mh-pos: #34d399;
+  --mh-pos-soft: rgba(16, 185, 129, 0.13);
+  --mh-warn: #fbbf24;
+  --mh-warn-soft: rgba(245, 158, 11, 0.14);
+  --mh-neg: #fb7185;
+  --mh-neg-soft: rgba(244, 63, 94, 0.14);
+}
+
+/* 2. Tokyo Night */
+[data-theme="tokyo-night"] {
+  color-scheme: dark;
+  --mh-app: #161722;
+  --mh-panel: #1a1b26;
+  --mh-elevated: #222639;
+  --mh-hover: #292e42;
+  --mh-inset: #12131c;
+  --mh-line: rgba(122, 162, 247, 0.15);
+  --mh-line-strong: rgba(122, 162, 247, 0.30);
+  --mh-ink: #c8d3f5;
+  --mh-ink-soft: #9aa5ce;
+  --mh-ink-muted: #656f94;
+  --mh-brand: #7aa2f7;
+  --mh-brand-hover: #608df0;
+  --mh-brand-soft: rgba(122, 162, 247, 0.16);
+  --mh-brand-ink: #9eceff;
+  --mh-pos: #9ece6a;
+  --mh-pos-soft: rgba(158, 206, 106, 0.14);
+  --mh-warn: #e0af68;
+  --mh-warn-soft: rgba(224, 175, 104, 0.15);
+  --mh-neg: #f7768e;
+  --mh-neg-soft: rgba(247, 118, 142, 0.14);
+}
+
+/* 3. Catppuccin Mocha */
+[data-theme="catppuccin"] {
+  color-scheme: dark;
+  --mh-app: #181825;
+  --mh-panel: #1e1e2e;
+  --mh-elevated: #28283c;
+  --mh-hover: #313244;
+  --mh-inset: #11111b;
+  --mh-line: rgba(180, 190, 254, 0.14);
+  --mh-line-strong: rgba(203, 166, 247, 0.30);
+  --mh-ink: #cdd6f4;
+  --mh-ink-soft: #a6adc8;
+  --mh-ink-muted: #7f849c;
+  --mh-brand: #cba6f7;
+  --mh-brand-hover: #b48ef0;
+  --mh-brand-soft: rgba(203, 166, 247, 0.16);
+  --mh-brand-ink: #dec2ff;
+  --mh-pos: #a6e3a1;
+  --mh-pos-soft: rgba(166, 227, 161, 0.14);
+  --mh-warn: #f9e2af;
+  --mh-warn-soft: rgba(249, 226, 175, 0.15);
+  --mh-neg: #f38ba8;
+  --mh-neg-soft: rgba(243, 139, 168, 0.15);
+}
+
+/* 4. Paper Daylight (high-contrast crisp light mode) */
+[data-theme="daylight"] {
+  color-scheme: light;
+  --mh-app: #f4f6f9;
+  --mh-panel: #ffffff;
+  --mh-elevated: #f8fafc;
+  --mh-hover: #eef2f7;
+  --mh-inset: #f1f4f8;
+  --mh-line: rgba(15, 23, 42, 0.10);
+  --mh-line-strong: rgba(15, 23, 42, 0.22);
+  --mh-ink: #0f172a;
+  --mh-ink-soft: #334155;
+  --mh-ink-muted: #64748b;
+  --mh-brand: #4f46e5;
+  --mh-brand-hover: #4338ca;
+  --mh-brand-soft: rgba(79, 70, 229, 0.10);
+  --mh-brand-ink: #4338ca;
+  --mh-pos: #059669;
+  --mh-pos-soft: rgba(5, 150, 105, 0.10);
+  --mh-warn: #b45309;
+  --mh-warn-soft: rgba(217, 119, 6, 0.12);
+  --mh-neg: #dc2626;
+  --mh-neg-soft: rgba(220, 38, 38, 0.10);
+}
+
+body {
+  font-family: var(--font-sans);
+  background-color: var(--mh-app);
+  color: var(--mh-ink);
 }
 
 ::-webkit-scrollbar {
@@ -10,10 +139,10 @@
 }
 
 ::-webkit-scrollbar-thumb {
-  background: rgba(161, 161, 170, 0.25);
+  background: var(--mh-line-strong);
   border-radius: 9999px;
 }
 
 ::-webkit-scrollbar-thumb:hover {
-  background: rgba(161, 161, 170, 0.45);
+  background: var(--mh-ink-muted);
 }

@@ -142,7 +142,7 @@ impl Default for AppConfig {
                 args: vec!["-y".into(), "@agentclientprotocol/codex-acp".into()],
                 fallback_commands: Vec::new(),
                 quota_provider: "codex_local".to_string(),
-                exact_quota_probe_opt_in: false,
+                exact_quota_probe_opt_in: true,
                 characteristics: AdapterCharacteristics {
                     strengths: vec![
                         "backend-systems".into(),
@@ -168,7 +168,7 @@ impl Default for AppConfig {
                 args: vec!["-y".into(), "@agentclientprotocol/claude-agent-acp".into()],
                 fallback_commands: Vec::new(),
                 quota_provider: "claude_local".to_string(),
-                exact_quota_probe_opt_in: false,
+                exact_quota_probe_opt_in: true,
                 characteristics: AdapterCharacteristics {
                     strengths: vec![
                         "architecture".into(),
@@ -196,7 +196,7 @@ impl Default for AppConfig {
                     args: vec!["--acp".into()],
                 }],
                 quota_provider: "google_local".to_string(),
-                exact_quota_probe_opt_in: false,
+                exact_quota_probe_opt_in: true,
                 characteristics: AdapterCharacteristics {
                     strengths: vec![
                         "broad-codebase-research".into(),

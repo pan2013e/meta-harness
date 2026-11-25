@@ -114,6 +114,11 @@ async fn main() -> anyhow::Result<()> {
 
     let store = Store::open(&paths.db_path())?;
     let quota = Arc::new(QuotaTracker::new());
+    for (id, acfg) in &cfg.adapters {
+        quota
+            .configure_adapter(id, None, acfg.exact_quota_probe_opt_in, None, None)
+            .await;
+    }
     if let Ok(prefs) = store.list_adapter_quota_prefs() {
         for p in prefs {
             quota

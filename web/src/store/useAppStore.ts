@@ -14,12 +14,48 @@ import type {
   Session,
   SessionDiffReport,
   SessionMember,
+  ThemeId,
   TrajectoryEvent,
   TurnTrajectory,
   WsEvent,
 } from "../types/api";
 
 export type DrawerTab = "trajectory" | "memory" | "settings";
+
+const VALID_THEMES: ThemeId[] = ["obsidian", "tokyo-night", "catppuccin", "daylight"];
+
+function getInitialTheme(): ThemeId {
+  try {
+    const saved = window.localStorage.getItem("mh_theme") as ThemeId | null;
+    if (saved && VALID_THEMES.includes(saved)) return saved;
+  } catch {
+    // ignore storage access issues
+  }
+  return "obsidian";
+}
+
+function applyThemeToDom(theme: ThemeId) {
+  if (typeof document === "undefined") return;
+  document.documentElement.setAttribute("data-theme", theme);
+  document.documentElement.className = theme === "daylight" ? "light" : "dark";
+  try {
+    window.localStorage.setItem("mh_theme", theme);
+  } catch {
+    // ignore
+  }
+}
+
+function cleanUserPath(raw: string): string {
+  const trimmed = raw.trim();
+  if (
+    trimmed.length >= 2 &&
+    ((trimmed.startsWith('"') && trimmed.endsWith('"')) ||
+      (trimmed.startsWith("'") && trimmed.endsWith("'")))
+  ) {
+    return trimmed.slice(1, -1).trim();
+  }
+  return trimmed;
+}
 
 interface HopPausedBanner {
   chain_id: string;
@@ -33,6 +69,12 @@ interface AppState {
   authenticated: boolean;
   bootstrapping: boolean;
   errorBanner: string | null;
+
+  theme: ThemeId;
+  sidebarCollapsed: boolean;
+  folderModalOpen: boolean;
+  pickingFolder: boolean;
+  quotasRefreshing: boolean;
 
   adapters: Record<string, AdapterConfig>;
   probes: AdapterProbeStatus[];
@@ -67,6 +109,11 @@ interface AppState {
 
   wsClient: WsHubClient | null;
 
+  setTheme: (theme: ThemeId) => void;
+  toggleSidebar: () => void;
+  setFolderModalOpen: (open: boolean) => void;
+  openProjectWithNativeOrModal: () => Promise<void>;
+
   init: () => Promise<void>;
   authenticateWithToken: (token: string) => Promise<void>;
   clearError: () => void;
@@ -90,6 +137,7 @@ interface AppState {
 
   refreshMemory: (query?: string) => Promise<void>;
   refreshQuotas: () => Promise<void>;
+  refreshQuotasLive: () => Promise<void>;
   handleWsEvent: (ev: WsEvent) => void;
 }
 
@@ -98,6 +146,12 @@ export const useAppStore = create<AppState>((set, get) => ({
   authenticated: true,
   bootstrapping: true,
   errorBanner: null,
+
+  theme: getInitialTheme(),
+  sidebarCollapsed: false,
+  folderModalOpen: false,
+  pickingFolder: false,
+  quotasRefreshing: false,
 
   adapters: {},
   probes: [],
@@ -128,10 +182,40 @@ export const useAppStore = create<AppState>((set, get) => ({
   memoryFacts: [],
   wsClient: null,
 
+  setTheme: (theme) => {
+    applyThemeToDom(theme);
+    set({ theme });
+  },
+  toggleSidebar: () => set((s) => ({ sidebarCollapsed: !s.sidebarCollapsed })),
+  setFolderModalOpen: (open) => set({ folderModalOpen: open }),
+
+  openProjectWithNativeOrModal: async () => {
+    if (get().pickingFolder) return;
+    set({ pickingFolder: true });
+    try {
+      const res = await api.pickFolderNative();
+      if (res.supported && !res.cancelled && res.path) {
+        await get().createAndSelectProject(res.path);
+        return;
+      }
+      if (!res.supported) {
+        set({ folderModalOpen: true });
+      }
+    } catch (e) {
+      set({
+        folderModalOpen: true,
+        errorBanner: e instanceof Error ? e.message : String(e),
+      });
+    } finally {
+      set({ pickingFolder: false });
+    }
+  },
+
   clearError: () => set({ errorBanner: null }),
   setError: (msg) => set({ errorBanner: msg }),
 
   init: async () => {
+    applyThemeToDom(get().theme);
     try {
       const urlParams = new URLSearchParams(window.location.search);
       const tokenParam = urlParams.get("token");
@@ -221,9 +305,13 @@ export const useAppStore = create<AppState>((set, get) => ({
   },
 
   createAndSelectProject: async (rootPath: string, name?: string) => {
-    const { project } = await api.createProject(rootPath, name);
+    const cleaned = cleanUserPath(rootPath);
+    if (!cleaned) {
+      throw new Error("Please select or enter a valid folder path.");
+    }
+    const { project } = await api.createProject(cleaned, name);
     const { projects } = await api.listProjects();
-    set({ projects });
+    set({ projects, folderModalOpen: false, errorBanner: null });
     await get().selectProject(project.id);
     if (get().sessions.length === 0) {
       await get().createAndSelectSession("Main Group Chat");
@@ -360,6 +448,23 @@ export const useAppStore = create<AppState>((set, get) => ({
     const map: Record<string, QuotaSnapshot> = {};
     for (const q of quotas) map[q.adapter_id] = q;
     set({ quotas: map });
+  },
+
+  refreshQuotasLive: async () => {
+    set({ quotasRefreshing: true });
+    try {
+      const [{ quotas }, { probes }] = await Promise.all([
+        api.refreshQuotasLive(),
+        api.probeAdapters(),
+      ]);
+      const map: Record<string, QuotaSnapshot> = {};
+      for (const q of quotas) map[q.adapter_id] = q;
+      set({ quotas: map, probes });
+    } catch (e) {
+      set({ errorBanner: e instanceof Error ? e.message : String(e) });
+    } finally {
+      set({ quotasRefreshing: false });
+    }
   },
 
   handleWsEvent: (ev: WsEvent) => {

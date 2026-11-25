@@ -1003,6 +1003,7 @@ dependencies = [
  "dunce",
  "libc",
  "mh-core",
+ "reqwest",
  "serde",
  "serde_json",
  "similar",

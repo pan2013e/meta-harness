@@ -1078,6 +1078,11 @@ impl SwitchEngine {
                         .record_turn_tokens(&member.adapter_id, approx_tokens)
                         .await;
                     if let Some(acfg) = cfg.adapters.get(&member.adapter_id) {
+                        if acfg.quota_provider != "manual" {
+                            self.quota
+                                .invalidate_if_stale(&member.adapter_id, 45_000)
+                                .await;
+                        }
                         let snap = self
                             .quota
                             .snapshot(&member.adapter_id, &acfg.quota_provider)

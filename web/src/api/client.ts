@@ -65,11 +65,20 @@ export const api = {
     apiFetch<{ current: string; parent: string | null; entries: FsEntry[] }>(
       `/api/fs/list${path ? `?path=${encodeURIComponent(path)}` : ""}`
     ),
+  pickFolderNative: () =>
+    apiFetch<{ supported: boolean; cancelled: boolean; path: string | null }>(
+      "/api/fs/pick-folder",
+      { method: "POST" }
+    ),
   listAdapters: () =>
     apiFetch<{ adapters: Record<string, AdapterConfig> }>("/api/adapters"),
   probeAdapters: () =>
     apiFetch<{ probes: AdapterProbeStatus[] }>("/api/adapters/probe"),
   listQuotas: () => apiFetch<{ quotas: QuotaSnapshot[] }>("/api/quotas"),
+  refreshQuotasLive: () =>
+    apiFetch<{ quotas: QuotaSnapshot[] }>("/api/quotas/refresh", {
+      method: "POST",
+    }),
   updateQuota: (
     adapterId: string,
     payload: {

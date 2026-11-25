@@ -42,6 +42,43 @@ impl AppPaths {
     }
 }
 
+/// Normalizes and expands user-supplied path strings across Windows, macOS, and Linux:
+/// trims whitespace, strips matching surrounding single/double quotes (e.g. from Explorer "Copy as path"),
+/// expands leading `~` to the user's home directory, and normalizes bare Windows drive specs like `C:` -> `C:\`.
+pub fn expand_user_path(raw: &str) -> PathBuf {
+    let mut s = raw.trim();
+    if s.len() >= 2
+        && ((s.starts_with('"') && s.ends_with('"')) || (s.starts_with('\'') && s.ends_with('\'')))
+    {
+        s = s[1..s.len() - 1].trim();
+    }
+
+    if s == "~"
+        && let Some(home) = dirs::home_dir()
+    {
+        return dunce::simplified(&home).to_path_buf();
+    }
+
+    if let Some(rest) = s.strip_prefix("~/").or_else(|| s.strip_prefix("~\\"))
+        && let Some(home) = dirs::home_dir()
+    {
+        let cleaned = rest.trim_start_matches(['/', '\\']);
+        let joined = if cleaned.is_empty() {
+            home
+        } else {
+            home.join(cleaned)
+        };
+        return dunce::simplified(&joined).to_path_buf();
+    }
+
+    #[cfg(windows)]
+    if s.len() == 2 && s.as_bytes()[0].is_ascii_alphabetic() && s.as_bytes()[1] == b':' {
+        return PathBuf::from(format!("{s}\\"));
+    }
+
+    PathBuf::from(s)
+}
+
 /// Canonicalizes an existing path without adding Windows verbatim `\\?\` prefixes
 /// and resolving OS symlinks (such as `/var` -> `/private/var` on macOS).
 pub fn normalize_path(path: &Path) -> std::io::Result<PathBuf> {
@@ -158,5 +195,28 @@ mod tests {
         assert!(!is_path_within(&outside, &tmp));
 
         let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn expand_user_path_strips_quotes_and_expands_tilde() {
+        let quoted = expand_user_path("  \"/tmp/demo\"  ");
+        assert_eq!(quoted, PathBuf::from("/tmp/demo"));
+
+        if let Some(home) = dirs::home_dir() {
+            let expanded_home = expand_user_path("~");
+            assert_eq!(expanded_home, dunce::simplified(&home));
+
+            let sub = expand_user_path("~/projects/app");
+            assert_eq!(sub, dunce::simplified(&home.join("projects/app")));
+        }
+
+        #[cfg(windows)]
+        {
+            assert_eq!(expand_user_path("C:"), PathBuf::from("C:\\"));
+            assert_eq!(
+                expand_user_path("\"C:\\Users\\demo\\repo\""),
+                PathBuf::from("C:\\Users\\demo\\repo")
+            );
+        }
     }
 }

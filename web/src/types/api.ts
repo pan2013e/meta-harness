@@ -1,3 +1,5 @@
+export type ThemeId = "obsidian" | "tokyo-night" | "catppuccin" | "daylight";
+
 export type IsolationMode = "worktree_per_member" | "shared_cwd";
 export type PermissionPolicy = "worktree_smart" | "strict" | "autonomous_sandbox";
 export type MemberRole = "orchestrator" | "executor" | "both";
@@ -129,6 +131,14 @@ export interface TrajectoryEvent {
   created_at: number;
 }
 
+export interface QuotaWindow {
+  id: string;
+  label: string;
+  remaining_pct: number;
+  resets_at: number | null;
+  window_mins: number | null;
+}
+
 export interface QuotaSnapshot {
   adapter_id: string;
   plan_label: string | null;
@@ -139,7 +149,15 @@ export interface QuotaSnapshot {
   local_5h_tokens_est: number;
   rate_limited_until: number | null;
   exact_probe_opt_in: boolean;
-  source: "local_log_estimate" | "live_probe" | "user_calibrated" | "cooldown429";
+  source:
+    | "local_log_estimate"
+    | "live_probe"
+    | "user_calibrated"
+    | "cooldown429"
+    | "unavailable";
+  windows?: QuotaWindow[];
+  credits_label?: string | null;
+  status_note?: string | null;
   updated_at: number;
 }
 

@@ -32,9 +32,11 @@ pub fn build_router(state: AppState) -> Router {
         .route("/api/auth/status", get(auth_status))
         .route("/api/auth/session", post(create_auth_session))
         .route("/api/fs/list", get(routes::list_fs))
+        .route("/api/fs/pick-folder", post(routes::pick_fs_folder))
         .route("/api/adapters", get(routes::list_adapters))
         .route("/api/adapters/probe", get(routes::probe_adapters))
         .route("/api/quotas", get(routes::list_quotas))
+        .route("/api/quotas/refresh", post(routes::refresh_quotas))
         .route(
             "/api/adapters/{id}/quota",
             patch(routes::update_adapter_quota),

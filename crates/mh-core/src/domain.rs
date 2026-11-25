@@ -354,6 +354,16 @@ pub enum QuotaSource {
     LiveProbe,
     UserCalibrated,
     Cooldown429,
+    Unavailable,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct QuotaWindow {
+    pub id: String,
+    pub label: String,
+    pub remaining_pct: f32,
+    pub resets_at: Option<i64>,
+    pub window_mins: Option<i64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -368,6 +378,12 @@ pub struct QuotaSnapshot {
     pub rate_limited_until: Option<i64>,
     pub exact_probe_opt_in: bool,
     pub source: QuotaSource,
+    #[serde(default)]
+    pub windows: Vec<QuotaWindow>,
+    #[serde(default)]
+    pub credits_label: Option<String>,
+    #[serde(default)]
+    pub status_note: Option<String>,
     pub updated_at: i64,
 }
 

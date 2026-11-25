@@ -1,14 +1,37 @@
-# Example Harness Registry Configuration for Meta-Harness
+# Example Harness & Switch Configuration for Meta-Harness
 # Copy to `configs/harnesses.local.toml` or `%APPDATA%/meta-harness/harnesses.toml` to customize.
-# All harnesses inherit the user's local login/subscription environment by default.
+# All adapters inherit the user's local login/subscription environment by default.
+
+[server]
+bind = "127.0.0.1:4410"
+# Set `bind = "0.0.0.0:4410"` with `--enable-remote-token` (or `auth_token_env`) for LAN / Tailscale access.
+open_browser_on_start = true
 
 [switch]
 max_agent_hops_per_user_turn = 6
+peer_consult_timeout_secs = 180
 idle_process_ttl_secs = 900
-default_permission_policy = "prompt" # "prompt" | "allow_edits_prompt_shell" | "strict"
+# "worktree_smart" auto-allows file reads/writes inside the agent's isolated Git worktree
+# and prompts in Group Chat for shell commands & outside-worktree access (with session pattern rules).
+default_permission_policy = "worktree_smart" # "worktree_smart" | "strict" | "autonomous_sandbox"
 
-[harnesses.codex]
-handle = "codex"
+[git]
+# Isolated per-session integration worktree + per-executor worktrees by default
+isolation_mode = "worktree_per_member"
+auto_merge_clean_turns = true
+sync_idle_worktrees_after_merge = true
+
+[memory]
+# Lightweight Orchestrator LLM curation pass after completed jobs (folded into merge/synthesis turns when active)
+curation_mode = "orchestrator_llm" # "orchestrator_llm" | "deterministic_only"
+
+# -----------------------------------------------------------------------------
+# Harness Adapters (Shared CLI Driver + Shared Subscription Quota Pool)
+# Multiple session members/personas (e.g. Orchestrator `@claude` + Executor `@claude`
+# or `@codex-reviewer`) can reference the same adapter and share its quota bucket.
+# -----------------------------------------------------------------------------
+
+[adapters.codex]
 display_name = "Codex"
 accent_color = "#10a37f"
 enabled = true
@@ -16,14 +39,14 @@ enabled = true
 command = "npx"
 args = ["-y", "@agentclientprotocol/codex-acp"]
 quota_provider = "codex_local"
+exact_quota_probe_opt_in = false
 
-[harnesses.codex.characteristics]
+[adapters.codex.characteristics]
 strengths = ["backend-systems", "rust", "refactoring", "debugging", "test-generation", "precise-diffs"]
 latency_tier = "medium"
 context_window_tier = "large"
 
-[harnesses.claude]
-handle = "claude"
+[adapters.claude]
 display_name = "Claude Code"
 accent_color = "#d97757"
 enabled = true
@@ -31,14 +54,14 @@ enabled = true
 command = "npx"
 args = ["-y", "@agentclientprotocol/claude-agent-acp"]
 quota_provider = "claude_local"
+exact_quota_probe_opt_in = false
 
-[harnesses.claude.characteristics]
-strengths = ["architecture", "frontend-ui", "nuanced-design", "code-review", "multi-file-coordination"]
+[adapters.claude.characteristics]
+strengths = ["architecture", "frontend-ui", "nuanced-design", "code-review", "conflict-resolution"]
 latency_tier = "fast"
 context_window_tier = "large"
 
-[harnesses.antigravity]
-handle = "antigravity"
+[adapters.antigravity]
 display_name = "Antigravity"
 accent_color = "#4285f4"
 enabled = true
@@ -49,8 +72,9 @@ fallback_commands = [
   { command = "gemini", args = ["--acp"] }
 ]
 quota_provider = "google_local"
+exact_quota_probe_opt_in = false
 
-[harnesses.antigravity.characteristics]
+[adapters.antigravity.characteristics]
 strengths = ["broad-codebase-research", "long-context", "orchestration", "fullstack-synthesis", "planning"]
 latency_tier = "fast"
 context_window_tier = "ultra"

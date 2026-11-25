@@ -1,6 +1,6 @@
 # Meta-Harness Phased Implementation Plan
 
-This roadmap breaks the implementation of **Meta-Harness** into 7 crisp, verifiable phases (**Phase 0 -> Phase 6**). Any agent(s) picking up implementation work should complete phases in dependency order and pass every phase's **Verification Gate** before advancing.
+This roadmap breaks **Meta-Harness** into 7 verifiable phases (**Phase 0 -> Phase 6**) incorporating all finalized architectural decisions (per-harness Git worktrees + session integration branch, parallel turns + deadlock-safe `peer_consult`, adapter-vs-member personas, Orchestrator-curated memory, worktree-smart permissions, and optional token-authenticated LAN mode).
 
 ---
 
@@ -8,181 +8,166 @@ This roadmap breaks the implementation of **Meta-Harness** into 7 crisp, verifia
 
 ```mermaid
 flowchart LR
-    P0["Phase 0: Toolchain & Workspace Scaffold"] --> P1["Phase 1: Core Domain & SQLite/FTS5 Store"]
-    P1 --> P2["Phase 2: ACP Supervisor, Broker & Mock Agent"]
-    P2 --> P3["Phase 3: Network Switch, @Mentions & MCP Bridge"]
-    P3 --> P4["Phase 4: Orchestrator & Subscription Quota Engine"]
-    P1 --> P5["Phase 5: Axum HTTP/WS API & Frontend Shell"]
+    P0["Phase 0: Toolchain & Workspace Scaffold"] --> P1["Phase 1: Core Models, Wait-For DAG & SQLite/FTS5 Store"]
+    P1 --> P2["Phase 2: Git Worktree Broker, ACP Supervisor & Mock Agent"]
+    P2 --> P3["Phase 3: Parallel Switch, peer_consult & MCP Bridge"]
+    P3 --> P4["Phase 4: Orchestrator, Conflict Resolver, Memory Curator & Quotas"]
+    P1 --> P5["Phase 5: Axum Server (+LAN Auth) & Group-Chat Web UI"]
     P3 --> P5
-    P4 --> P6["Phase 6: Live Harness Polish & E2E Verification"]
+    P4 --> P6["Phase 6: Promote Flows, Live CLI Harnesses & Resource Audit"]
     P5 --> P6
 ```
 
 > [!TIP]
-> **Multi-Agent Parallelism**: Once **Phase 1** (`mh-core` + `mh-store` + shared wire DTOs) is merged, one agent can build **Phases 2–4** (ACP runtime, Switch MCP bridge, Orchestrator) in Rust while a second agent builds **Phase 5** (Frontend UI against a mock/stub WS server or `mh-server` skeleton) in `web/`.
+> **Multi-Agent Parallelism**: Once **Phase 1** (`mh-core` + `mh-store` + wire DTOs) lands, backend crates (**Phases 2–4**) and the frontend SPA (**Phase 5**) can be developed in parallel and integrated cleanly in **Phase 6**.
 
 ---
 
 ## Phase 0: Toolchain Verification & Workspace Bootstrap
 
 ### Goals
-Ensure Rust and Node toolchains compile cleanly on this machine and establish the Cargo multi-crate workspace plus Vite + React + TypeScript frontend skeleton.
+Ensure Rust and Node toolchains compile cleanly on Windows and scaffold the 5-crate Cargo workspace plus Vite + React 19 + TypeScript frontend.
 
 ### Tasks
-1. **Rust Toolchain Check (Windows)**:
-   - Check `cargo --version`. If absent, install `rustup` and configure `stable-x86_64-pc-windows-gnu` (self-contained linker, no 6 GB Visual Studio C++ Build Tools needed) or `stable-x86_64-pc-windows-msvc` if MSVC `cl.exe` is already installed (see `AGENTS.md` §3).
-2. **Cargo Workspace Setup (`Cargo.toml`)**:
-   - Initialize workspace with crates:
-     - `crates/mh-core`
-     - `crates/mh-store`
-     - `crates/mh-acp`
-     - `crates/mh-switch`
-     - `crates/mh-server`
-   - Pin core dependencies in `[workspace.dependencies]`: `tokio`, `axum`, `serde`, `serde_json`, `toml`, `rusqlite` (`features = ["bundled"]`), `agent-client-protocol` (`2.0`), `tracing`, `tracing-subscriber`, `uuid`, `thiserror`, `anyhow`, `which`, `dunce`, `similar` (for unified diffs).
+1. **Rust Toolchain Setup (Windows)**:
+   - Verify `cargo --version`. If missing and MSVC `cl.exe` is absent, install `rustup` with `stable-x86_64-pc-windows-gnu` (self-contained ~350 MB setup, zero admin rights; see `AGENTS.md` §3).
+2. **Cargo Workspace (`Cargo.toml`)**:
+   - Create crates: `crates/mh-core`, `crates/mh-store`, `crates/mh-acp`, `crates/mh-switch`, `crates/mh-server`.
+   - Configure `[workspace.dependencies]`: `tokio`, `axum`, `tower-http`, `serde`, `serde_json`, `toml`, `rusqlite` (`features = ["bundled"]`), `agent-client-protocol` (`2.0`), `tracing`, `tracing-subscriber`, `uuid`, `thiserror`, `anyhow`, `which`, `dunce`, `similar`, `hmac`, `sha2`, `rand`.
 3. **Frontend Scaffold (`web/`)**:
    - Initialize Vite + React 19 + TypeScript (`strict: true`) + Tailwind CSS v4 + Zustand + `@tanstack/react-virtual` + `lucide-react` + Vitest.
-   - Configure Vite dev proxy (`/api` -> `http://127.0.0.1:4410`).
 
 ### Verification Gate
-- `cargo check --workspace` and `cargo test --workspace` exit `0`.
-- `cd web && npm install && npm run typecheck && npm run build` exits `0`.
+- `cargo check --workspace` and `cargo test --workspace` pass.
+- `cd web && npm install && npm run typecheck && npm run build` passes.
 
 ---
 
-## Phase 1: Core Domain Models, Mention Parser & SQLite/FTS5 Store (`mh-core`, `mh-store`)
+## Phase 1: Core Primitives, Wait-For DAG & SQLite/FTS5 Store (`mh-core`, `mh-store`)
 
 ### Goals
-Implement pure routing/scoring primitives and the persistent SQLite + FTS5 storage and episodic memory layer.
+Build pure routing/concurrency primitives (`@mention` parser + `peer_consult` deadlock detector) and the SQLite + FTS5 persistence layer.
 
 ### Tasks
 1. **`crates/mh-core`**:
-   - Define shared serde types: `Project`, `Session`, `HarnessProfile`, `ChatMessage`, `TurnTrajectory`, `TrajectoryEvent`, `QuotaSnapshot`, `EpisodicJob`, `ProjectFact`, `WsEvent`.
-   - Implement **Code-Aware `@mention` Parser** (`mention.rs`):
-     - Masks fenced code blocks and inline code spans before extracting `@handle` and optional `@handle[model:effort]` tokens.
-     - Unit test edge cases: `@codex` at start/middle/end of line, `@decorator` inside Python code block (ignored), `user@example.com` (ignored), multiple `@codex @claude` targets, `@all`, `@orchestrator`.
+   - Define domain & wire DTOs separating `HarnessAdapter` (CLI + shared quota bucket) from `SessionMember` (handle, persona, role, worktree).
+   - **Code-Aware `@mention` Parser** (`mention.rs`): Masks fenced and inline code before extracting `@handle`, `@handle[model:effort]`, `@all`, and `@orchestrator`.
+   - **`WaitForGraph` Cycle Detector** (`dag.rs`): Tracks active `caller -> target` consult edges and detects direct/transitive cycles in `O(V + E)` before permitting `peer_consult`.
 2. **`crates/mh-store`**:
-   - Implement embedded migrations applying the schema in `docs/SPECIFICATION.md` §6.3 (`WAL` mode, foreign keys).
-   - CRUD repositories for `projects`, `sessions`, `session_members`, `messages` (cursor pagination + per-harness `last_seen_msg_seq` delta query), and `turn_trajectories` / `trajectory_events`.
-   - **Episodic Memory Engine (`memory.rs`)**:
-     - `record_job(...)` inserting into `episodic_jobs` + `episodic_jobs_fts`.
-     - `recall_jobs(project_id, query, path_prefix, limit)` using FTS5 BM25 ranking + recency boost + `pinned` priority.
-     - `record_fact` / `list_facts` / `delete_job`.
+   - Embedded SQLite migrations (`WAL` mode) implementing `docs/SPECIFICATION.md` §6.2 (`projects`, `sessions`, `session_members`, `session_permission_rules`, `messages` with `parent_msg_id` threads, `turn_trajectories`, `trajectory_events`, `episodic_jobs` + `episodic_jobs_fts`, `project_facts`).
+   - Delta message query (`seq > last_seen_msg_seq`) and FTS5 BM25 memory recall + pin/recency ranking.
 
 ### Verification Gate
-- Unit & integration tests in `mh-core` and `mh-store` covering mention parsing, delta message queries, trajectory pagination, and FTS5 episodic memory recall (`cargo test -p mh-core -p mh-store`).
+- `cargo test -p mh-core -p mh-store` verifying mention edge cases, `A -> B -> C -> A` consult cycle rejection, threaded message queries, and FTS5 recall.
 
 ---
 
-## Phase 2: ACP Process Supervisor, Workspace Broker & Mock ACP Harness (`mh-acp`)
+## Phase 2: Git Worktree Broker, ACP Supervisor & Mock Agent (`mh-acp`)
 
 ### Goals
-Speak real ACP JSON-RPC 2.0 over stdio to child processes safely on Windows/Unix, broker filesystem/terminal/permission callbacks, and test everything deterministically with an offline Mock ACP Agent.
+Manage isolated session/member Git worktrees, drive ACP JSON-RPC 2.0 subprocesses safely on Windows, enforce worktree-smart permissions, and validate everything with an offline Mock ACP Agent.
 
 ### Tasks
-1. **Cross-Platform Process Supervisor (`supervisor.rs`)**:
-   - Resolve executable shims via `which` (`npx.cmd`, `codex.exe`, `agy.cmd`).
-   - Windows Job Object wrapper (`windows-sys` crate: `CreateJobObjectW`, `SetInformationJobObject` with `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`, `AssignProcessToJobObject`) so child process trees never leak.
-   - Lazy spawn on first session prompt + configurable idle reaper task.
-2. **ACP Client Session Driver (`client.rs`)**:
-   - Implement `agent-client-protocol` client transport over `ChildStdin` / `ChildStdout` (newline-delimited JSON-RPC 2.0) while capturing `ChildStderr` into a bounded diagnostic ring buffer.
-   - Implement `initialize`, `session/new` (with `mcpServers` injection), `session/load`, `session/set_config_option` (indexing advertised `model` and `thought_level` / `reasoning_effort` options), `session/prompt`, and `session/cancel`.
-   - Coalesce streaming `session/update` chunks (text deltas, thought deltas, tool call status) into structured `TrajectoryEvent` records.
-3. **Workspace File/Terminal & Permission Broker (`broker.rs`)**:
-   - Enforce `project_root` path sandboxing using `dunce::canonicalize`.
-   - Snapshot pre-write contents on `fs/write_text_file`, compute unified diffs via `similar::TextDiff`, detect concurrent same-file writers, and record `touched_files`.
-   - Handle `terminal/*` execution within `project_root` and route `session/request_permission` to an async approval channel.
+1. **Git Worktree Broker (`crates/mh-acp/src/worktree.rs`)**:
+   - Detect Git status (`is_git_repo`, current branch/SHA) and implement 1-click `git init` helper for non-Git folders.
+   - Create session integration worktree (`mh/s-<id>`) and lazy per-member executor worktrees (`mh/s-<id>/<handle>`) under `<project>/.meta-harness/worktrees/<session_id>/` (registered in `.git/info/exclude`).
+   - Implement auto-commit of dirty executor worktree edits on turn completion, deterministic clean merge into `mh/s-<id>`, structured conflict detection (returning conflicting file paths + diffs without aborting context needed for Orchestrator resolution), idle peer worktree fast-forward sync, and 3 promotion modes (`merge`, `squash`, `patch`) back to `<base_branch>`.
+   - Implement clean worktree pruning on session deletion.
+2. **Process Supervisor & ACP Client (`supervisor.rs`, `client.rs`)**:
+   - Resolve Windows `.cmd`/`.exe` shims via `which`; bind child trees to Win32 Job Objects (`JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`); lazy spawn + idle hibernation reaper.
+   - Implement ACP `initialize`, `session/new` (injecting `meta-harness mcp-bridge` + member worktree `cwd`), `session/load`, `session/set_config_option` (`model` + `reasoning_effort`), `session/prompt`, `session/cancel`, and 25ms-coalesced `session/update` capture.
+3. **Worktree-Smart Permission Broker (`broker.rs`)**:
+   - Auto-approve `fs/read_text_file` in project and `fs/write_text_file` strictly inside the calling member's `dunce::canonicalize`d worktree.
+   - Match `terminal/*` and external file requests against `session_permission_rules` (`Allow 'cargo test*' for session`); prompt UI via async oneshot channel when unmatched.
 4. **Deterministic Mock ACP Agent (`tests/fixtures/mock_acp_agent.rs`)**:
-   - A tiny Rust test binary speaking ACP stdio that advertises `configOptions` (`model`: `mock-fast`/`mock-pro`, `reasoning_effort`: `low`/`medium`/`high`), streams thoughts + tool calls + `fs/write_text_file`, and can invoke MCP tools when instructed.
+   - Rust test binary supporting configurable models/efforts, parallel file edits in its assigned `cwd`, permission requests, and scripted MCP tool calls (`peer_consult`, `trajectory_read`, `orchestrator_dispatch`, `memory_curate_job`).
 
 ### Verification Gate
-- Integration test spawns two `mock_acp_agent` instances, runs `initialize` -> `session/new` -> `session/set_config_option` -> `session/prompt`, verifies streamed trajectory diffs, permission gating, `session/cancel` latency (<250ms), and clean child termination.
+- Integration test verifying two `mock_acp_agent` instances editing files **simultaneously** in separate worktrees:
+  1. Disjoint file edits auto-merge cleanly into `_integration` with zero conflicts.
+  2. Overlapping line edits trigger structured conflict detection ready for Orchestrator escalation.
+  3. Worktree-smart permissions auto-allow inside-worktree writes while gating shell commands and outside-worktree writes.
 
 ---
 
-## Phase 3: Network Switch Router & Embedded MCP Bridge (`mh-switch`, `mh-server` CLI)
+## Phase 3: Parallel Network Switch, `peer_consult` & Embedded MCP Bridge (`mh-switch`, `mh-server` CLI)
 
 ### Goals
-Enable multi-harness group chat routing, delta context envelopes, hop-limit loop protection, and active peer-to-peer communication + trajectory reading via `meta-harness mcp-bridge`.
+Connect parallel session members over the Switch Bus with async `@mention` routing, synchronous deadlock-free `peer_consult`, `trajectory_read` pills, and hop protection.
 
 ### Tasks
-1. **Switch Router & Hop Guard (`router.rs`)**:
-   - Route incoming user messages and finalized agent replies through `mh-core` mention parser.
-   - Track `chain_id` and `hops_remaining` (`max_hops` default `6`); emit `switch.hop_limit_paused` when exhausted, with resume capability (`+N` hops).
-   - Construct `<group_chat_updates>` XML delta envelopes per `(session_id, harness_id)` and advance `last_seen_msg_seq` upon prompt dispatch.
-   - Automatically extract and persist an `EpisodicJob` entry in `mh-store` when an executor turn completes.
-2. **Embedded Switch MCP Server & Stdio Bridge (`mcp.rs` + `mcp-bridge` subcommand)**:
-   - Implement `meta-harness mcp-bridge` CLI subcommand in `mh-server`: lightweight stdio JSON-RPC loop forwarding MCP `initialize`, `tools/list`, and `tools/call` to `POST /internal/mcp` authenticated with `MH_BRIDGE_TOKEN`.
-   - Implement handlers for peer switch tools (`chat_list_peers`, `chat_read_messages`, `chat_send_message`, `trajectory_list`, `trajectory_read`, `memory_recall`, `memory_record_fact`) with bounded payload pagination (max 16 KB per `trajectory_read` call).
+1. **Parallel Session Router (`router.rs`)**:
+   - Per-member turn queue allowing distinct members (`@codex`, `@claude`, `@codex-reviewer`) to run `session/prompt` concurrently in their own worktrees while serializing turns targeting the *same* member.
+   - `<group_chat_updates>` XML delta builder per `SessionMember`.
+   - `chain_id` hop budget (`max_hops = 6`) + global `Stop All` (`session/cancel` across all active members + aborting pending consult waits in <250ms).
+2. **`mcp-bridge` Subcommand & Switch MCP Handlers (`mcp.rs`)**:
+   - Implement `meta-harness mcp-bridge` stdio-to-HTTP forwarder authenticated via `MH_BRIDGE_TOKEN`.
+   - Implement `chat_list_peers`, `chat_read_messages`, `chat_send_message`, `peer_consult` (wired to `WaitForGraph` + creating `consult_thread` chat messages), `trajectory_list`, `trajectory_read` (emitting `activity_pill` events), `memory_recall`, and `memory_record_fact`.
 
 ### Verification Gate
-- Automated switch test: User tells `@mock-a` to write `hello.txt` and ask `@mock-b` to review its trajectory. `@mock-a` writes `hello.txt` and outputs `@mock-b please review`; Switch dispatches `@mock-b`; `@mock-b` calls `trajectory_read` via `mcp-bridge`, sees the unified diff of `hello.txt`, and replies to the group chat; `episodic_jobs` records both jobs; loop test confirms chain halts cleanly at `max_hops`.
+- Multi-agent switch integration test:
+  1. `@mock-a` and `@mock-b` run in parallel; `@mock-a` calls `peer_consult` on idle `@mock-c` mid-turn and receives synchronous reply; mutual `A <-> B` `peer_consult` is caught immediately by `WaitForGraph` without deadlocking.
+  2. `@mock-b` calls `trajectory_read` on `@mock-a` and receives paginated diffs while Group Chat records an `activity_pill`.
 
 ---
 
-## Phase 4: Orchestrator Pipeline & Subscription Quota Engine (`mh-acp::quota`, `mh-switch::orchestrator`)
+## Phase 4: Orchestrator, Conflict Resolver, LLM Memory Curator & Quota Engine
 
 ### Goals
-Implement unmentioned prompt orchestration with subscription usage lookup, complexity/model/effort matching, and automatic failover on quota exhaustion.
+Deliver intelligent unmentioned task routing (including self-brand executor dispatch), automatic merge-conflict escalation, Orchestrator-curated episodic memory, and subscription usage tracking.
 
 ### Tasks
-1. **Subscription Quota Tracker (`crates/mh-acp/src/quota.rs`)**:
-   - Implement `QuotaProvider` trait with adapters for:
-     - `codex_local`: inspects `~/.codex/` local session token activity + Meta-Harness turn ledger + optional cached status probe.
-     - `claude_local`: inspects `~/.claude/` local project/session activity + Meta-Harness turn ledger + user-calibrated plan tier (`Pro`, `Max 5x`, `Max 20x`).
-     - `google_local`: inspects `~/.gemini/` activity + Meta-Harness turn ledger + plan tier.
-   - Implement reactive `429` / rate-limit error detector that marks `rate_limited_until` cooldowns immediately.
-2. **Orchestrator Dispatch Pipeline (`crates/mh-switch/src/orchestrator.rs`)**:
-   - Build compact `<orchestrator_telemetry>` prompt injector (live `QuotaSnapshot` table, per-harness `configOptions` models & efforts, static model strength tags from `harnesses.toml`, and top 5 FTS5 episodic memories).
-   - Implement MCP tools `quota_get_status`, `models_list_catalog`, and `orchestrator_dispatch`.
-   - Validate `orchestrator_dispatch` calls -> emit `dispatch_card` message to group chat -> apply `session/set_config_option` (`model` + `reasoning_effort`) on target executor -> execute executor turn (supporting sequential chains and read-only parallel fan-out).
-   - Add deterministic fallback heuristic if the Orchestrator harness itself hits a rate limit!
+1. **Multi-Tier Subscription Quota Engine (`crates/mh-acp/src/quota.rs`)**:
+   - Adapter-level `QuotaTracker` (shared across personas of the same `adapter_id`).
+   - Safe default telemetry: local CLI session logs (`~/.codex`, `~/.claude`, `~/.gemini`) + Meta-Harness turn accounting + ACP status metadata + reactive `429` circuit breaker calibrated to user plan tier.
+   - Opt-in exact quota probe toggle (`exact_quota_probe_opt_in`) per adapter.
+2. **Orchestrator Dispatch, Conflict Resolution & Memory Curation (`crates/mh-switch/src/orchestrator.rs`)**:
+   - Pre-inject `<orchestrator_telemetry>` into Orchestrator turns; support pragmatic direct replies, auto-dispatch (`orchestrator_dispatch` with live cancel/reroute), and optional `confirm_before_dispatch` mode.
+   - Support dispatching to an executor member sharing the Orchestrator's own `adapter_id` (running in `_exec_<handle>` while Orchestrator stays in `_integration`).
+   - **Conflict & Wave Escalation**: Automatically wake Orchestrator in `_integration` when `GitWorktreeBroker` encounters merge conflicts or when a multi-executor wave completes.
+   - **Curated Memory Pass**: Piggyback `memory_curate_job` onto active Orchestrator merge/synthesis turns, or trigger a lightweight `low`-effort Orchestrator curation pass after clean single-executor merges (with deterministic fallback if no Orchestrator is set).
 
 ### Verification Gate
-- Integration test verifying:
-  1. Unmentioned prompt routes to Orchestrator, which calls `orchestrator_dispatch` selecting `mock-pro` + `high` effort for a complex architecture prompt vs `mock-fast` + `low` effort for a typo fix.
-  2. When `@mock-a`'s simulated 5h quota is set to `5%` (or `429`), Orchestrator selects `@mock-b` (`88%` remaining) and surfaces the quota rationale in the `dispatch_card`.
+- Integration tests verifying:
+  1. Quota-aware failover when primary adapter is `<15%` or `429`, and shared quota accounting when `@claude` (Orchestrator) dispatches to `@claude` (Executor).
+  2. Merge conflict between `@mock-a` and `@mock-b` automatically wakes Orchestrator in `_integration`, resolves the conflict cleanly, and writes curated `episodic_jobs` + `project_facts` entries searchable via FTS5.
 
 ---
 
-## Phase 5: Axum Server & Responsive Group-Chat Web UI (`mh-server`, `web/`)
+## Phase 5: Axum Server (+ LAN Token Auth) & Responsive Web UI (`mh-server`, `web/`)
 
 ### Goals
-Deliver a fast, low-memory HTTP + multiplexed WebSocket backend and a polished, keyboard-friendly group chat UI.
+Build the low-memory HTTP/WS backend (with optional LAN/Tailscale bearer auth) and the user-friendly 3-column Group Chat + Worktree Promotion SPA.
 
 ### Tasks
 1. **`crates/mh-server`**:
-   - Implement REST endpoints and `/api/ws` multiplexed WebSocket hub (`docs/SPECIFICATION.md` §7) with 25ms stream chunk coalescing and selective trajectory subscription.
-   - Serve compiled `web/dist` static assets (`tower-http` / `rust-embed`) so production runs as a single self-contained binary on `http://127.0.0.1:4410`.
+   - REST + `/api/ws` multiplexed WebSocket hub with 25ms delta coalescing and selective trajectory streaming.
+   - Localhost (`127.0.0.1:4410`) zero-friction default + `--bind` remote mode with random bearer token / pairing URL -> `HttpOnly` cookie exchange.
+   - Static asset embedding (`web/dist`) for single-binary deployment.
 2. **`web/` Frontend**:
-   - **Left Sidebar**: Project folder switcher/browser, session list, Harness Roster with status badges, Orchestrator crown selector, and 5h/Weekly quota bars.
-   - **Center Group Chat**:
-     - `@tanstack/react-virtual` message list with memoized Markdown + syntax highlighting.
-     - Orchestrator Dispatch Cards, Trajectory Summary Pills (`Inspect ->`), Hop Limit Pause banner, and inline Permission Approval Cards (`Alt+A` / `Alt+R`).
-     - Smart Composer with `@mention` popup (including optional `[model:effort]` selector), `#file` path completions, live routing target preview, and `Stop All` button.
-   - **Right Drawer**:
-     - **Trajectory Inspector**: Live thoughts, tool calls, terminal runs, and unified file diffs.
-     - **Memory Ledger**: Searchable high-level jobs ("Who did what") + pinned project facts.
-     - **Switch & Quotas Settings**: Plan tier calibration, custom harness command config, hop budget slider.
+   - **Left Sidebar**: Project picker (+ 1-click `git init` modal for non-Git folders), Session list, Member Roster (`+ Add Persona`, Orchestrator crown toggle, live parallel status badges, shared adapter 5h/Weekly quota bars).
+   - **Top Session Changes Bar**: Ahead/behind stats for `mh/s-<id>`, cumulative diff viewer modal, **"Preview/Shell in Session Worktree"** launcher, and 3-mode **Promote** dropdown (`Fast-Forward / Merge`, `Squash Merge`, `Apply Patch`).
+   - **Center Virtualized Group Chat**: Multi-agent markdown bubbles, Orchestrator Dispatch Cards (Cancel / Reroute / Confirm), collapsible `peer_consult` threads, `trajectory_read` activity pills, Git auto-merge/conflict badges, Worktree-Smart Permission Cards (`Alt+A` / `Allow pattern for session` / `Alt+R`), and `@mention` + `#file` composer.
+   - **Right Drawer**: Live Trajectory Inspector (switchable across parallel running members), Curated Memory Ledger, and Switch/Quota Settings (plan tiers + opt-in exact quota toggles).
 
 ### Verification Gate
 - `npm run typecheck && npm run test && npm run build` pass.
-- End-to-end UI test (or Playwright/Vitest suite) verifying project creation, `@mention` autocomplete, streaming chat rendering without dropped frames, trajectory drawer inspection, permission approval, and memory ledger editing.
+- Automated server + UI tests covering LAN token auth guard, parallel streaming chat rendering, collapsible consult threads, permission pattern whitelisting, and 3-mode branch promotion.
 
 ---
 
-## Phase 6: Live Harness Integration, Resource Tuning & Hardening
+## Phase 6: Live Harness Integration, End-to-End Polish & Resource Audit
 
 ### Goals
-Validate real-world compatibility with installed CLI harnesses on Windows (`@agentclientprotocol/codex-acp`, `@agentclientprotocol/claude-agent-acp`, `agy --acp` / `gemini --acp`) and verify memory/CPU budgets.
+Verify seamless real-world operation with installed CLI harnesses on Windows (`codex-acp`, `claude-agent-acp`, `agy --acp` / `gemini --acp`) and validate resource footprint targets.
 
 ### Tasks
-1. **Harness Doctor & Onboarding Probe (`GET /api/harnesses/probe`)**:
-   - Detect which CLIs (`codex`, `claude`, `agy`, `gemini`, `npx`) are installed and signed in on the user's PC, surfacing one-click setup hints in the UI for any uninstalled adapter (never blocking installed ones).
-2. **Real-World Adapter Quirk Handling**:
-   - Test `codex-acp` on this machine (Codex CLI is already installed at `C:\Users\panzh\AppData\Local\Programs\OpenAI\Codex\bin\codex.exe` and Node v24 is available) to verify `configOptions` IDs for model & reasoning effort, Windows path formatting, and `mcp-bridge` tool calls.
-   - Verify graceful error cards when an adapter is missing authentication (`codex login`, `claude login`, `agy`).
-3. **Resource & Performance Audit**:
-   - Confirm `meta-harness.exe` idle RSS < 30 MB, SQLite WAL checkpointing works cleanly, idle harness subprocesses hibernate on schedule, and shutting down `meta-harness` leaves zero orphan subprocesses in Windows Task Manager.
+1. **Adapter Doctor (`GET /api/adapters/probe`)**:
+   - Auto-detect installed CLIs (`codex`, `claude`, `agy`, `gemini`, `npx`) and login state on Windows, displaying clear onboarding badges in UI.
+2. **Live Multi-Harness Smoke Test**:
+   - Test a real session on this PC (Codex CLI + Node v24 already present) exercising lazy worktree creation, `session/set_config_option` (`model` + `reasoning_effort`), `mcp-bridge` tool calls, Orchestrator memory curation, and Squash/Merge promotion back to a test repo's `main` branch.
+3. **Resource & Cleanup Audit**:
+   - Verify `meta-harness.exe` idle RSS < 30 MB, clean `.git/worktrees` pruning on session delete, idle subprocess hibernation, and zero orphan processes on server shutdown.
 
 ### Verification Gate
-- Full `cargo clippy --workspace -- -D warnings`, `cargo test --workspace`, `npm run build`, plus live smoke test running a session on a sample folder with real ACP adapter(s).
+- `cargo fmt --all -- --check`, `cargo clippy --workspace --all-targets -- -D warnings`, `cargo test --workspace`, `npm run build`, and clean Windows live smoke run.

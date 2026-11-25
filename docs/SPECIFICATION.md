@@ -2,227 +2,200 @@
 
 ## 1. System Overview
 
-**Meta-Harness** is a local-first web application that coordinates multiple AI coding harnesses (**Codex**, **Claude Code**, **Antigravity / Gemini CLI**, and custom ACP-compliant agents) inside **project-scoped group chat sessions**.
+**Meta-Harness** is a local-first web application that coordinates multiple AI coding harnesses (**Codex**, **Claude Code**, **Antigravity / Gemini CLI**, and custom ACP-compliant agents/personas) inside **project-scoped group chat sessions**.
 
-Instead of re-implementing an LLM agent loop with raw API keys, Meta-Harness acts as:
-1. **An ACP Client Hub** speaking JSON-RPC 2.0 over stdio to locally installed agent harnesses (reusing the user's existing AI subscriptions).
-2. **An L2/L3 Agent Network Switch** routing messages (`@mentions`), exposing cross-harness **Trajectory Inspection** and **Peer Messaging** via an injected local MCP bridge (`meta-harness mcp-bridge`), and enforcing hop/loop safety.
-3. **An Intelligent Orchestration Plane** where a user-selected **Orchestrator Harness** inspects live subscription usage/quotas, model characteristics, task complexity, and high-level episodic memory before dispatching work to an **Executor Harness** with tailored `model` and `reasoning_effort` settings.
+Meta-Harness combines four architectural layers inside a single low-footprint Rust binary + virtualized React SPA:
+1. **Isolated Git Worktree Fabric**: Every session maintains a clean **Session Integration Branch/Worktree** (`mh/s-<id>`) plus **per-executor Git worktrees** (`mh/s-<id>/<member>`), allowing multiple harnesses to execute genuinely **in parallel** without clobbering each other or touching the user's main checkout until promoted.
+2. **ACP Client Hub**: Speaks JSON-RPC 2.0 over stdio (`agent-client-protocol`) to locally installed CLI harnesses, inheriting the user's existing AI subscriptions (`~/.codex`, `~/.claude`, `~/.gemini`).
+3. **L2/L3 Agent Network Switch**: Connects all session members via an injected single-binary MCP bridge (`meta-harness mcp-bridge`), enabling async `@mention` handoffs, synchronous deadlock-checked mid-turn `peer_consult` calls, and live cross-harness `trajectory_read` inspection.
+4. **Quota-Aware Orchestrator & Curated Memory Plane**: Routes unmentioned prompts by evaluating subscription quota headroom, task complexity, model characteristics, and project memory; resolves cross-worktree merge conflicts; and curates high-level episodic memory (`SQLite + FTS5`) after each completed job.
 
 ```mermaid
 flowchart TB
-    subgraph Browser["Web Frontend (React + Vite + Zustand)"]
-        ChatUI["Group Chat & @Mention Composer"]
-        Drawer["Trajectory Inspector & Memory Ledger"]
-        Roster["Harness Roster & Live Quota Meters"]
+    subgraph Browser["Web Frontend (127.0.0.1 Default / Optional Token LAN)"]
+        ChatUI["Group Chat, Collapsible Consults & @Mention Composer"]
+        GitBar["Session Changes Bar, Preview Launcher & 3-Mode Promote"]
+        Drawer["Trajectory Inspector, Curated Memory & Quota Settings"]
     end
 
-    subgraph Backend["Rust Backend (`meta-harness` binary)"]
-        WS["Axum REST + Multiplexed WebSocket Hub"]
-        Switch["Network Switch Router (Mention Parser, Hop Guard, Delta Sync)"]
-        Orch["Orchestrator Pipeline & Quota/Complexity Telemetry"]
-        Mem["Episodic Memory Engine (SQLite + FTS5)"]
-        Broker["ACP Supervisor & Workspace File/Terminal Broker"]
-        MCPHub["Internal Switch MCP Endpoint (`/internal/mcp`)"]
+    subgraph Backend["Rust Backend (`meta-harness` single binary)"]
+        WS["Axum REST + WS Hub (+ Optional Bearer Auth)"]
+        Switch["Switch Router (Parallel Queue, Hop Guard, Wait-For DAG)"]
+        Orch["Orchestrator Pipeline, Memory Curator & Quota Engine"]
+        GitBroker["Git Worktree Broker (Zero-Token Clean Merge & Sync)"]
+        Mem["Episodic Memory Store (SQLite WAL + FTS5)"]
+        ACPSup["ACP Process Supervisor & Worktree-Smart Permission Broker"]
     end
 
-    subgraph Harnesses["Local Agent Harnesses (User Subscriptions)"]
-        Codex["@codex (`codex-acp` stdio)"]
-        Claude["@claude (`claude-agent-acp` stdio)"]
-        AGY["@antigravity (`agy --acp` stdio)"]
-        Bridge["`meta-harness mcp-bridge` (stdio <-> HTTP)"]
+    subgraph Worktrees["Isolated Session Git Worktrees"]
+        WTInt["`_integration` (`mh/s-1a2b`)\nOrchestrator CWD"]
+        WTCodex["`_exec_codex` (`mh/s-1a2b/codex`)"]
+        WTClaude["`_exec_claude` (`mh/s-1a2b/claude`)"]
     end
 
     Browser <-->|"HTTP + WS JSON"| WS
     WS <--> Switch
     Switch <--> Orch
+    Switch <--> GitBroker
     Switch <--> Mem
-    Switch <--> Broker
-    Broker <-->|"ACP JSON-RPC (stdio)"| Codex
-    Broker <-->|"ACP JSON-RPC (stdio)"| Claude
-    Broker <-->|"ACP JSON-RPC (stdio)"| AGY
-    Codex & Claude & AGY <-->|"MCP (stdio)"| Bridge
-    Bridge <-->|"Localhost HTTP + Bearer Token"| MCPHub
-    MCPHub <--> Switch
-    MCPHub <--> Mem
-    MCPHub <--> Orch
+    Switch <--> ACPSup
+    ACPSup <-->|"ACP stdio + `mcp-bridge`"| WTInt & WTCodex & WTClaude
+    GitBroker -->|"Auto-merge / Conflict Escalate"| WTInt
+    WTCodex & WTClaude -.->|"Clean Merge / Rebase"| GitBroker
 ```
 
 ---
 
-## 2. Core Domain Concepts
+## 2. Core Domain Model: Adapters, Members & Worktrees
 
-### 2.1 Project
-- Represents a validated directory on the local filesystem (`root_path`, normalized via `dunce::canonicalize`).
-- Tracks basic repository context (`is_git_repo`, current branch, dirty status) and owns **Project Episodic Memory** shared across sessions in that folder.
+### 2.1 `HarnessAdapter` vs. `SessionMember`
+To allow the **Orchestrator's harness brand to also execute coding tasks** (and let users create custom personas like `@codex-reviewer` even with a single subscription), Meta-Harness decouples adapters from group-chat participants:
 
-### 2.2 Session (Group Chat Room)
-- Created under a specific **Project** (`cwd = project.root_path`, or an optional dedicated subdirectory/git worktree).
-- Contains:
-  - **Participants**: The `user` plus an active subset of registered **Harness Profiles** (e.g., `["codex", "claude", "antigravity"]`).
-  - **Orchestrator Config**: Optional `orchestrator_harness_id` (e.g., `"antigravity"` or `"claude"`), optional fixed orchestrator `model` / `reasoning_effort` (typically fast/low-cost for triage), and routing policy (`auto_dispatch`, `confirm_before_dispatch`).
-  - **Switch Policy**: `max_agent_hops_per_user_turn` (default `6`), permission policy (`prompt`, `allow_edits_prompt_shell`, `yolo_sandboxed`).
+- **`HarnessAdapter`** (`adapter_id`: `"codex"`, `"claude"`, `"antigravity"`, or custom):
+  - Defines the underlying ACP command/args, discovered `configOptions` (`models`, `reasoning_efforts`), static capability tags, and **shared Subscription Quota Bucket**.
+- **`SessionMember`** (`handle`: `"codex"`, `"claude"`, `"codex-reviewer"`, etc.):
+  - Belongs to a `Session`, references an `adapter_id`, holds an optional `persona_prompt`, `role` (`orchestrator` | `executor`), its own ACP `sessionId`, `last_seen_msg_seq`, and its own Git worktree path!
+  - *Example*: If the user sets `@claude` as the Session's **Orchestrator**, Meta-Harness maintains an orchestrator context in `_integration` **and** allows `orchestrator_dispatch(target = "claude", ...)` to run coding work in `_exec_claude`, accounting both turns against the `claude` adapter's quota snapshot.
 
-### 2.3 Message vs. Trajectory
-- **Chat Message**: High-signal item in the group chat stream:
-  - `user_text`: Human prompt (with optional `@mentions` and file attachments/paths).
-  - `orchestrator_dispatch`: Structured routing card showing chosen executor, model, reasoning effort, quota snapshot, and rationale.
-  - `agent_reply`: Top-level conversational response emitted by a harness, linked `1:1` to a `turn_id` Trajectory.
-  - `system_notice` / `permission_request`: Switch lifecycle alerts, hop-limit pauses, or interactive tool-approval cards.
-- **Trajectory (`TurnTrajectory`)**: All granular ACP `session/update` events recorded during a single `session/prompt` execution (`turn_id`):
-  - `thought_chunks` (coalesced reasoning blocks)
-  - `plan_updates` (agent step checklists)
-  - `tool_calls` (name, input args, status, condensed output, duration)
-  - `file_edits` (path, unified diff, before/after sha256)
-  - `terminal_runs` (command, cwd, exit code, tail output)
+### 2.2 Git Worktree Lifecycle & Integration Flow (`mh-acp::worktree`)
 
----
+```mermaid
+sequenceDiagram
+    participant U as User (Main Checkout: `main`)
+    participant S as Switch & Rust Git Broker
+    participant E as Executor `@codex` (`mh/s-1/codex`)
+    participant O as Orchestrator (`mh/s-1` _integration)
 
-## 3. ACP Client Lifecycle & Harness Supervision (`mh-acp`)
-
-### 3.1 Lazy Spawning & Subscription Inheritance
-1. Harnesses are **not** spawned when `meta-harness` starts or when a session opens. A subprocess spawns lazily on its first assigned turn in a session.
-2. Child processes inherit `USERPROFILE` / `HOME`, `APPDATA`, `LOCALAPPDATA`, and `PATH` so existing logins (`~/.codex/auth.json`, `~/.claude/`, `~/.gemini/`) work seamlessly with zero credential copying.
-3. On Windows, every child process is immediately attached to a Win32 Job Object configured with `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`.
-4. An idle reaper checks harnesses every 60s; processes idle longer than `idle_process_ttl_secs` (default `900s`) are gracefully terminated and transparently respawned (`session/load` if supported by the agent's `agentCapabilities.loadSession`, otherwise `session/new` seeded with the session's compact working summary) on next message.
-
-### 3.2 ACP Handshake & Configuration Flow
-For each spawned harness in a session:
-1. **`initialize`**:
-   - Advertises client capabilities: `fs: { readTextFile: true, writeTextFile: true }`, `terminal: true`.
-   - Captures `agentCapabilities` and supported features.
-2. **`session/new`** (or **`session/load`**):
-   - Passes `cwd = session.project_root`.
-   - Injects the **Switch MCP Bridge** into `mcpServers`:
-     ```json
-     {
-       "cwd": "C:/Users/panzh/my-project",
-       "mcpServers": [
-         {
-           "name": "meta-harness-switch",
-           "command": "C:/path/to/meta-harness.exe",
-           "args": [
-             "mcp-bridge",
-             "--url", "http://127.0.0.1:4410/internal/mcp",
-             "--session", "<session_id>",
-             "--caller", "<harness_handle>"
-           ],
-           "env": [
-             { "name": "MH_BRIDGE_TOKEN", "value": "<ephemeral_hmac_token>" }
-           ]
-         }
-       ]
-     }
-     ```
-   - Inspects returned `configOptions` array and indexes option IDs by semantic category (`model`, `thought_level` / `reasoning_effort`, `mode`) alongside their allowed `options` values.
-3. **`session/set_config_option`** (Dynamic Model & Effort Selection):
-   - Before invoking `session/prompt`, if the Orchestrator or user requested a target `model` or `reasoning_effort` that differs from the harness's active value, `mh-acp` fuzzy-matches or maps the requested value against the harness's advertised `configOptions` and sends `session/set_config_option`.
-   - If a harness does not advertise a `reasoning_effort` selector for a specific non-reasoning model, `mh-acp` logs a benign notice and skips setting effort rather than failing the turn.
-4. **`session/prompt` & Delta Context Envelope**:
-   - Maintains `last_seen_message_seq` per `(session_id, harness_handle)`.
-   - Prepends unseen group-chat messages since `last_seen_message_seq` in a compact XML envelope so the harness sees what user and peer agents said since its last turn without duplicating prior context:
-     ```xml
-     <group_chat_updates session="proj-alpha" your_handle="@codex">
-       <msg id="41" from="user" to="@claude">Design the REST endpoints for tasks.</msg>
-       <msg id="42" from="@claude" turn_id="t_89">Here is the OpenAPI contract in docs/api.md. @codex please implement the Axum handlers.</msg>
-     </group_chat_updates>
-     ```
-5. **Client Callback Broker (`fs/*`, `terminal/*`, `session/request_permission`)**:
-   - **Path Guard**: Rejects `fs/read_text_file` or `fs/write_text_file` outside `session.project_root` unless approved via an explicit user permission prompt.
-   - **Diff Capture & Conflict Lock**: Before executing `fs/write_text_file`, snapshots prior file content to compute a unified diff stored in `TurnTrajectory`, and checks if another harness has an uncommitted write lock on that path in the same active chain.
-   - **Permission Forwarding**: Emits `permission.requested` over WebSocket to the UI and awaits a `oneshot` channel resolution (`allow_once`, `allow_always_session`, `reject`)—or auto-resolves if matched by session permission rules.
-
----
-
-## 4. Network Switch & Inter-Harness MCP Bridge (`mh-switch`)
-
-### 4.1 Mention Grammar & Routing Table
-1. Pre-process message markdown to mask fenced code blocks and inline backticks.
-2. Match `(?:^|\s)@([a-zA-Z0-9_-]+)(?:\[([a-zA-Z0-9._-]+)(?::([a-zA-Z0-9_-]+))?\])?`:
-   - `@codex` -> routes to `codex` using current/default model & effort.
-   - `@codex[gpt-5.4:high]` -> optional power-user inline override setting `model = gpt-5.4`, `reasoning_effort = high` before prompting.
-   - `@all` -> broadcasts sequentially or concurrently (read-only advisory mode unless confirmed) to all active session harnesses.
-   - `@orchestrator` -> explicitly invokes the Orchestrator Harness.
-3. **Unmentioned User Message**:
-   - If `session.orchestrator_harness` is set -> routes to the Orchestrator Pipeline (Section 5).
-   - Otherwise -> routes to `session.default_harness` (or prompts user in UI if multiple harnesses exist and none is default).
-4. **Agent Output Mention Routing**:
-   - When an agent finishes a turn (or calls `chat_send_message`), if its message addresses `@<peer_handle>` and `chain.hops_remaining > 0`, the Switch decrements `hops_remaining` and enqueues a turn for `<peer_handle>`.
-
-### 4.2 Switch MCP Tools Exposed to Harnesses
-Every harness receives these tools automatically via `meta-harness-switch`:
-
-| Tool Name | Who Can Call | Parameters | Behavior |
-| :--- | :--- | :--- | :--- |
-| `chat_list_peers` | All harnesses | `{}` | Returns session members, handles, live status (`idle`/`working`), current model, and role (`orchestrator`/`executor`). |
-| `chat_read_messages` | All harnesses | `{ limit?: u32, before_seq?: i64 }` | Fetches recent group chat messages for situational context. |
-| `chat_send_message` | All harnesses | `{ to?: string[], content: string }` | Posts an intermediate or handoff message into the group chat and triggers `@to` recipients (consumes 1 hop). |
-| `trajectory_list` | All harnesses | `{ harness?: string, limit?: u32 }` | Lists recent turns (`turn_id`, `harness`, `summary`, `touched_files`, `status`, `created_at`). |
-| `trajectory_read` | All harnesses | `{ turn_id: string, detail: "summary" \| "tool_calls" \| "diffs" \| "full", page?: u32 }` | Reads a peer harness's trajectory at bounded token budgets (max 16 KB per page) so agents can inspect diffs, errors, or reasoning without context overflow. |
-| `memory_recall` | All harnesses | `{ query?: string, path_prefix?: string, limit?: u32 }` | Queries high-level project episodic memory (`episodic_jobs` + `project_facts`) via SQLite FTS5. |
-| `memory_record_fact` | All harnesses | `{ category: string, summary: string }` | Saves a concise architectural decision or ownership note to project memory. |
-| `quota_get_status` | Orchestrator (or all) | `{}` | Returns normalized subscription usage & headroom across all harnesses. |
-| `models_list_catalog` | Orchestrator | `{}` | Returns live ACP `configOptions` (`models`, `efforts`) merged with model strength profiles. |
-| `orchestrator_dispatch` | Orchestrator | `{ dispatches: [{ target: string, model?: string, effort?: string, task_brief: string, mode?: "sequential" \| "parallel_readonly" }], rationale: string }` | Configures executor harness(es) via `session/set_config_option` and dispatches the structured task brief(s). |
-
----
-
-## 5. Orchestrator & Subscription Quota Intelligence
-
-### 5.1 Multi-Tier Subscription Usage Tracker
-Because user-authenticated CLI harnesses expose usage differently, `mh-acp::quota` combines three non-intrusive signal sources into a unified `QuotaSnapshot` per harness:
-
-```rust
-pub struct QuotaSnapshot {
-    pub harness_id: String,
-    pub plan_label: Option<String>,          // e.g., "ChatGPT Plus", "Claude Max 5x", "Google AI Pro"
-    pub window_5h_remaining_pct: Option<f32>,// 0.0..=100.0
-    pub window_5h_resets_at: Option<i64>,
-    pub weekly_remaining_pct: Option<f32>,   // 0.0..=100.0
-    pub weekly_resets_at: Option<i64>,
-    pub local_5h_tokens_est: u64,            // Measured from Meta-Harness turns + local CLI session logs
-    pub rate_limited_until: Option<i64>,     // Set immediately on 429 / quota error
-    pub source: QuotaSource,                 // LiveProbe | LocalLogEstimate | UserCalibrated | Cooldown429
-}
+    U->>S: Create Session (bases `mh/s-1` off `main` HEAD)
+    U->>S: "@codex implement JWT verifier" (or via Orchestrator)
+    S->>E: Sync `mh/s-1/codex` to `mh/s-1`, run ACP `session/prompt`
+    E-->>S: Turn complete (files modified in `_exec_codex`)
+    S->>S: Auto-commit dirty files on `mh/s-1/codex` & attempt `git merge` into `mh/s-1`
+    alt Clean Merge (Zero Conflict)
+        S->>S: Fast-forward `mh/s-1` (0 LLM tokens!) & sync idle peer worktrees
+        S->>O: Lightweight low-effort pass -> curate Episodic Memory entry
+    else Merge Conflict or Multi-Agent Wave Synthesis
+        S->>O: Wake Orchestrator in `_integration` with peer trajectories + conflict markers
+        O-->>S: Resolves conflict, commits merge + curates Episodic Memory entry
+    end
+    U->>S: Preview/Test in `_integration` -> Promote (FF/Merge | Squash | Patch) to `main`
 ```
 
-1. **Local Log & Turn Accounting (Zero Overhead, Always Available)**:
-   - Reads local session metadata where present (`~/.codex/sessions`, `~/.claude/projects`, `~/.gemini/`) and sums rolling 5-hour / 7-day turns & token estimates observed by Meta-Harness, normalized against user-configurable plan baselines.
-2. **Cached Status Probe (Optional, TTL = 10 min)**:
-   - Parses non-LLM status endpoints/commands when available without consuming prompt completions.
-3. **Reactive 429 / Exhaustion Circuit Breaker**:
-   - If an ACP `session/prompt` fails with a quota/rate-limit error, `QuotaTracker` immediately marks `rate_limited_until` and triggers automatic Orchestrator re-routing if mid-dispatch.
-
-### 5.2 Complexity, Model & Effort Selection Matrix
-To minimize latency and token overhead on unmentioned user turns, `mh-switch` pre-injects a compact `<orchestrator_telemetry>` block (~150–250 tokens) into the Orchestrator's prompt containing:
-1. Live `QuotaSnapshot` summary for all enabled session harnesses.
-2. Available `(model, reasoning_effort)` pairs per harness from ACP `configOptions` + capability tags (`strengths`, `relative_quota_cost`).
-3. Top 5 relevant `episodic_jobs` from FTS5 matching keywords/paths in the user's message.
-
-The Orchestrator applies four decision rules (codified in its role prompt and validated by `orchestrator_dispatch`):
-- **Trivial / Quick Lookup / Small Edit**: Pick fast model + `low` reasoning effort on a harness with ample 5h headroom.
-- **Standard Feature / UI Component / Test Suite**: Match domain affinity (e.g., frontend/UX -> `@claude`, systems/Rust/CLI -> `@codex`, broad cross-repo research -> `@antigravity`) + `medium` effort.
-- **Hard Architecture / Concurrency Bug / Tricky Refactor**: Select top-tier model + `high` (or `xhigh`) reasoning effort, provided `window_5h_remaining_pct > 25%`; if primary harness is below `15%` quota, automatically shift to the highest-headroom capable peer and explain the substitution in the Dispatch Card.
-- **Continuity Bias**: If `episodic_jobs` shows `@codex` just implemented module `X` in the previous job and has healthy quota, prefer `@codex` for follow-up fixes in `X` (leveraging warm ACP session context!).
+1. **Non-Git Directory Onboarding**:
+   - When opening a folder without `.git`, the UI prompts: **[Initialize Git Repository (Recommended)]** (runs `git init -b main` + initial commit so full worktree isolation works) or **[Use Shared Folder Mode]** (disables parallel writes and enables per-file write locks).
+2. **Worktree Storage Layout**:
+   - Stored under `<project_root>/.meta-harness/worktrees/<session_id>/` (automatically excluded via `.git/info/exclude` so `.gitignore` in the user's repo stays clean without polluting `git status`!).
+   - `_integration` checks out `mh/s-<short_id>`.
+   - `_exec_<handle>` checks out `mh/s-<short_id>/<handle>` (created lazily when that member first executes).
+3. **Promotion Modes to User's Main Checkout**:
+   - **Fast-Forward / Merge Commit**: Merges `mh/s-<short_id>` into `<base_branch>` (auto-stashing and restoring uncommitted user edits if requested, or warning cleanly if dirty).
+   - **Squash Merge**: Collapses session commits into a single clean commit on `<base_branch>`.
+   - **Apply Patch**: Applies `git diff <base_sha>..mh/s-<short_id>` onto the user's main working tree without creating commits, letting the user review/stage manually.
+   - **Preview / Dev Shell Helper**: Launches a terminal or user command (`npm run dev`, `cargo test`) directly inside `_integration` so integrated agent work can be verified live before touching the main checkout.
 
 ---
 
-## 6. High-Level Episodic Memory Engine (`mh-store`)
+## 3. ACP Client Lifecycle & Worktree-Smart Permissions (`mh-acp`)
 
-### 6.1 Design Scope
-Memory strictly captures **who did what, where, and with what outcome**—never raw file contents or verbose tool outputs.
+### 3.1 Lazy Spawning, Hibernation & Windows Job Objects
+1. Subprocesses spawn lazily on first turn in a session, inheriting `USERPROFILE`/`HOME`, `APPDATA`, `LOCALAPPDATA`, and `PATH` to reuse existing CLI subscriptions.
+2. Every spawned process on Windows is bound to a Win32 Job Object (`JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`) to prevent orphan `node.exe` / CLI leaks.
+3. Processes idle beyond `idle_process_ttl_secs` (`900s`) hibernate and transparently resume via ACP `session/load` (if advertised) or `session/new` seeded with the session's compact working summary + last worktree state.
 
-### 6.2 Automatic + Explicit Capture
-When an executor turn completes:
-1. **Deterministic Extraction (Zero LLM calls)**:
-   - `executor_harness`, `model`, `reasoning_effort`
-   - `task_brief` (from Orchestrator dispatch or user `@mention` prompt, truncated to 240 chars)
-   - `outcome_summary` (first/final summary paragraph of agent reply, truncated to 400 chars)
-   - `touched_paths` (deduplicated relative paths modified during the turn via `fs/write_text_file` or `git status --porcelain` delta)
-   - `status` (`completed` | `cancelled` | `failed`)
-2. **FTS5 Indexing**: Indexed over `(executor_harness, task_brief, outcome_summary, touched_paths_text)` for sub-millisecond recall.
+### 3.2 ACP Handshake, MCP Injection & `session/set_config_option`
+1. **`initialize`** -> negotiates `fs` (`readTextFile`, `writeTextFile`) and `terminal` capabilities.
+2. **`session/new`** -> sets `cwd` to the member's assigned worktree (`_integration` for orchestrator turns, `_exec_<handle>` for executor turns) and injects `meta-harness-switch` into `mcpServers`:
+   ```json
+   {
+     "cwd": "C:/Users/panzh/project/.meta-harness/worktrees/s_01/_exec_codex",
+     "mcpServers": [
+       {
+         "name": "meta-harness-switch",
+         "command": "C:/path/to/meta-harness.exe",
+         "args": ["mcp-bridge", "--url", "http://127.0.0.1:4410/internal/mcp", "--session", "s_01", "--caller", "codex"],
+         "env": [{ "name": "MH_BRIDGE_TOKEN", "value": "<ephemeral_hmac_token>" }]
+       }
+     ]
+   }
+   ```
+3. **`configOptions` & `session/set_config_option`**:
+   - Indexes advertised `model` and `thought_level` / `reasoning_effort` selectors from `session/new`.
+   - Applies target `model` and `reasoning_effort` via `session/set_config_option` prior to `session/prompt`.
 
-### 6.3 SQLite Schema (`rusqlite` with `WAL` mode)
+### 3.3 Worktree-Smart Permission Policy (`default = "worktree_smart"`)
+- **Auto-Allowed**: `fs/read_text_file` inside the project/worktrees and `fs/write_text_file` strictly **inside the calling member's own isolated Git worktree** (evaluated after `dunce::canonicalize` containment check).
+- **Prompt in Group Chat**:
+  - Any `terminal/*` shell command execution (with 1-click **"Allow command prefix for session"**, e.g., `cargo test*`, `npm run build`, stored in `session_permission_rules`).
+  - Any file read/write outside the member's worktree.
+- **Alternative Modes**: `strict` (prompt on file writes too) and `autonomous_sandbox` (auto-allow non-destructive local dev commands inside worktree, prompt only on external paths or `git push`/`rm` outside worktree).
+
+---
+
+## 4. Network Switch, Parallel Routing & Inter-Harness Tools (`mh-switch`)
+
+### 4.1 Mention Routing & Delta Context Envelopes
+1. Strips fenced code blocks and inline code spans before matching `@<handle>` (plus optional `@<handle>[<model>:<effort>]`, `@all`, `@orchestrator`).
+2. Multiple mentioned executors (`@codex @claude`) dispatch **in parallel** in their isolated worktrees!
+3. Each `session/prompt` prepends only unseen group-chat messages (`seq > member.last_seen_msg_seq`) in `<group_chat_updates>` XML so stateful ACP sessions never waste tokens re-reading prior messages.
+
+### 4.2 Synchronous `peer_consult` & Deadlock Detection
+In addition to async group-chat handoffs (`chat_send_message`), an active harness mid-turn can call `peer_consult(target, question, context_turn_id?)`:
+1. **Wait-For DAG Check**: `SwitchState` maintains directed edges `caller -> target` for all in-flight `peer_consult` RPCs. If adding `caller -> target` creates a cycle (e.g., `@claude` consults `@codex` while `@codex` is directly or transitively waiting on `@claude`), `mh-switch` immediately rejects the tool call with a descriptive guidance string (`"Cycle detected: @codex is currently waiting on @claude; post an async @codex message via chat_send_message instead"`).
+2. **Hop & Timeout Guard**: Consumes 1 hop from `chain.hops_remaining` and enforces `peer_consult_timeout_secs` (default `180s`).
+3. **Execution & Chat Visibility**: If `target` is idle (or once its current non-dependent turn finishes), runs a focused consult prompt on `target` and returns the answer synchronously as the MCP tool result to `caller`, while rendering a **Collapsible Consult Thread** in the main Group Chat UI.
+
+### 4.3 Switch MCP Tools Summary
+
+| Tool Name | Caller | Description & UI Visibility |
+| :--- | :--- | :--- |
+| `chat_list_peers` | All | Lists session members, adapter brands, roles, live states (`idle`/`working`/`consulting`), active models, and worktree branches. |
+| `chat_read_messages` | All | Paginated read of group chat messages (`limit`, `before_seq`). |
+| `chat_send_message` | All | Posts a visible message/handoff to Group Chat and triggers `@to` recipients asynchronously (consumes 1 hop). |
+| `peer_consult` | All | Synchronous mid-turn question to a peer with DAG deadlock prevention; renders as a compact collapsible thread in Group Chat (consumes 1 hop). |
+| `trajectory_list` | All | Lists recent turns (`turn_id`, `member`, `summary`, `touched_files`, `git_diff_stat`, `status`). |
+| `trajectory_read` | All | Reads a peer's trajectory (`summary` \| `tool_calls` \| `diffs` \| `full`, max 16 KB/page); emits a subtle inline pill in Group Chat (`@claude read @codex's trajectory`). |
+| `memory_recall` | All | Queries project-wide `episodic_jobs` + `project_facts` via SQLite FTS5. |
+| `memory_record_fact` | All | Records or updates a high-level architectural/ownership/performance note (`project_facts`). |
+| `quota_get_status` | All / Orch | Returns adapter-level subscription quota headroom snapshots. |
+| `models_list_catalog` | Orchestrator | Returns live ACP `configOptions` (`models`, `efforts`) + adapter capability metadata. |
+| `orchestrator_dispatch` | Orchestrator | Configures target executor member(s) (`model`, `reasoning_effort`) and dispatches 1 or more parallel/sequential worktree tasks with a visible Dispatch Card. |
+| `memory_curate_job` | Orchestrator | Saves the curated post-job `EpisodicJob` summary + optional `project_facts` updates after a turn/wave completes. |
+
+---
+
+## 5. Orchestrator Pipeline & Subscription Quota Engine
+
+### 5.1 Layered Subscription Usage Tracker (`mh-acp::quota`)
+Tracked per `HarnessAdapter` (so multiple personas of the same CLI share one quota pool):
+1. **Default Safe Local Telemetry (Always On)**:
+   - Reads local session/token logs (`~/.codex/sessions`, `~/.claude/projects`, `~/.gemini/`) + Meta-Harness turn accounting + cached non-LLM ACP status metadata, normalized against user-selected plan tiers (`Plus`, `Pro`, `Max 5x`, `Max 20x`, `AI Pro`, `AI Ultra`).
+   - **Reactive `429` Circuit Breaker**: Immediately marks `rate_limited_until` upon rate-limit errors and triggers automatic Orchestrator failover.
+2. **Opt-In Exact Probes (`exact_quota_probe_opt_in = true`)**:
+   - Per-adapter user toggle enabling live account usage endpoint queries or localhost transparent rate-limit header inspection (`anthropic-ratelimit-*` / Codex usage status) where supported.
+
+### 5.2 Orchestrator Decision Modes & Self-Brand Dispatch
+When an unmentioned user prompt arrives:
+1. `mh-switch` injects `<orchestrator_telemetry>` (~200 tokens: adapter quota percentages, available `(model, effort)` options, and top 5 FTS5 episodic memories).
+2. **Pragmatic Execution Rules**:
+   - **Trivial Question / Quick Repo Inspection / Branch Merge**: Orchestrator answers directly from `_integration` without wasting an extra hop.
+   - **Single or Decomposable Coding Work**: Calls `orchestrator_dispatch(...)` to assign work to one or more executor members (including an executor worktree of its own adapter brand if best suited!), selecting:
+     - `low` effort + fast model for simple edits/boilerplate.
+     - `medium` effort + domain-matched model for standard features/UI/tests.
+     - `high` / `xhigh` effort + flagship model for hard systems/architecture/concurrency tasks—automatically shifting to a peer adapter when remaining 5h quota drops below threshold (`<15%`).
+   - **Confirm-Plan Mode (Optional Session Toggle)**: Posts the proposed Dispatch Card in `"awaiting_confirmation"` state until the user clicks **Proceed** (or edits model/target inline).
+
+---
+
+## 6. Curated Episodic Memory & SQLite Schema (`mh-store`)
+
+### 6.1 Orchestrator LLM Memory Curation Pass
+To keep memory high-signal without low-level clutter:
+1. Whenever an executor job (or parallel wave) finishes and merges into `_integration`:
+   - **Piggyback Optimization**: If the Orchestrator is *already* running a conflict-resolution or wave-synthesis turn, `mh-switch` instructs it in that same turn to invoke `memory_curate_job(...)`.
+   - **Standalone Lightweight Pass**: If the Rust Git Broker merged cleanly with zero conflicts, `mh-switch` triggers a fast, `low`-effort background curation prompt on the Orchestrator with `(task_brief, git diff --stat, executor final reply)` (<600 input tokens) to produce a crisp 1–2 sentence `EpisodicJob` entry + any durable `ProjectFact` (e.g., module ownership or `"@codex resolved async lifetime issues in mh-acp cleanly"`).
+   - *(Fallback: If a session has no Orchestrator configured, `mh-switch` records deterministic job metadata directly.)*
+
+### 6.2 SQLite + FTS5 Schema (`WAL` Mode)
 
 ```sql
 PRAGMA journal_mode = WAL;
@@ -233,6 +206,7 @@ CREATE TABLE projects (
     id              TEXT PRIMARY KEY,
     name            TEXT NOT NULL,
     root_path       TEXT NOT NULL UNIQUE,
+    is_git_repo     INTEGER NOT NULL DEFAULT 1,
     created_at      INTEGER NOT NULL,
     last_opened_at  INTEGER NOT NULL
 );
@@ -241,24 +215,43 @@ CREATE TABLE sessions (
     id                      TEXT PRIMARY KEY,
     project_id              TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
     title                   TEXT NOT NULL,
-    orchestrator_harness    TEXT,
-    orchestrator_model      TEXT,
-    orchestrator_effort     TEXT,
+    base_branch             TEXT,
+    base_commit_sha         TEXT,
+    integration_branch      TEXT,          -- e.g. 'mh/s-8f3a'
+    integration_wt_path     TEXT,
+    isolation_mode          TEXT NOT NULL DEFAULT 'worktree_per_member', -- or 'shared_cwd'
+    orchestrator_member     TEXT,          -- references session_members.handle
+    confirm_before_dispatch INTEGER NOT NULL DEFAULT 0,
     max_hops                INTEGER NOT NULL DEFAULT 6,
-    permission_policy       TEXT NOT NULL DEFAULT 'prompt',
+    permission_policy       TEXT NOT NULL DEFAULT 'worktree_smart',
     working_summary         TEXT NOT NULL DEFAULT '',
     created_at              INTEGER NOT NULL,
     updated_at              INTEGER NOT NULL
 );
 
 CREATE TABLE session_members (
-    session_id              TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
-    harness_id              TEXT NOT NULL,
-    acp_session_id          TEXT,
-    active_model            TEXT,
-    active_effort           TEXT,
-    last_seen_msg_seq       INTEGER NOT NULL DEFAULT 0,
-    PRIMARY KEY (session_id, harness_id)
+    session_id          TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+    handle              TEXT NOT NULL,     -- e.g. 'codex', 'claude', 'codex-reviewer'
+    adapter_id          TEXT NOT NULL,     -- e.g. 'codex', 'claude', 'antigravity'
+    display_name        TEXT NOT NULL,
+    role                TEXT NOT NULL DEFAULT 'executor', -- 'orchestrator' | 'executor' | 'both'
+    persona_prompt      TEXT NOT NULL DEFAULT '',
+    worktree_branch     TEXT,
+    worktree_path       TEXT,
+    acp_session_id      TEXT,
+    active_model        TEXT,
+    active_effort       TEXT,
+    last_seen_msg_seq   INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY (session_id, handle)
+);
+
+CREATE TABLE session_permission_rules (
+    id              TEXT PRIMARY KEY,
+    session_id      TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+    tool_kind       TEXT NOT NULL,         -- 'terminal' | 'fs_external'
+    pattern         TEXT NOT NULL,         -- e.g. 'cargo test*'
+    decision        TEXT NOT NULL,         -- 'allow' | 'deny'
+    created_at      INTEGER NOT NULL
 );
 
 CREATE TABLE messages (
@@ -266,10 +259,11 @@ CREATE TABLE messages (
     id              TEXT NOT NULL UNIQUE,
     session_id      TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
     chain_id        TEXT NOT NULL,
-    sender_kind     TEXT NOT NULL, -- 'user' | 'harness' | 'orchestrator' | 'system'
+    parent_msg_id   TEXT,                  -- links peer_consult replies into a collapsible thread
+    sender_kind     TEXT NOT NULL,         -- 'user' | 'member' | 'orchestrator' | 'system'
     sender_id       TEXT NOT NULL,
     recipients_json TEXT NOT NULL DEFAULT '[]',
-    kind            TEXT NOT NULL, -- 'text' | 'dispatch_card' | 'permission_card' | 'notice'
+    kind            TEXT NOT NULL,         -- 'text' | 'dispatch_card' | 'consult_thread' | 'activity_pill' | 'permission_card' | 'merge_notice'
     content         TEXT NOT NULL,
     turn_id         TEXT,
     metadata_json   TEXT NOT NULL DEFAULT '{}',
@@ -280,12 +274,16 @@ CREATE INDEX idx_messages_session_seq ON messages(session_id, seq);
 CREATE TABLE turn_trajectories (
     turn_id         TEXT PRIMARY KEY,
     session_id      TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
-    harness_id      TEXT NOT NULL,
+    member_handle   TEXT NOT NULL,
+    adapter_id      TEXT NOT NULL,
     model           TEXT,
     effort          TEXT,
-    status          TEXT NOT NULL, -- 'running' | 'completed' | 'cancelled' | 'failed'
+    worktree_branch TEXT,
+    head_commit_sha TEXT,
+    status          TEXT NOT NULL,         -- 'running' | 'completed' | 'cancelled' | 'failed'
     summary         TEXT NOT NULL DEFAULT '',
     touched_files   TEXT NOT NULL DEFAULT '[]',
+    diff_stat_json  TEXT NOT NULL DEFAULT '{}',
     started_at      INTEGER NOT NULL,
     finished_at     INTEGER
 );
@@ -293,7 +291,7 @@ CREATE TABLE turn_trajectories (
 CREATE TABLE trajectory_events (
     id              INTEGER PRIMARY KEY AUTOINCREMENT,
     turn_id         TEXT NOT NULL REFERENCES turn_trajectories(turn_id) ON DELETE CASCADE,
-    event_kind      TEXT NOT NULL, -- 'thought' | 'plan' | 'tool_call' | 'diff' | 'terminal' | 'error'
+    event_kind      TEXT NOT NULL,         -- 'thought' | 'plan' | 'tool_call' | 'diff' | 'terminal' | 'error'
     payload_json    TEXT NOT NULL,
     created_at      INTEGER NOT NULL
 );
@@ -304,13 +302,15 @@ CREATE TABLE episodic_jobs (
     project_id      TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
     session_id      TEXT REFERENCES sessions(id) ON DELETE SET NULL,
     turn_id         TEXT,
-    harness_id      TEXT NOT NULL,
+    member_handle   TEXT NOT NULL,
+    adapter_id      TEXT NOT NULL,
     model           TEXT,
     effort          TEXT,
     task_brief      TEXT NOT NULL,
-    outcome_summary TEXT NOT NULL,
-    touched_paths   TEXT NOT NULL DEFAULT '[]',
-    status          TEXT NOT NULL,
+    curated_summary TEXT NOT NULL,
+    touched_modules TEXT NOT NULL DEFAULT '[]',
+    outcome         TEXT NOT NULL,
+    curated_by      TEXT NOT NULL DEFAULT 'orchestrator',
     pinned          INTEGER NOT NULL DEFAULT 0,
     created_at      INTEGER NOT NULL
 );
@@ -318,16 +318,17 @@ CREATE TABLE episodic_jobs (
 CREATE VIRTUAL TABLE episodic_jobs_fts USING fts5(
     job_id UNINDEXED,
     project_id UNINDEXED,
-    harness_id,
+    member_handle,
+    adapter_id,
     task_brief,
-    outcome_summary,
-    touched_paths
+    curated_summary,
+    touched_modules
 );
 
 CREATE TABLE project_facts (
     id              TEXT PRIMARY KEY,
     project_id      TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
-    category        TEXT NOT NULL, -- 'architecture' | 'ownership' | 'convention' | 'constraint'
+    category        TEXT NOT NULL,         -- 'architecture' | 'ownership' | 'harness_affinity' | 'convention'
     summary         TEXT NOT NULL,
     author_id       TEXT NOT NULL,
     created_at      INTEGER NOT NULL
@@ -336,59 +337,35 @@ CREATE TABLE project_facts (
 
 ---
 
-## 7. Backend-to-Frontend API & WebSocket Protocol (`mh-server`)
+## 7. Server, Auth & Frontend UX Specification
 
-### 7.1 REST Endpoints
-- `GET /api/health` — Server status, version, active subprocess count, RSS memory usage.
-- `GET /api/projects` | `POST /api/projects` | `DELETE /api/projects/:id` — Manage project folders (includes local directory browser helper `GET /api/fs/list?path=...` restricted to local user drives).
-- `GET /api/projects/:id/sessions` | `POST /api/projects/:id/sessions` — List/create sessions.
-- `GET /api/sessions/:id` | `PATCH /api/sessions/:id` | `DELETE /api/sessions/:id` — Read/update session members, orchestrator harness, hop budget, permission policy.
-- `GET /api/sessions/:id/messages?before_seq=&limit=100` — Paginated message history.
-- `POST /api/sessions/:id/messages` — Post user message (initiates routing chain).
-- `POST /api/sessions/:id/cancel` — Immediate Stop All (`session/cancel` across active harnesses).
-- `POST /api/sessions/:id/permissions/:req_id` — Resolve a pending `session/request_permission` (`allow_once` | `allow_session` | `reject`).
-- `GET /api/trajectories/:turn_id` — Fetch structured trajectory events & diffs for drawer inspection.
-- `GET /api/projects/:id/memory` | `POST /api/projects/:id/memory/facts` | `PATCH /api/memory/jobs/:id` | `DELETE /api/memory/jobs/:id` — View/pin/edit/prune high-level episodic memory.
-- `GET /api/harnesses` | `POST /api/harnesses/probe` | `GET /api/quotas` — Harness availability, discovered ACP `configOptions`, and subscription quota snapshots.
+### 7.1 Localhost Default + Optional LAN/Tailscale Bearer Mode (`mh-server`)
+- **Default**: Binds `127.0.0.1:4410` with zero login friction and opens the system browser automatically.
+- **Remote / LAN / Tailscale Mode** (`meta-harness serve --bind 0.0.0.0:4410`):
+  - Automatically enforces Bearer/Cookie authentication using a cryptographically random access token printed to the terminal (plus a convenient pairing URL `http://<lan-or-tailscale-ip>:4410/?token=...` that exchanges for an `HttpOnly; SameSite=Strict` session cookie).
 
-### 7.2 Multiplexed WebSocket (`/api/ws?session_id=...`)
-Server-to-Client tagged JSON events (coalesced at 25ms intervals during streaming):
-- `chat.message_created` / `chat.message_delta` / `chat.message_completed`
-- `switch.dispatch_decided` (Orchestrator -> Executor card update)
-- `switch.hop_limit_paused` (Prompt user to extend hop budget or stop)
-- `harness.status_changed` (`spawning` | `idle` | `thinking` | `running_tool` | `waiting_permission` | `hibernated` | `error`)
-- `trajectory.event` (Streamed only when client subscribes to `turn_id` or as lightweight summary counters `tool_count`, `edit_count` on main chat!)
-- `permission.requested` / `permission.resolved`
-- `quota.updated`
-- `memory.job_recorded`
+### 7.2 REST & Multiplexed WebSocket API
+- **Projects & Git Onboarding**: `GET/POST/DELETE /api/projects`, `POST /api/projects/:id/git-init`, `GET /api/fs/list`.
+- **Sessions & Personas**: `GET/POST /api/projects/:id/sessions`, `GET/PATCH/DELETE /api/sessions/:id`, `POST/PATCH/DELETE /api/sessions/:id/members` (add/configure `@codex-reviewer` personas, assign Orchestrator).
+- **Session Git Integration & Promotion**:
+  - `GET /api/sessions/:id/diff` — Cumulative diff of `integration_branch` vs `base_branch` + per-member unmerged status.
+  - `POST /api/sessions/:id/preview-terminal` — Spawns/attaches a test command or opens a shell rooted in `_integration`.
+  - `POST /api/sessions/:id/promote` — Promotes session branch to main checkout (`mode`: `"merge"` | `"squash"` | `"patch"`).
+- **Chat, Permissions & Cancellation**:
+  - `GET/POST /api/sessions/:id/messages`, `POST /api/sessions/:id/cancel` (Stop All <250ms), `POST /api/sessions/:id/permissions/:req_id` (`allow_once` | `allow_pattern_session` | `reject`).
+- **Trajectories, Memory & Quotas**:
+  - `GET /api/trajectories/:turn_id`, `GET/POST/PATCH/DELETE /api/projects/:id/memory/*`, `GET /api/adapters`, `GET /api/quotas`, `PATCH /api/adapters/:id/quota-config`.
+- **WebSocket (`/api/ws?session_id=...`)**: Streams 25ms-coalesced deltas for parallel active turns (`chat.*`, `switch.dispatch_decided`, `switch.consult_updated`, `switch.activity_pill`, `git.branch_updated`, `git.conflict_escalated`, `permission.requested`, `quota.updated`, `memory.job_curated`).
 
-*(Optimization: Full `trajectory.event` payloads only stream over WS for turns the user currently has open in the Trajectory Drawer; closed turns only receive lightweight badge count updates, keeping WebSocket bandwidth and browser memory tiny!)*
-
----
-
-## 8. Frontend UX & Performance Specification (`web/`)
-
-### 8.1 Three-Column Adaptive Layout
-1. **Left Rail (260px, Collapsible)**:
-   - **Project Selector**: Dropdown + "Open Project Folder" modal showing git branch pill.
-   - **Sessions List**: Group chat rooms under the current project with unread/running indicators.
-   - **Harness Roster**: Cards for `@codex`, `@claude`, `@antigravity`, etc., showing:
-     - Live status dot (`Idle`, `Working`, `Hibernated` to save RAM)
-     - Crown toggle to assign **Orchestrator** role
-     - Compact dual progress bar for **5h Quota** & **Weekly Quota**
-2. **Center Canvas (Fluid)**:
-   - **Session Header**: Session title, active Orchestrator badge (`Orchestrator: @antigravity`), hop counter when agents are conversing (`Chain Hop 2/6`), and prominent red **Stop All** button when any turn is active.
+### 7.3 Three-Column Responsive UI Layout (`web/`)
+1. **Left Rail**:
+   - Project switcher (with Git status badge), Session list, and **Member Roster** (`@codex`, `@claude`, `@antigravity`, `+ Add Persona`) showing live parallel work states, Orchestrator crown toggle, and shared adapter **5h / Weekly Quota Bars**.
+2. **Center Canvas**:
+   - **Top Session Changes Bar**: Shows `mh/s-8f3a` ahead of `main` (`+142 / -31 · 5 files`), **[View Diff]**, **[Run/Preview in Session Worktree]**, and **[Promote ▾]** (`Fast-Forward / Merge`, `Squash Merge`, `Apply Patch`).
    - **Virtualized Group Chat Stream**:
-     - Distinct color-coded harness badges & markdown rendering with syntax-highlighted code blocks.
-     - **Orchestrator Dispatch Card**: Compact collapsible banner explaining why a specific executor + model + effort was selected.
-     - **Trajectory Summary Pill** on every agent reply: e.g., `[14s · gpt-5.4 (high) · 4 tool calls · +48/-12 in 2 files -> Inspect]`.
-     - **Inline Permission Card**: Clear diff/command preview with one-click `Allow Once`, `Allow for Session`, `Reject`.
-   - **Smart Composer**:
-     - Rich textarea with instant `@` autocomplete popup listing harnesses (plus inline model/effort picker chip if user wants manual override) and `#` project file path autocomplete.
-     - Dynamic routing indicator above Send button:
-       - If `@codex` typed: *"Direct to **@codex** (`gpt-5.4 · medium`)"*
-       - If no `@mention`: *"Routed via Orchestrator (**@antigravity**) -> auto-selects executor, model & effort"*
-3. **Right Inspector Drawer (420px, On-Demand)**:
-   - Tab 1 — **Trajectory**: Live step-by-step timeline of thoughts, tool calls, terminal runs, and side-by-side/unified diffs for the selected agent turn, plus a "Peer Harnesses Reading This" indicator when another agent queries `trajectory_read`.
-   - Tab 2 — **Memory Ledger**: Searchable high-level list of jobs ("`@codex` implemented auth JWT middleware · 3 files") and pinned architectural facts, with 1-click delete/pin/edit.
-   - Tab 3 — **Switch & Quotas**: Detailed subscription usage calibration, model/effort overrides, hop limit slider, and custom ACP command editor.
+     - Clean multi-agent messages, **Orchestrator Dispatch Cards** (with live Cancel/Reroute button), **Collapsible `peer_consult` Threads**, subtle **Trajectory Read Pills** (`@claude read @codex's trajectory`), **Git Clean-Merge / Conflict Resolution Notices**, and **Worktree-Smart Permission Cards** (`Allow Once` / `Allow 'cargo test*' for Session` / `Reject`).
+   - **Smart `@mention` Composer**: Autocompletes `@member`, `@member[model:effort]`, `@all`, `@orchestrator`, and `#file` paths, with a live routing indicator above Send.
+3. **Right Inspector Drawer**:
+   - **Trajectory**: Step-by-step thoughts, tool calls, terminal logs, and worktree commit diffs for any selected turn (supports switching between parallel running agents!).
+   - **Memory Ledger**: Orchestrator-curated job history & pinned architectural/affinity facts.
+   - **Switch & Quotas**: Plan tier calibration, opt-in exact quota probe toggles, session permission rules, and hop/consult timeout sliders.

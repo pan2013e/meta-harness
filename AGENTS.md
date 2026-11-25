@@ -3,50 +3,61 @@
 This document defines the mandatory architecture invariants, engineering standards, platform constraints, and verification gates for **any coding agent or developer** implementing **Meta-Harness**.
 
 Read this file first, then consult:
-- `docs/SPECIFICATION.md` for exact wire protocols, data schemas, MCP tool definitions, and UI behavior.
+- `docs/SPECIFICATION.md` for exact wire protocols, Git worktree flows, data schemas, MCP tool definitions, and UI behavior.
 - `docs/IMPLEMENTATION_PLAN.md` for milestone ordering, crate boundaries, and acceptance tests.
 
 ---
 
-## 1. Mission & Product Pillars
+## 1. Mission & Aligned Product Decisions
 
-Meta-Harness is a local-first web application where a human developer and multiple AI agent harnesses (`@codex`, `@claude`, `@antigravity`, etc.) collaborate inside **project-scoped group chat sessions**.
+Meta-Harness is a local-first web application where a human developer and multiple AI agent harnesses (`@codex`, `@claude`, `@antigravity`, and custom personas like `@codex-reviewer`) collaborate inside **project-scoped group chat sessions**.
 
-Every design decision must uphold these six pillars:
+Every design decision must uphold these core specifications (finalized during design alignment):
 
-1. **Project-Bound Sessions**: Every session belongs to a concrete local project directory (`cwd`). File operations and terminal commands initiated by harnesses are sandboxed to that project root unless explicitly granted by the user.
-2. **Group-Chat UX with Trajectory Clarity**: Main chat stays clean and conversational (user turns, `@mention` messages, orchestrator dispatch cards, permission cards, final/milestone agent replies). Low-level reasoning, tool calls, terminal streams, and diffs live in structured **Trajectories** viewable in a side drawer or queryable by peer harnesses.
-3. **ACP Native + Network Switch**: All harness communication uses the **Agent Client Protocol (ACP)** over JSON-RPC 2.0 stdio, inheriting the user's existing CLI subscriptions (`~/.codex`, `~/.claude`, `~/.gemini`). Never require separate paid API keys for core operation. East–West communication (harness-to-harness messaging and trajectory inspection) is enabled by injecting Meta-Harness's embedded MCP bridge (`meta-harness mcp-bridge`) into each harness's `session/new` `mcpServers` list.
-4. **Deterministic `@mention` Routing + Smart Orchestrator**:
-   - Messages containing explicit `@<handle>` mentions (outside code blocks/spans) route directly to those harnesses.
-   - Messages with **no** `@<handle>` route to the session's configured **Orchestrator Harness**, which inspects subscription quota status, task complexity, model characteristics, and episodic memory to pick an executor harness, `model`, and `reasoning_effort` (applied via ACP `session/set_config_option`).
-5. **High-Level Episodic Memory Only**: Persist *who did what job, which modules/files were touched, outcomes, and key architectural decisions* in SQLite + FTS5. **Do not** build heavy vector-DB pipelines, embedding models, or raw line-by-line code memorization.
-6. **Frugal Resource Footprint & Snappy Responsiveness**:
-   - **Backend**: Single Rust binary (`tokio` + `axum` + `rusqlite` bundled + `agent-client-protocol`). Target <30 MB idle RSS for Meta-Harness itself. Spawn harness subprocesses lazily on demand and reap idle ones cleanly.
-   - **Frontend**: Lightweight SPA (`Vite` + `React 19` + `TypeScript` + `Zustand` + `@tanstack/react-virtual` + `Tailwind CSS v4`), virtualizing message and trajectory lists so 60fps responsiveness holds under heavy token streaming.
+1. **Per-Session Integration Branch + Per-Harness Git Worktrees**:
+   - Every session creates a dedicated **Session Integration Worktree & Branch** (`mh/s-<short_id>`) plus **isolated Git worktrees per executor member** (`mh/s-<short_id>/<handle>`), keeping the user's primary checked-out working tree untouched until explicit promotion (**Fast-Forward/Merge**, **Squash Merge**, or **Apply Patch**). Non-Git folders offer 1-click `git init` (with fallback to serialized shared-folder mode).
+   - **Zero-Token Clean Merge First**: When an executor finishes a turn with edits, the Rust Git Broker auto-commits uncommitted worktree changes and cleanly merges into the session integration branch (`mh/s-<short_id>`) in Rust without spending LLM tokens—waking the **Orchestrator Harness** only when merge conflicts occur or multi-executor synthesis is needed. Idle peer worktrees fast-forward to stay synced.
+2. **Adapter vs. Session Member Separation**:
+   - Distinguish **`HarnessAdapter`** (CLI binary + ACP driver + **shared subscription quota bucket**, e.g., `codex`, `claude`, `antigravity`) from **`SessionMember`** (handle `@claude`, role `orchestrator` vs `executor`, optional persona prompt, dedicated worktree).
+   - The harness brand chosen as **Orchestrator** (operating in the session integration worktree) can **also** spawn/dispatch coding tasks to an executor member of the same harness brand (in its own executor worktree), drawing from the same adapter quota pool, and users can add custom-named personas (`@codex-reviewer`).
+3. **ACP Native + Parallel Network Switch**:
+   - All harness communication uses the **Agent Client Protocol (ACP)** over JSON-RPC 2.0 stdio, inheriting the user's existing CLI subscriptions (`~/.codex`, `~/.claude`, `~/.gemini`).
+   - Harnesses run **in parallel** across their isolated worktrees and communicate via Meta-Harness's embedded single-binary MCP bridge (`meta-harness mcp-bridge` injected into `session/new` `mcpServers`):
+     - **Async Group-Chat Messaging** (`@mention` / `chat_send_message`, queued if recipient is busy).
+     - **Synchronous Mid-Turn Consults** (`peer_consult`), allowing an active harness to pause mid-turn and await an answer from an idle peer, protected by a **Wait-For Graph cycle detector** so circular consults never deadlock.
+     - **Peer Trajectory Inspection** (`trajectory_list` / `trajectory_read`).
+   - **UI Visibility**: Peer messages and consults appear in main Group Chat (with `peer_consult` styled as compact collapsible threads), while `trajectory_read` calls appear as subtle inline activity pills (`@claude read @codex's trajectory`).
+4. **`@mention` Routing + Autonomous Quota-Aware Orchestrator**:
+   - Explicit `@<handle>` messages (outside code blocks/spans) route directly to those members.
+   - Unmentioned messages route to the session's **Orchestrator Harness**, which auto-dispatches coding tasks by default (rendering a live Dispatch Card with cancel/reroute controls), answers trivial questions or handles integration merges directly without wasting an extra hop, and supports an optional `"Confirm Plan First"` toggle.
+   - Subscription usage lookup uses **safe local telemetry by default** (local CLI session logs in `~/.codex`, `~/.claude`, `~/.gemini` + ACP status metadata + Meta-Harness ledger + reactive `429` cooldowns calibrated to user plan tier), with an **opt-in toggle** for live endpoint / localhost rate-limit header-tap exact percentages.
+5. **Orchestrator-Curated High-Level Episodic Memory**:
+   - Project-wide memory lives in **SQLite (`WAL`) + FTS5** (shared across sessions of the same project).
+   - After every completed job, the **Orchestrator** runs a lightweight, low-effort LLM summarization pass (folded into its merge/synthesis turn whenever one is already active!) to curate *who did what job, touched modules, outcomes, and harness/model notes*—never raw code chunks or vector-DB embeddings.
+6. **Worktree-Smart Permissions, Low Footprint & Optional Remote Access**:
+   - **Permissions**: By default, auto-allow file reads/writes strictly *inside* the harness's assigned Git worktree; prompt in Group Chat for shell commands (`terminal/*`) and outside-worktree paths, with 1-click **"Allow command pattern for session"** rules (`cargo *`, `npm test`).
+   - **Hosting**: Single Rust binary serving `127.0.0.1:4410` in the user's browser by default (<30 MB idle server RSS), plus optional `--bind` + bearer-token auth mode for LAN / Tailscale access from laptop or mobile.
 
 ---
 
 ## 2. Hard Architectural Invariants (Do Not Violate)
 
-1. **No Raw Terminal Scraping for Agent Turns**: Always speak structured JSON-RPC 2.0 via ACP (`initialize`, `session/new`, `session/set_config_option`, `session/prompt`, `session/cancel`, `session/update`, `session/request_permission`, `fs/*`, `terminal/*`).
-2. **Mandatory Loop & Runaway Protection**:
-   - Every user message initiates a routing `chain_id` with a configurable hop budget (`max_agent_hops_per_user_turn`, default `6`).
-   - Every agent-triggered message (`@mention` or `chat_send_message`) decrements the remaining hop budget. When `hops_remaining == 0`, pause dispatch and surface a user confirmation action in the UI.
-   - Expose an immediate **Stop All (`session/cancel`)** endpoint/button that halts all in-flight turns in the session within <250ms.
+1. **No Raw Terminal Scraping for Agent Turns**: Speak structured JSON-RPC 2.0 via ACP (`initialize`, `session/new`, `session/load`, `session/set_config_option`, `session/prompt`, `session/cancel`, `session/update`, `session/request_permission`, `fs/*`, `terminal/*`).
+2. **Loop, Hop & Deadlock Protection**:
+   - Every user message initiates a `chain_id` with `max_agent_hops_per_user_turn` (default `6`). Every agent-triggered `@mention`, `chat_send_message`, or `peer_consult` decrements remaining hops; at `0`, pause routing and surface a UI confirmation banner.
+   - Maintain an in-memory **Wait-For Graph** across active `peer_consult` calls: reject any consult edge `A -> B` if `B` transitively waits on `A` (returning a structured MCP tool error advising async `chat_send_message` instead).
+   - Provide an immediate **Stop All (`session/cancel`)** endpoint/button that aborts all active ACP turns and pending `peer_consult` futures within <250ms.
 3. **Mention Parsing Hygiene**:
-   - Strip fenced code blocks (` ``` ... ``` `) and inline code spans (`` `...` ``) **before** extracting `@<handle>` tokens so code snippets like `@decorator`, `@types/node`, or email addresses never accidentally summon a harness.
-   - Only match registered session member handles (plus reserved `@orchestrator` and `@all`).
-4. **Windows-First Process & Path Discipline** (Primary Host OS: Windows):
-   - Resolve `.cmd` / `.ps1` / `.exe` shims cleanly on Windows (e.g., `npx.cmd`, `codex.exe`, `agy.cmd`) using `which` crate before `tokio::process::Command::new`.
-   - Attach every spawned harness child process tree to a **Windows Job Object** with `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE` (and process groups on Unix) so zero orphan `node.exe` or agent subprocesses survive server shutdown or crashes.
-   - Normalize filesystem paths consistently (`dunce::canonicalize` rather than raw `std::fs::canonicalize`, avoiding `\\?\` extended-length prefix bugs that break Node/CLI tools on Windows!).
+   - Strip fenced code blocks (` ``` ... ``` `) and inline code spans (`` `...` ``) **before** extracting `@<handle>` tokens so `@decorator`, `@types/react`, or `name@domain.com` never trigger routing.
+4. **Windows-First Process, Git & Path Discipline** (Primary Host OS: Windows):
+   - Resolve `.cmd` / `.ps1` / `.exe` shims cleanly via `which` (`npx.cmd`, `codex.exe`, `agy.cmd`) before spawning subprocesses.
+   - Attach every spawned child process tree to a **Windows Job Object** with `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE` (and process groups on Unix) so zero orphan `node.exe` or agent processes survive server exit.
+   - Normalize paths with `dunce::canonicalize` (never pass raw `\\?\` verbatim prefixes to `git` or Node CLIs on Windows).
+   - Prune session/member Git worktrees cleanly (`git worktree remove --force`) when a session is archived/deleted so `.git/worktrees` never accumulates stale locks.
 5. **Single Binary MCP Bridge**:
-   - Do **not** require Python or a separate Node daemon for the inter-harness MCP server. The main Rust binary must support a subcommand (`meta-harness mcp-bridge --server-url ... --session-id ... --caller ... --token ...`) that speaks standard MCP JSON-RPC over stdio to the harness and proxies calls over localhost HTTP/IPC to the running `mh-server`.
-6. **File Write Conflict Visibility**:
-   - All ACP `fs/write_text_file` requests pass through `mh-acp`'s Workspace Broker. Track active per-file writers per turn; if two harnesses attempt concurrent edits to the same file in the same turn chain, serialize or trigger a permission/conflict alert rather than silently clobbering changes.
-7. **Token-Conscious Context Forwarding**:
-   - Because each harness maintains its own stateful ACP `sessionId`, **only send incremental unseen group-chat deltas** (messages since that harness's `last_seen_msg_id`) plus a compact (<250 token) episodic memory header—never re-send the entire chat transcript on every turn!
+   - Implement `meta-harness mcp-bridge` inside the main Rust binary (speaking stdio MCP JSON-RPC to the harness and forwarding over localhost HTTP with ephemeral `MH_BRIDGE_TOKEN` to `mh-server`). Zero Python or auxiliary Node scripts.
+6. **Token-Conscious Delta Context**:
+   - Track `last_seen_msg_seq` per `SessionMember` and forward **only unseen group-chat messages** plus compact memory/telemetry headers on each `session/prompt`.
 
 ---
 
@@ -54,16 +65,16 @@ Every design decision must uphold these six pillars:
 
 Before starting Rust backend implementation on a fresh Windows machine, verify toolchains:
 
-- **Node.js & Git**: Check `node -v`, `npm -v`, `git --version`.
+- **Node.js & Git**: Verify `node -v`, `npm -v`, `git --version`.
 - **Rust Toolchain (`rustup` / `cargo`)**:
   - Check `cargo --version`. If missing on Windows **and** Visual Studio C++ Build Tools (`cl.exe` / `link.exe`) are not installed:
-    - **Recommended lightweight setup (zero admin rights, ~350 MB vs ~6 GB MSVC)**: Install Rust with the self-contained GNU ABI toolchain:
+    - **Recommended lightweight setup (zero admin rights, ~350 MB vs ~6 GB MSVC)**:
       ```powershell
       winget install --id Rustlang.Rustup -e --accept-package-agreements --accept-source-agreements
       rustup toolchain install stable-x86_64-pc-windows-gnu
       rustup default stable-x86_64-pc-windows-gnu
       ```
-      *(Note: If Visual Studio C++ Build Tools ARE already installed, `stable-x86_64-pc-windows-msvc` works equally well. Ensure `rusqlite` uses `features = ["bundled"]` so SQLite compiles cleanly from C source under both GNU and MSVC toolchains.)*
+      *(If Visual Studio C++ Build Tools are already installed, `stable-x86_64-pc-windows-msvc` works equally well. Always enable `features = ["bundled"]` on `rusqlite`.)*
 
 ---
 
@@ -72,26 +83,27 @@ Before starting Rust backend implementation on a fresh Windows machine, verify t
 Keep crates decoupled with strict unidirectional dependencies:
 
 ```text
-mh-core       (pure domain models, @mention parser, complexity/quota scorer; zero I/O)
+mh-core       (domain DTOs, @mention parser, Wait-For DAG cycle detector, quota/complexity models; zero I/O)
   ▲
-mh-store      (SQLite + FTS5 schema, migrations, sessions, messages, trajectories, episodic memory)
+mh-store      (SQLite + FTS5 schema, migrations, sessions, members, messages, trajectories, episodic memory)
   ▲
-mh-acp        (ACP stdio process manager, configOptions mapper, workspace fs/terminal broker, quota probes)
+mh-acp        (ACP stdio supervisor, Git worktree broker, worktree-smart permissions, multi-tier quota probes)
   ▲
-mh-switch     (group chat router, hop guard, orchestrator dispatch pipeline, MCP tool handlers)
+mh-switch     (parallel session router, hop guard, peer_consult RPC, orchestrator + memory curator, MCP handlers)
   ▲
-mh-server     (Axum REST + WebSocket hub, static frontend serving, CLI entrypoint & `mcp-bridge` mode)
+mh-server     (Axum REST + WS hub, optional LAN bearer auth, static asset serving, CLI & `mcp-bridge` subcommand)
 ```
 
 Frontend (`web/`):
 ```text
 web/src/
-├── api/          # Typed REST client & multiplexed WebSocket client with auto-reconnect
-├── store/        # Normalized Zustand stores (projects, activeSession, chatStream, trajectories, quotas, memory)
+├── api/          # Typed REST client, auth token handler & multiplexed WS client with auto-reconnect
+├── store/        # Normalized Zustand stores (projects, activeSession, chatStream, worktreeDiff, trajectories, quotas, memory)
 ├── components/
-│   ├── sidebar/  # Project picker, session list, harness roster + live quota meters
-│   ├── chat/     # Virtualized message list, @mention composer, Orchestrator dispatch card, Permission card
-│   ├── drawer/   # Trajectory inspector (thoughts, tool calls, diffs), Memory ledger, Switch settings
+│   ├── sidebar/  # Project picker, session list, member/persona roster +Orchestrator badge + live quota meters
+│   ├── chat/     # Virtualized message list, collapsible consult threads, trajectory-read pills, Dispatch & Permission cards, @mention composer
+│   ├── gitbar/   # "Session Changes" status bar, cumulative diff modal, integration terminal/preview launcher, 3-mode Promote menu
+│   ├── drawer/   # Trajectory inspector (thoughts, tool calls, diffs), Curated Memory ledger, Switch & Quota settings
 │   └── common/   # Accessible UI primitives, keyboard shortcuts, status badges
 └── types/        # Shared wire DTOs mirroring Rust serde types
 ```
@@ -102,9 +114,9 @@ web/src/
 
 ### Rust (`crates/*`)
 - Rust Edition **2024** (or **2021** if toolchain <1.85).
-- Use `thiserror` in library crates (`mh-core`, `mh-store`, `mh-acp`, `mh-switch`) and `anyhow` only at binary boundaries (`mh-server`).
-- Never `.unwrap()` or `.expect()` on runtime I/O, user input, or external subprocess JSON payloads—malformed output from a third-party harness must degrade gracefully into a logged system event, never crash the switch.
-- Buffer and coalesce high-frequency ACP `session/update` token chunks (e.g., 16–33ms batch window) before broadcasting over WebSocket and flushing to SQLite so streaming stays silky smooth with minimal SQLite write amplification.
+- `thiserror` in library crates; `anyhow` only at binary entrypoints (`mh-server`).
+- Never `.unwrap()` / `.expect()` on runtime I/O, user input, Git CLI outputs, or third-party ACP JSON payloads.
+- Coalesce ACP `session/update` streaming deltas (16–33ms batch window) before broadcasting over WebSocket and persisting to SQLite.
 - **Pre-completion checks**:
   - `cargo fmt --all -- --check`
   - `cargo clippy --workspace --all-targets -- -D warnings`
@@ -112,12 +124,11 @@ web/src/
 
 ### Frontend (`web/*`)
 - Strict TypeScript (`"strict": true`, zero `any` in domain models).
-- Virtualize long lists (`@tanstack/react-virtual`) and memoize message rows so streaming tokens in the active turn only re-render the tail message bubble.
-- Keyboard-first UX: `@` opens mention menu, `Up/Down/Enter/Tab` selects harness, `Cmd/Ctrl+Enter` sends, `Esc` closes drawers or cancels compose, `Alt+A` / `Alt+R` resolves pending permission prompts.
+- Virtualize chat and trajectory lists (`@tanstack/react-virtual`) and memoize rows so streaming tokens across parallel agents sustain 60fps.
 - **Pre-completion checks**:
   - `npm run typecheck` (`tsc --noEmit`)
   - `npm run test` (`vitest run`)
   - `npm run build`
 
-### Testing Expectations
-- **Mock ACP Harness Binary/Script**: Build a deterministic mock ACP agent in `crates/mh-acp/tests/fixtures/` so integration tests can verify `@mention` routing, `mcp-bridge` inter-harness communication, trajectory reading, permission gating, hop limits, and orchestrator `session/set_config_option` calls **offline and in CI without burning real user AI subscriptions**.
+### Offline Deterministic Integration Testing
+- Maintain a deterministic Rust **Mock ACP Agent** (`crates/mh-acp/tests/fixtures/mock_acp_agent.rs`) so CI and local tests verify parallel worktree execution, clean Rust auto-merges, conflict escalation to Orchestrator, `peer_consult` deadlock prevention, `trajectory_read`, hop limits, Orchestrator `session/set_config_option` calls, and memory curation **without consuming real AI subscriptions**.

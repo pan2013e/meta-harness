@@ -26,14 +26,15 @@ flowchart LR
 ## Phase 0: Toolchain Verification & Workspace Bootstrap
 
 ### Goals
-Ensure Rust and Node toolchains compile cleanly on Windows and scaffold the 5-crate Cargo workspace plus Vite + React 19 + TypeScript frontend.
+Ensure Rust and Node toolchains compile cleanly across Windows, macOS, and Linux and scaffold the 5-crate Cargo workspace plus Vite + React 19 + TypeScript frontend.
 
 ### Tasks
-1. **Rust Toolchain Setup (Windows)**:
-   - Verify `cargo --version`. If missing and MSVC `cl.exe` is absent, install `rustup` with `stable-x86_64-pc-windows-gnu` (self-contained ~350 MB setup, zero admin rights; see `AGENTS.md` §3).
+1. **Rust Toolchain Setup**:
+   - **Windows**: Verify `cargo --version`. If missing and MSVC `cl.exe` is absent, install `Rustlang.Rustup` + `BrechtSanders.WinLibs.POSIX.MSVCRT` (for `gcc.exe` + `libgcc`, needed by `rusqlite` `bundled` and `-gnu` linking) and set `stable-x86_64-pc-windows-gnu` (see `AGENTS.md` §3).
+   - **macOS / Linux**: Ensure `rustup` and system C compiler (`xcode-select` / `build-essential`) are installed.
 2. **Cargo Workspace (`Cargo.toml`)**:
    - Create crates: `crates/mh-core`, `crates/mh-store`, `crates/mh-acp`, `crates/mh-switch`, `crates/mh-server`.
-   - Configure `[workspace.dependencies]`: `tokio`, `axum`, `tower-http`, `serde`, `serde_json`, `toml`, `rusqlite` (`features = ["bundled"]`), `agent-client-protocol` (`2.0`), `tracing`, `tracing-subscriber`, `uuid`, `thiserror`, `anyhow`, `which`, `dunce`, `similar`, `hmac`, `sha2`, `rand`.
+   - Configure `[workspace.dependencies]`: `tokio`, `axum`, `tower-http`, `serde`, `serde_json`, `toml`, `rusqlite` (`features = ["bundled"]`), `tracing`, `tracing-subscriber`, `uuid`, `thiserror`, `anyhow`, `which`, `dunce`, `dirs`, `similar`, `hmac`, `sha2`, `hex`, `rand`, `chrono`, `reqwest` (`rustls-tls`, no OpenSSL).
 3. **Frontend Scaffold (`web/`)**:
    - Initialize Vite + React 19 + TypeScript (`strict: true`) + Tailwind CSS v4 + Zustand + `@tanstack/react-virtual` + `lucide-react` + Vitest.
 

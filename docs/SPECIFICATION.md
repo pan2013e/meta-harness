@@ -97,10 +97,11 @@ sequenceDiagram
 
 ## 3. ACP Client Lifecycle & Worktree-Smart Permissions (`mh-acp`)
 
-### 3.1 Lazy Spawning, Hibernation & Windows Job Objects
-1. Subprocesses spawn lazily on first turn in a session, inheriting `USERPROFILE`/`HOME`, `APPDATA`, `LOCALAPPDATA`, and `PATH` to reuse existing CLI subscriptions.
-2. Every spawned process on Windows is bound to a Win32 Job Object (`JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`) to prevent orphan `node.exe` / CLI leaks.
-3. Processes idle beyond `idle_process_ttl_secs` (`900s`) hibernate and transparently resume via ACP `session/load` (if advertised) or `session/new` seeded with the session's compact working summary + last worktree state.
+### 3.1 Lazy Spawning, Hibernation & Cross-Platform Process Supervision
+1. Subprocesses spawn lazily on first turn in a session, inheriting OS user environment (`USERPROFILE`/`HOME`, `APPDATA`/`XDG_CONFIG_HOME`, `LOCALAPPDATA`/`XDG_DATA_HOME`, `PATH`) to reuse existing CLI subscriptions on Windows, macOS, and Linux.
+2. Process tree cleanup is enforced natively on every OS: Win32 Job Objects (`JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`) on Windows, dedicated process groups (`process_group(0)` + `killpg(SIGTERM -> SIGKILL)`) on macOS & Linux, and `prctl(PR_SET_PDEATHSIG, SIGTERM)` on Linux.
+3. Config and data directories follow native platform conventions (`%APPDATA%`/`%LOCALAPPDATA%` on Windows, `~/Library/Application Support` on macOS, `$XDG_CONFIG_HOME`/`$XDG_DATA_HOME` on Linux, overridable via `MH_CONFIG_DIR`/`MH_DATA_DIR`).
+4. Processes idle beyond `idle_process_ttl_secs` (`900s`) hibernate and transparently resume via ACP `session/load` (if advertised) or `session/new` seeded with the session's compact working summary + last worktree state.
 
 ### 3.2 ACP Handshake, MCP Injection & `session/set_config_option`
 1. **`initialize`** -> negotiates `fs` (`readTextFile`, `writeTextFile`) and `terminal` capabilities.

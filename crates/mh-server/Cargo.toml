@@ -1,0 +1,34 @@
+[package]
+name = "mh-server"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "meta-harness"
+path = "src/main.rs"
+
+[dependencies]
+mh-core = { workspace = true }
+mh-store = { workspace = true }
+mh-acp = { workspace = true }
+mh-switch = { workspace = true }
+tokio = { workspace = true }
+axum = { workspace = true }
+tower-http = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+anyhow = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+uuid = { workspace = true }
+hex = { workspace = true }
+rand = { workspace = true }
+reqwest = { workspace = true }
+clap = { workspace = true }
+rust-embed = { workspace = true }
+dunce = { workspace = true }
+dirs = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }

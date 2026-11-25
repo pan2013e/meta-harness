@@ -19,8 +19,8 @@ All harnesses run locally over the **Agent Client Protocol (ACP)** using your **
    - Evaluates live subscription headroom (local CLI logs + ACP status + 429 circuit breakers + opt-in exact probes), task complexity, model strengths, and project memory to select executor(s), `model`, and `reasoning_effort` via `session/set_config_option`.
 4. **Orchestrator-Curated Episodic Memory**:
    - After each completed job, the Orchestrator runs a lightweight, low-effort curation pass (folded into merge/synthesis turns when active) to record *who did what job*, module ownership, and harness performance notes in project-wide **SQLite + FTS5** memory.
-5. **Lightweight Localhost App (+ Optional LAN/Tailscale Mode)**:
-   - Single Rust binary (`axum` + `tokio` + `rusqlite` + `agent-client-protocol`) serving a virtualized `Vite + React 19 + TypeScript + Tailwind v4` UI on `127.0.0.1:4410` by default, with optional `--bind` + bearer-token auth for mobile/laptop access over LAN or Tailscale.
+5. **Cross-Platform & Lightweight (+ Optional LAN/Tailscale Mode)**:
+   - Cross-platform single Rust binary for **Windows, macOS, and Linux** (`axum` + `tokio` + `rusqlite`) serving a virtualized `Vite + React 19 + TypeScript + Tailwind v4` UI on `127.0.0.1:4410` by default, with optional `--bind` + bearer-token auth for mobile/laptop access over LAN or Tailscale.
 
 ---
 

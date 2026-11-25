@@ -49,10 +49,11 @@ Every design decision must uphold these core specifications (finalized during de
    - Provide an immediate **Stop All (`session/cancel`)** endpoint/button that aborts all active ACP turns and pending `peer_consult` futures within <250ms.
 3. **Mention Parsing Hygiene**:
    - Strip fenced code blocks (` ``` ... ``` `) and inline code spans (`` `...` ``) **before** extracting `@<handle>` tokens so `@decorator`, `@types/react`, or `name@domain.com` never trigger routing.
-4. **Windows-First Process, Git & Path Discipline** (Primary Host OS: Windows):
-   - Resolve `.cmd` / `.ps1` / `.exe` shims cleanly via `which` (`npx.cmd`, `codex.exe`, `agy.cmd`) before spawning subprocesses.
-   - Attach every spawned child process tree to a **Windows Job Object** with `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE` (and process groups on Unix) so zero orphan `node.exe` or agent processes survive server exit.
-   - Normalize paths with `dunce::canonicalize` (never pass raw `\\?\` verbatim prefixes to `git` or Node CLIs on Windows).
+4. **Cross-Platform Process, Git & Path Discipline** (Windows, macOS & Linux):
+   - Resolve executables cleanly via `which` across all OSes (handling `.cmd` / `.ps1` / `.exe` shims on Windows and executable binaries on macOS/Linux) before spawning subprocesses.
+   - Isolate and clean up every spawned child process tree across all OSes: attach to a **Windows Job Object** (`JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`) on Windows, spawn into a dedicated process group (`process_group(0)` + `killpg(SIGTERM -> SIGKILL)`) on macOS & Linux, and set `prctl(PR_SET_PDEATHSIG, SIGTERM)` on Linux so zero orphan agent/Node processes survive server exit.
+   - Normalize paths with `dunce::canonicalize` (resolving macOS `/var -> /private/var` symlinks while avoiding raw `\\?\` verbatim prefixes on Windows that break `git` and Node CLIs).
+   - Resolve per-OS configuration and state paths cleanly via `dirs` (`%APPDATA%` / `%LOCALAPPDATA%` on Windows, `~/Library/Application Support` on macOS, `$XDG_CONFIG_HOME` / `$XDG_DATA_HOME` on Linux), with `MH_CONFIG_DIR` and `MH_DATA_DIR` overrides.
    - Prune session/member Git worktrees cleanly (`git worktree remove --force`) when a session is archived/deleted so `.git/worktrees` never accumulates stale locks.
 5. **Single Binary MCP Bridge**:
    - Implement `meta-harness mcp-bridge` inside the main Rust binary (speaking stdio MCP JSON-RPC to the harness and forwarding over localhost HTTP with ephemeral `MH_BRIDGE_TOKEN` to `mh-server`). Zero Python or auxiliary Node scripts.
@@ -61,20 +62,23 @@ Every design decision must uphold these core specifications (finalized during de
 
 ---
 
-## 3. Environment & Toolchain Bootstrap Notes (Windows)
+## 3. Environment & Toolchain Bootstrap Notes (Windows, macOS & Linux)
 
-Before starting Rust backend implementation on a fresh Windows machine, verify toolchains:
+Before starting Rust backend implementation on any host, verify `node -v`, `npm -v`, `git --version`, and `cargo --version`:
 
-- **Node.js & Git**: Verify `node -v`, `npm -v`, `git --version`.
-- **Rust Toolchain (`rustup` / `cargo`)**:
-  - Check `cargo --version`. If missing on Windows **and** Visual Studio C++ Build Tools (`cl.exe` / `link.exe`) are not installed:
-    - **Recommended lightweight setup (zero admin rights, ~350 MB vs ~6 GB MSVC)**:
-      ```powershell
-      winget install --id Rustlang.Rustup -e --accept-package-agreements --accept-source-agreements
-      rustup toolchain install stable-x86_64-pc-windows-gnu
-      rustup default stable-x86_64-pc-windows-gnu
-      ```
-      *(If Visual Studio C++ Build Tools are already installed, `stable-x86_64-pc-windows-msvc` works equally well. Always enable `features = ["bundled"]` on `rusqlite`.)*
+- **Windows** (when `cargo` / Visual Studio C++ Build Tools `cl.exe` are absent):
+  - Install Rustup **plus** a user-space GCC MinGW-w64 toolchain (`WinLibs`, providing `gcc.exe`, `libgcc`, and `libgcc_eh` for `rusqlite`'s `bundled` SQLite compilation):
+    ```powershell
+    winget install --id Rustlang.Rustup -e --accept-package-agreements --accept-source-agreements
+    winget install --id BrechtSanders.WinLibs.POSIX.MSVCRT -e --accept-package-agreements --accept-source-agreements
+    rustup toolchain install stable-x86_64-pc-windows-gnu
+    rustup default stable-x86_64-pc-windows-gnu
+    ```
+    *(If Visual Studio C++ Build Tools are already installed, `stable-x86_64-pc-windows-msvc` works equally well.)*
+- **macOS**:
+  - Install Xcode Command Line Tools (`xcode-select --install`) and Rust (`curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh`).
+- **Linux**:
+  - Install a C compiler (`sudo apt install build-essential` / `dnf groupinstall "Development Tools"`) and Rust (`rustup`). Always enable `features = ["bundled"]` on `rusqlite` and `rustls` (never `openssl-sys` / `native-tls`) so builds stay self-contained across all OSes.
 
 ---
 

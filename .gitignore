@@ -1,0 +1,30 @@
+# Rust / Cargo
+/target/
+**/*.rs.bk
+
+# Frontend / Node
+/web/node_modules/
+/web/dist/
+npm-debug.log*
+pnpm-debug.log*
+yarn-error.log*
+
+# Meta-Harness local runtime data & SQLite WAL files
+/.meta-harness/
+*.db
+*.db-shm
+*.db-wal
+configs/harnesses.local.toml
+
+# Environment & secrets
+.env
+.env.*
+!.env.example
+
+# OS & Editor artifacts
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+*.swp
+*~

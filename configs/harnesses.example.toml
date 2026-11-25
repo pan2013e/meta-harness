@@ -1,0 +1,56 @@
+# Example Harness Registry Configuration for Meta-Harness
+# Copy to `configs/harnesses.local.toml` or `%APPDATA%/meta-harness/harnesses.toml` to customize.
+# All harnesses inherit the user's local login/subscription environment by default.
+
+[switch]
+max_agent_hops_per_user_turn = 6
+idle_process_ttl_secs = 900
+default_permission_policy = "prompt" # "prompt" | "allow_edits_prompt_shell" | "strict"
+
+[harnesses.codex]
+handle = "codex"
+display_name = "Codex"
+accent_color = "#10a37f"
+enabled = true
+# Speaks ACP over stdio while reusing ~/.codex user subscription login
+command = "npx"
+args = ["-y", "@agentclientprotocol/codex-acp"]
+quota_provider = "codex_local"
+
+[harnesses.codex.characteristics]
+strengths = ["backend-systems", "rust", "refactoring", "debugging", "test-generation", "precise-diffs"]
+latency_tier = "medium"
+context_window_tier = "large"
+
+[harnesses.claude]
+handle = "claude"
+display_name = "Claude Code"
+accent_color = "#d97757"
+enabled = true
+# Speaks ACP over stdio while reusing ~/.claude Pro/Max subscription login
+command = "npx"
+args = ["-y", "@agentclientprotocol/claude-agent-acp"]
+quota_provider = "claude_local"
+
+[harnesses.claude.characteristics]
+strengths = ["architecture", "frontend-ui", "nuanced-design", "code-review", "multi-file-coordination"]
+latency_tier = "fast"
+context_window_tier = "large"
+
+[harnesses.antigravity]
+handle = "antigravity"
+display_name = "Antigravity"
+accent_color = "#4285f4"
+enabled = true
+# Native ACP mode via Antigravity CLI (`agy --acp`) or Gemini CLI (`gemini --acp`)
+command = "agy"
+args = ["--acp"]
+fallback_commands = [
+  { command = "gemini", args = ["--acp"] }
+]
+quota_provider = "google_local"
+
+[harnesses.antigravity.characteristics]
+strengths = ["broad-codebase-research", "long-context", "orchestration", "fullstack-synthesis", "planning"]
+latency_tier = "fast"
+context_window_tier = "ultra"

@@ -520,6 +520,7 @@ pub async fn delete_project(
     State(state): State<AppState>,
     AxumPath(project_id): AxumPath<String>,
 ) -> ApiResult<Value> {
+    let _workspaces = state.switch.workspace_paths_lock.lock().await;
     let proj = state
         .switch
         .store
@@ -611,6 +612,7 @@ async fn create_session_internal(
     project_id: Option<String>,
     body: CreateSessionRequest,
 ) -> ApiResult<Value> {
+    let _workspaces = state.switch.workspace_paths_lock.lock().await;
     let cfg = state.switch.config.read().await.clone();
     let sid = format!("s_{}", &uuid::Uuid::new_v4().simple().to_string()[..10]);
     let root_path = if let Some(ref pid) = project_id {
@@ -2008,10 +2010,15 @@ async fn compute_storage_summary(switch: &mh_switch::SwitchEngine) -> StorageSum
         if let Ok(mut rd) = tokio::fs::read_dir(&wt_root).await {
             while let Ok(Some(entry)) = rd.next_entry().await {
                 let p = entry.path();
-                if !p.is_dir() {
+                let name = entry.file_name().to_string_lossy().into_owned();
+                if !p.is_dir()
+                    || (!active_ids.contains(&name)
+                        && !archived_ids.contains(&name)
+                        && !is_managed_workspace_name(&name))
+                    || !is_path_within(&p, &wt_root)
+                {
                     continue;
                 }
-                let name = entry.file_name().to_string_lossy().into_owned();
                 let sz = dir_size_bytes(p).await;
                 if active_ids.contains(&name) {
                     active_worktrees_count = active_worktrees_count.saturating_add(1);
@@ -2030,10 +2037,15 @@ async fn compute_storage_summary(switch: &mh_switch::SwitchEngine) -> StorageSum
     if let Ok(mut rd) = tokio::fs::read_dir(ws_root).await {
         while let Ok(Some(entry)) = rd.next_entry().await {
             let p = entry.path();
-            if !p.is_dir() {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if !p.is_dir()
+                || (!active_ids.contains(&name)
+                    && !archived_ids.contains(&name)
+                    && !is_managed_workspace_name(&name))
+                || !is_path_within(&p, ws_root)
+            {
                 continue;
             }
-            let name = entry.file_name().to_string_lossy().into_owned();
             let sz = dir_size_bytes(p).await;
             if active_ids.contains(&name) {
                 standalone_count = standalone_count.saturating_add(1);
@@ -2086,6 +2098,15 @@ pub async fn get_storage_handler(State(state): State<AppState>) -> ApiResult<Val
     Ok(Json(json!({ "storage": storage })))
 }
 
+fn is_managed_workspace_name(name: &str) -> bool {
+    name.strip_prefix("s_").is_some_and(|id| {
+        id.len() == 10
+            && id
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
+    })
+}
+
 #[derive(Debug, Deserialize)]
 pub struct CleanupStorageRequest {
     pub action: String,
@@ -2109,6 +2130,7 @@ pub async fn cleanup_storage_handler(
     let mut harness_warnings = std::collections::BTreeSet::new();
 
     if action == "clear_caches" {
+        let _workspaces = state.switch.workspace_paths_lock.lock().await;
         let all_ids: std::collections::HashSet<String> = state
             .switch
             .store
@@ -2129,16 +2151,17 @@ pub async fn cleanup_storage_handler(
             if let Ok(mut rd) = tokio::fs::read_dir(&wt_root).await {
                 while let Ok(Some(entry)) = rd.next_entry().await {
                     let p = entry.path();
-                    if !p.is_dir() {
+                    if !entry.file_type().await.is_ok_and(|kind| kind.is_dir())
+                        || !is_path_within(&p, &wt_root)
+                    {
                         continue;
                     }
                     let name = entry.file_name().to_string_lossy().into_owned();
-                    if !all_ids.contains(&name) {
+                    if is_managed_workspace_name(&name) && !all_ids.contains(&name) {
                         let _ = prune_session_worktrees(Path::new(&proj.root_path), &name).await;
-                        if p.exists() {
-                            let _ = tokio::fs::remove_dir_all(&p).await;
+                        if !p.exists() || tokio::fs::remove_dir_all(&p).await.is_ok() {
+                            removed_dirs += 1;
                         }
-                        removed_dirs += 1;
                     }
                 }
             }
@@ -2147,11 +2170,16 @@ pub async fn cleanup_storage_handler(
         if let Ok(mut rd) = tokio::fs::read_dir(ws_root).await {
             while let Ok(Some(entry)) = rd.next_entry().await {
                 let p = entry.path();
-                if !p.is_dir() {
+                if !entry.file_type().await.is_ok_and(|kind| kind.is_dir())
+                    || !is_path_within(&p, ws_root)
+                {
                     continue;
                 }
                 let name = entry.file_name().to_string_lossy().into_owned();
-                if !all_ids.contains(&name) && tokio::fs::remove_dir_all(&p).await.is_ok() {
+                if is_managed_workspace_name(&name)
+                    && !all_ids.contains(&name)
+                    && tokio::fs::remove_dir_all(&p).await.is_ok()
+                {
                     removed_dirs += 1;
                 }
             }

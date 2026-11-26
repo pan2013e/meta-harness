@@ -109,6 +109,7 @@ async fn acp_config_options_diff_capture_and_cancel() {
                 skill_read_roots: Vec::new(),
                 permission_policy: PermissionPolicy::WorktreeSmart,
                 existing_acp_session_id: None,
+                startup_deadline: None,
                 extra_env: Vec::new(),
                 mcp_bridge_spec: None,
                 rules: Arc::new(RwLock::new(Vec::new())),
@@ -171,7 +172,7 @@ async fn acp_config_options_diff_capture_and_cancel() {
     let t0 = Instant::now();
     let res = managed
         .client
-        .prompt("turn_2", "[MOCK:SLEEP ms=5000]", listener)
+        .prompt("turn_2", "[MOCK:SLEEP ms=5000]", listener.clone())
         .await;
     let elapsed = t0.elapsed();
     let _ = cancel_task.await;
@@ -182,5 +183,18 @@ async fn acp_config_options_diff_capture_and_cancel() {
         "cancel took {elapsed:?}"
     );
 
-    sup.shutdown_all().await;
+    let shutdown = async {
+        tokio::time::sleep(Duration::from_millis(80)).await;
+        sup.shutdown_session("s_acp").await;
+    };
+    let (interrupted, ()) = tokio::join!(
+        tokio::time::timeout(
+            Duration::from_secs(2),
+            managed
+                .client
+                .prompt("turn_3", "[MOCK:SLEEP ms=5000]", listener)
+        ),
+        shutdown,
+    );
+    assert!(matches!(interrupted, Ok(Err(AcpError::Cancelled))));
 }

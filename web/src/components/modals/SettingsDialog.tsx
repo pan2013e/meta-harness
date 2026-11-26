@@ -73,6 +73,7 @@ export function SettingsDialog({ onClose }: { onClose: () => void }) {
     updateAdapterDefaults,
     updateMemberConfig,
     errorBanner,
+    activeProjectId,
     activeSession,
     members,
     permissionRules,
@@ -720,7 +721,7 @@ export function SettingsDialog({ onClose }: { onClose: () => void }) {
               </div>
             )}
 
-            {section === "skills" && <SkillsSettings />}
+            {section === "skills" && <SkillsSettings key={activeProjectId ?? "standalone"} />}
 
             {section === "personas" && <GlobalPersonas />}
 

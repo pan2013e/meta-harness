@@ -65,7 +65,13 @@ impl Store {
     }
 
     pub fn upsert_skill_state(&self, row: &SkillStateRow) -> Result<(), StoreError> {
-        self.conn()?.execute(
+        self.upsert_skill_states(std::slice::from_ref(row))
+    }
+
+    pub fn upsert_skill_states(&self, rows: &[SkillStateRow]) -> Result<(), StoreError> {
+        let mut conn = self.conn()?;
+        let tx = conn.transaction()?;
+        let mut stmt = tx.prepare(
             "INSERT INTO skill_states (state_key, source, origin, enabled, builtin_hash, updated_at)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6)
              ON CONFLICT(state_key) DO UPDATE SET
@@ -74,15 +80,19 @@ impl Store {
                  enabled = excluded.enabled,
                  builtin_hash = COALESCE(excluded.builtin_hash, skill_states.builtin_hash),
                  updated_at = excluded.updated_at",
-            params![
+        )?;
+        for row in rows {
+            stmt.execute(params![
                 row.state_key,
                 row.source.as_str(),
                 row.origin,
                 if row.enabled { 1 } else { 0 },
                 row.builtin_hash,
                 row.updated_at,
-            ],
-        )?;
+            ])?;
+        }
+        drop(stmt);
+        tx.commit()?;
         Ok(())
     }
 

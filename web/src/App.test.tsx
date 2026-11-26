@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { App } from "./App";
 import { MarkdownBlock } from "./components/common/MarkdownBlock";
 import { formatCreditsDisplay, QuotaMeter, QuotaSnapshotSummary } from "./components/common/Badges";
@@ -90,6 +90,30 @@ describe("Startup and file previews", () => {
 });
 
 describe("Session navigation", () => {
+  it("discards skill responses for projects that are no longer selected", async () => {
+    type SkillListing = Awaited<ReturnType<typeof api.listSkills>>;
+    let finishFirst: (result: SkillListing) => void = () => {};
+    const first = new Promise<SkillListing>((resolve) => { finishFirst = resolve; });
+    const firstSkill = {
+      id: "first", name: "First", description: "First project skill", source: "project" as const,
+      origin: null, enabled: true, builtin_modified: false, skill_dir: "/first/skills/first",
+      skill_md_path: "/first/skills/first/SKILL.md", files: ["SKILL.md"], updated_at: 0,
+    };
+    vi.spyOn(api, "listSkills").mockImplementation((id) => id === "first"
+      ? first
+      : Promise.resolve({ skills: [{ ...firstSkill, id: "second" }], skills_dir: "/data/skills" }));
+    vi.spyOn(api, "listSessions").mockResolvedValue({ sessions: [] });
+    vi.spyOn(api, "getMemory").mockResolvedValue({ jobs: [], facts: [] });
+
+    const store = useAppStore.getState();
+    await store.selectProject("first");
+    await store.selectProject("second");
+    expect(useAppStore.getState().skills.map((skill) => skill.id)).toEqual(["second"]);
+    finishFirst({ skills: [firstSkill], skills_dir: "/data/skills" });
+    await first;
+    expect(useAppStore.getState().skills.map((skill) => skill.id)).toEqual(["second"]);
+    expect(useAppStore.getState().skillsLoading).toBe(false);
+  });
   it("keeps the most recently selected session when older requests finish last", async () => {
     let releaseFirst!: () => void;
     const first = new Promise<void>((resolve) => {
@@ -145,7 +169,8 @@ describe("Session navigation", () => {
         return socket;
       }, { OPEN: 1 })
     );
-    const client = new WsHubClient(vi.fn());
+    const connected = vi.fn();
+    const client = new WsHubClient(vi.fn(), connected);
     client.connect(null);
     client.setSession("session");
     client.subscribeTrajectory("turn");
@@ -156,6 +181,7 @@ describe("Session navigation", () => {
       { type: "set_session", session_id: "session" },
       { type: "subscribe_trajectory", turn_id: "turn" },
     ]);
+    expect(connected).toHaveBeenCalledOnce();
     client.disconnect();
     expect(close).toHaveBeenCalledOnce();
   });
@@ -232,15 +258,20 @@ describe("Session navigation", () => {
       ],
     });
 
-    useAppStore.getState().handleWsEvent({
-      type: "chat.message_delta",
+    const update = {
+      type: "chat.message_delta" as const,
       session_id: "s_1",
       message_id: "m_1",
       turn_id: "t_1",
       member_handle: "codex",
       delta: "Final summary ready.",
       replace: true,
-    });
+      revision: 3,
+    };
+    const store = useAppStore.getState();
+    store.handleWsEvent(update);
+    store.handleWsEvent({ ...update, delta: "Old snapshot", revision: 2 });
+    store.handleWsEvent({ ...update, delta: "Duplicate fragment", replace: false });
 
     expect(useAppStore.getState().messages[0].content).toBe("Final summary ready.");
   });
@@ -1135,15 +1166,21 @@ describe("UI primitives", () => {
       ],
     });
 
-    vi.spyOn(api, "getSkillDetail").mockResolvedValue({
+    type SkillFile = Awaited<ReturnType<typeof api.getSkillDetail>>;
+    let finishSkillFile: (file: SkillFile) => void = () => {};
+    const slowFile = new Promise<SkillFile>((resolve) => { finishSkillFile = resolve; });
+    vi.spyOn(api, "getSkillDetail").mockReturnValueOnce(slowFile).mockResolvedValue({
       detail: {
         skill: builtinSkill,
-        file_path: "SKILL.md",
-        content: "# Meta-Harness Docs\nBootstrap development guide.",
+        file_path: "references/usage-and-workflows.md",
+        content: "# Usage and workflows",
       },
     });
     vi.spyOn(api, "patchSkill").mockResolvedValue({
       skill: { ...builtinSkill, enabled: false },
+    });
+    vi.spyOn(api, "listSkills").mockResolvedValue({
+      skills: [{ ...builtinSkill, enabled: false }], skills_dir: "/data/skills",
     });
 
     render(<SettingsDialog onClose={() => {}} />);
@@ -1153,9 +1190,13 @@ describe("UI primitives", () => {
     expect(screen.getByText("/meta-harness-docs")).toBeTruthy();
 
     fireEvent.click(screen.getByRole("button", { name: /Inspect \/ Edit Files/i }));
-    await waitFor(() => {
-      expect(screen.getByDisplayValue(/Bootstrap development guide/)).toBeTruthy();
+    fireEvent.click(screen.getByRole("button", { name: "references/usage-and-workflows.md" }));
+    await screen.findByDisplayValue("# Usage and workflows");
+    await act(async () => {
+      finishSkillFile({ detail: { skill: builtinSkill, file_path: "SKILL.md", content: "# Meta-Harness Docs" } });
+      await slowFile;
     });
+    expect(screen.getByDisplayValue("# Usage and workflows")).toBeTruthy();
 
     fireEvent.click(screen.getByRole("switch", { name: "Enable skill Meta-Harness Docs" }));
     await waitFor(() => {
@@ -1163,6 +1204,7 @@ describe("UI primitives", () => {
         enabled: false,
         project_id: null,
       });
+      expect(screen.getByRole("switch", { name: "Enable skill Meta-Harness Docs" }).getAttribute("aria-checked")).toBe("false");
     });
 
     cleanup();

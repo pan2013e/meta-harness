@@ -17,7 +17,7 @@ pub struct BridgeCallPayload {
 /// to the local Meta-Harness server authenticated by `MH_BRIDGE_TOKEN`.
 pub async fn run_mcp_bridge(url: String, session_id: String, caller: String) -> anyhow::Result<()> {
     let token = std::env::var("MH_BRIDGE_TOKEN").unwrap_or_default();
-    let http = reqwest::Client::new();
+    let http = reqwest::Client::builder().no_proxy().build()?;
     let stdin = tokio::io::stdin();
     let mut stdout = tokio::io::stdout();
     let mut lines = BufReader::new(stdin).lines();

@@ -150,9 +150,27 @@ mod tests {
                 kind: MessageKind::Text,
                 content: "Done".into(),
                 turn_id: Some("t1".into()),
-                metadata: json!({}),
+                metadata: json!({"streaming": true}),
             })
             .unwrap();
+
+        assert_eq!(
+            store.append_message_delta(&m2.id, " now", false).unwrap(),
+            1
+        );
+        assert_eq!(
+            store
+                .append_message_delta(&m2.id, "Final answer", true)
+                .unwrap(),
+            2
+        );
+        let partial = store.get_message(&m2.id).unwrap();
+        assert_eq!(partial.content, "Final answer");
+        assert_eq!(partial.metadata["stream_revision"], 2);
+        store
+            .update_message(&m2.id, "Final answer", Some(json!({"streaming": false})))
+            .unwrap();
+        assert!(store.append_message_delta(&m2.id, "late", false).is_err());
 
         let deltas = store.list_unseen_deltas(&sess.id, m1.seq, 50).unwrap();
         assert_eq!(deltas.len(), 1);

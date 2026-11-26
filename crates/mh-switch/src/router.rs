@@ -51,6 +51,7 @@ pub enum TurnPurpose {
     MemoryCuration,
     PeerConsult {
         caller: String,
+        deadline: tokio::time::Instant,
     },
 }
 
@@ -126,6 +127,8 @@ pub struct SwitchEngine {
     pub internal_mcp_url: RwLock<String>,
     pub bridge_token: String,
     pub app_paths: AppPaths,
+    pub skill_mutations: Mutex<()>,
+    pub workspace_paths_lock: Mutex<()>,
     runtimes: Mutex<HashMap<String, Arc<SessionRuntime>>>,
 }
 
@@ -174,6 +177,8 @@ impl SwitchEngine {
             internal_mcp_url: RwLock::new(internal_mcp_url),
             bridge_token,
             app_paths,
+            skill_mutations: Mutex::new(()),
+            workspace_paths_lock: Mutex::new(()),
             runtimes: Mutex::new(HashMap::new()),
         })
     }
@@ -655,10 +660,28 @@ impl SwitchEngine {
             message: q_msg.clone(),
         });
 
-        self.set_member_status(session_id, caller, MemberStatus::Consulting, None)
-            .await;
+        let caller_turn = rt
+            .member_statuses
+            .read()
+            .await
+            .get(caller)
+            .and_then(|(_, id)| id.clone());
+        self.set_member_status(
+            session_id,
+            caller,
+            MemberStatus::Consulting,
+            caller_turn.clone(),
+        )
+        .await;
 
-        let timeout_secs = self.config.read().await.switch.peer_consult_timeout_secs;
+        let timeout_secs = self
+            .config
+            .read()
+            .await
+            .switch
+            .peer_consult_timeout_secs
+            .max(10);
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(timeout_secs);
         let brief = if let Some(ctid) = &context_turn_id {
             format!(
                 "[Consult from @{caller}] {question}\n(Context turn_id: {ctid}; you may call `trajectory_read` if needed. Answer concisely.)"
@@ -667,27 +690,36 @@ impl SwitchEngine {
             format!("[Consult from @{caller}] {question}\n(Answer concisely.)")
         };
 
-        let fut = self.execute_member_turn(
-            session_id,
-            &chain_id,
-            DispatchTaskSpec {
-                target: target.to_string(),
-                model: None,
-                effort: None,
-                task_brief: brief,
-                mode: "parallel".into(),
-            },
-            TurnPurpose::PeerConsult {
-                caller: caller.to_string(),
-            },
-        );
-
-        let result = tokio::time::timeout(Duration::from_secs(timeout_secs.max(10)), fut).await;
-        self.set_member_status(session_id, caller, MemberStatus::Thinking, None)
+        let result = self
+            .execute_member_turn(
+                session_id,
+                &chain_id,
+                DispatchTaskSpec {
+                    target: target.to_string(),
+                    model: None,
+                    effort: None,
+                    task_brief: brief,
+                    mode: "parallel".into(),
+                },
+                TurnPurpose::PeerConsult {
+                    caller: caller.to_string(),
+                    deadline,
+                },
+            )
             .await;
+        let still_consulting = rt
+            .member_statuses
+            .read()
+            .await
+            .get(caller)
+            .is_some_and(|(status, id)| *status == MemberStatus::Consulting && *id == caller_turn);
+        if still_consulting {
+            self.set_member_status(session_id, caller, MemberStatus::Thinking, caller_turn)
+                .await;
+        }
 
         match result {
-            Ok(Ok((turn_id, answer))) => {
+            Ok((turn_id, answer)) => {
                 let a_msg = self.store.append_message(NewMessageParams {
                     id: None,
                     session_id: session_id.to_string(),
@@ -715,10 +747,12 @@ impl SwitchEngine {
                     "answer": answer,
                 }))
             }
-            Ok(Err(e)) => Err(e),
-            Err(_) => Err(SwitchError::Timeout(format!(
-                "peer_consult to @{target} timed out after {timeout_secs}s"
-            ))),
+            Err(SwitchError::Timeout(_) | SwitchError::Acp(AcpError::Timeout(_))) => {
+                Err(SwitchError::Timeout(format!(
+                    "peer_consult to @{target} timed out after {timeout_secs}s"
+                )))
+            }
+            Err(e) => Err(e),
         }
     }
 
@@ -1042,19 +1076,28 @@ impl SwitchEngine {
                 c.cancelled = true;
             }
         }
-        {
-            let mut perms = rt.pending_permissions.lock().await;
-            for (req_id, entry) in perms.drain() {
-                let _ = entry.tx.send(PermissionResolution::Cancelled);
-                let _ = self.events_tx.send(WsEvent::PermissionResolved {
-                    session_id: session_id.to_string(),
-                    request_id: req_id,
-                    decision: "cancelled".into(),
-                });
-            }
-        }
+        self.cancel_permissions(session_id, &rt, None).await;
         rt.wait_for_graph.lock().await.clear();
         self.supervisor.cancel_session(session_id).await;
+    }
+
+    async fn cancel_permissions(
+        &self,
+        session_id: &str,
+        rt: &SessionRuntime,
+        turn_id: Option<&str>,
+    ) {
+        let mut pending = rt.pending_permissions.lock().await;
+        for (request_id, entry) in pending.extract_if(|_, entry| {
+            turn_id.is_none_or(|id| entry.view.turn_id.as_deref() == Some(id))
+        }) {
+            let _ = entry.tx.send(PermissionResolution::Cancelled);
+            let _ = self.events_tx.send(WsEvent::PermissionResolved {
+                session_id: session_id.to_string(),
+                request_id,
+                decision: "cancelled".into(),
+            });
+        }
     }
 
     /// Executes a single ACP turn for `task.target`, handling worktree isolation, delta sync,
@@ -1068,6 +1111,10 @@ impl SwitchEngine {
     ) -> BoxTurnFuture<'a> {
         Box::pin(async move {
             let rt = self.runtime(session_id).await;
+            let deadline = match &purpose {
+                TurnPurpose::PeerConsult { deadline, .. } => Some(*deadline),
+                _ => None,
+            };
             let epoch_at_start = *rt.cancel_epoch.read().await;
             let member_lock = {
                 let mut map = rt.member_locks.lock().await;
@@ -1076,7 +1123,13 @@ impl SwitchEngine {
                         .or_insert_with(|| Arc::new(Mutex::new(()))),
                 )
             };
-            let _member_guard = member_lock.lock().await;
+            let lock = member_lock.lock();
+            let _member_guard = match deadline {
+                Some(deadline) => tokio::time::timeout_at(deadline, lock)
+                    .await
+                    .map_err(|_| SwitchError::Timeout("Waiting for the consulted member".into()))?,
+                None => lock.await,
+            };
             let session = self.store.get_session(session_id)?;
             if session.archived_at.is_some() {
                 return Err(SwitchError::Cancelled);
@@ -1104,12 +1157,19 @@ impl SwitchEngine {
             }
             let mut member = self.store.get_member(session_id, &task.target)?;
             let previous_cwd = member.worktree_path.clone();
-            let _adapter_use = self
+            let use_adapter = self
                 .supervisor
                 .adapter_activity(&member.adapter_id)
                 .await
-                .read_owned()
-                .await;
+                .read_owned();
+            let _adapter_use = match deadline {
+                Some(deadline) => tokio::time::timeout_at(deadline, use_adapter)
+                    .await
+                    .map_err(|_| {
+                        SwitchError::Timeout("Waiting for the consulted harness".into())
+                    })?,
+                None => use_adapter.await,
+            };
             let cfg = self.config.read().await.clone();
             let adapter_cfg = cfg
                 .adapters
@@ -1205,6 +1265,7 @@ impl SwitchEngine {
                         previous_cwd.as_deref().map(Path::new) == Some(dunce::simplified(&work_cwd))
                     })
                     .and_then(|id| mh_acp::resume_profile_session(profile_dir.as_deref(), id)),
+                startup_deadline: deadline,
                 extra_env: Vec::new(),
                 mcp_bridge_spec: mcp_spec,
                 rules,
@@ -1287,14 +1348,17 @@ impl SwitchEngine {
             } else {
                 None
             };
-            let (applied_model, applied_effort) = managed
-                .client
-                .apply_model_and_effort(
-                    wanted_model,
-                    wanted_effort,
-                    model_default_effort.as_deref(),
-                )
-                .await;
+            let configure = managed.client.apply_model_and_effort(
+                wanted_model,
+                wanted_effort,
+                model_default_effort.as_deref(),
+            );
+            let (applied_model, applied_effort) = match deadline {
+                Some(deadline) => tokio::time::timeout_at(deadline, configure)
+                    .await
+                    .unwrap_or_default(),
+                None => configure.await,
+            };
 
             let new_acp_sid = managed
                 .client
@@ -1398,21 +1462,40 @@ impl SwitchEngine {
 
             let pre_head_sha = get_head_sha(&work_cwd).await;
             let prompt_res = if *rt.cancel_epoch.read().await == epoch_at_start {
-                managed
+                let prompt = managed
                     .client
-                    .prompt(&turn_id, &full_prompt, stream_listener)
-                    .await
+                    .prompt(&turn_id, &full_prompt, stream_listener);
+                if let Some(deadline) = deadline {
+                    let result = if tokio::time::Instant::now() >= deadline {
+                        None
+                    } else {
+                        tokio::time::timeout_at(deadline, prompt).await.ok()
+                    };
+                    if let Some(result) = result {
+                        result
+                    } else {
+                        *managed.active_turn_id.write().await = None;
+                        self.cancel_permissions(session_id, &rt, Some(&turn_id))
+                            .await;
+                        // The prompt may still be running in the harness. Retire it before releasing the member lock.
+                        managed.client.shutdown().await;
+                        Err(AcpError::Timeout("Peer consultation expired".into()))
+                    }
+                } else {
+                    prompt.await
+                }
             } else {
                 Err(AcpError::Cancelled)
             };
             *managed.active_turn_id.write().await = None;
 
-            let _ = self
-                .store
-                .advance_member_last_seen(session_id, &member.handle, max_seen_seq);
-
             match prompt_res {
                 Ok((_, prompt_output)) => {
+                    let _ = self.store.advance_member_last_seen(
+                        session_id,
+                        &member.handle,
+                        max_seen_seq,
+                    );
                     let reply_text = prompt_output.final_text;
                     let intermediate_notes = prompt_output.intermediate_notes;
                     let approx_tokens = ((full_prompt.len() + reply_text.len()) / 4).max(20) as u64;
@@ -2380,7 +2463,14 @@ impl SwitchEngine {
     }
 
     pub async fn compact_session(&self, session_id: &str) -> Result<ChatMessage, SwitchError> {
+        let rt = self.runtime(session_id).await;
+        let _lifecycle = rt.lifecycle_lock.lock().await;
         let session = self.store.get_session(session_id)?;
+        if session.archived_at.is_some() {
+            return Err(SwitchError::Validation(
+                "Restore the session before compacting its context.".into(),
+            ));
+        }
         let messages = self.store.list_messages(session_id, None, 100)?;
         let mut lines = Vec::new();
         if !session.working_summary.trim().is_empty() {
@@ -2405,7 +2495,8 @@ impl SwitchEngine {
                 ..Default::default()
             },
         )?;
-        let _ = self.store.clear_session_acp_ids(session_id);
+        self.cancel_all_in_session(session_id).await;
+        self.store.clear_session_acp_ids(session_id)?;
         self.supervisor.reset_session_clients(session_id).await;
 
         let notice = self.store.append_message(NewMessageParams {
@@ -2916,6 +3007,7 @@ impl TurnStreamListener for SwitchStreamListener {
     async fn on_text_delta(&self, turn_id: &str, delta: String, replace: bool) {
         if let Some(msg_id) = &self.message_id
             && let Some(engine) = self.engine.upgrade()
+            && let Ok(revision) = engine.store.append_message_delta(msg_id, &delta, replace)
         {
             let _ = engine.events_tx.send(WsEvent::ChatMessageDelta {
                 session_id: self.session_id.clone(),
@@ -2923,6 +3015,7 @@ impl TurnStreamListener for SwitchStreamListener {
                 turn_id: turn_id.to_string(),
                 member_handle: self.member_handle.clone(),
                 delta,
+                revision,
                 replace,
             });
         }

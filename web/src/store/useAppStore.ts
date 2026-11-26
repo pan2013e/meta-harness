@@ -214,11 +214,16 @@ interface AppState {
   closeDrawer: () => void;
 
   refreshMemory: (query?: string) => Promise<void>;
-  refreshSkills: (projectId?: string | null) => Promise<void>;
+  refreshSkills: () => Promise<void>;
   toggleSkill: (id: string, enabled: boolean) => Promise<void>;
   refreshQuotas: () => Promise<void>;
   refreshQuotasLive: () => Promise<void>;
   handleWsEvent: (ev: WsEvent) => void;
+}
+
+function streamRevision(message: ChatMessage): number {
+  const revision = message.metadata.stream_revision;
+  return typeof revision === "number" ? revision : 0;
 }
 
 const emptySessionState = {
@@ -248,6 +253,7 @@ export const useAppStore = create<AppState>((set, get) => {
   let sessionRequest = 0;
   let diffRequest = 0;
   let memoryRequest = 0;
+  let skillsRequest = 0;
   let trajectoryRequest = 0;
   let catalogRequest = 0;
   let startupRequest = 0;
@@ -398,8 +404,8 @@ export const useAppStore = create<AppState>((set, get) => {
         const ws = new WsHubClient(
           (ev) => get().handleWsEvent(ev),
           () => {
-            const sessionId = get().activeSession?.id;
-            if (sessionId && !sessionLoad) void get().selectSession(sessionId);
+            const sessionId = sessionLoad?.id ?? get().activeSession?.id;
+            if (sessionId) void get().selectSession(sessionId);
           }
         );
         ws.connect(null);
@@ -424,7 +430,6 @@ export const useAppStore = create<AppState>((set, get) => {
         void get().refreshQuotas()
           .catch((error: unknown) => { if (startup === startupRequest) reportError(error); })
           .finally(() => finish("quota"));
-        void get().refreshSkills(projRes.projects[0]?.id ?? null).catch(() => undefined);
         const request = ++catalogRequest;
         void api.listAdapters().then(({ catalogs }) => {
           if (catalogs && request === catalogRequest) set({ adapterCatalogs: catalogs });
@@ -462,7 +467,8 @@ export const useAppStore = create<AppState>((set, get) => {
       const request = ++projectRequest;
       const memoryAtStart = ++memoryRequest;
       clearSession();
-      set({ activeProjectId: projectId, sessions: [], memoryJobs: [], memoryFacts: [] });
+      set({ activeProjectId: projectId, sessions: [], memoryJobs: [], memoryFacts: [], skills: [], skillsLoading: true });
+      void get().refreshSkills().catch(() => undefined);
       try {
         const [{ sessions }, mem] = await Promise.all([
           projectId
@@ -482,7 +488,6 @@ export const useAppStore = create<AppState>((set, get) => {
         });
         const firstActive = sessions.find((s) => s.archived_at == null);
         if (firstActive) await get().selectSession(firstActive.id);
-        void get().refreshSkills(projectId).catch(() => undefined);
       } catch (error) {
         if (request === projectRequest) reportError(error);
       }
@@ -510,7 +515,7 @@ export const useAppStore = create<AppState>((set, get) => {
 
     selectSession: async (sessionId: string) => {
       const current = get().activeSession?.id === sessionId;
-      if (!current) clearSession();
+      if (!current && sessionLoad?.id !== sessionId) clearSession();
       const request = ++sessionRequest;
       const load =
         sessionLoad?.id === sessionId
@@ -540,11 +545,12 @@ export const useAppStore = create<AppState>((set, get) => {
           pendingPermissions: detail.pending_permissions,
           memberStatuses: statusMap,
           sessionContext: detail.context ?? null,
-          messages: msgsRes.messages.map((message) =>
-            message.metadata.streaming === true
-              ? existing.get(message.id) ?? message
-              : message
-          ),
+          messages: msgsRes.messages.map((message) => {
+            const local = existing.get(message.id);
+            return local && message.metadata.streaming === true &&
+              (streamRevision(local) > streamRevision(message) ||
+                (streamRevision(message) === 0 && !message.content)) ? local : message;
+          }),
           trajectories: trajRes.trajectories,
           turnEventSnapshots: {},
         });
@@ -882,23 +888,24 @@ export const useAppStore = create<AppState>((set, get) => {
       }
     },
 
-    refreshSkills: async (projectId?: string | null) => {
-      const pid = projectId !== undefined ? projectId : get().activeProjectId;
+    refreshSkills: async () => {
+      const request = ++skillsRequest;
+      const pid = get().activeProjectId;
       set({ skillsLoading: true });
       try {
         const res = await api.listSkills(pid);
-        set({ skills: res.skills, skillsDir: res.skills_dir });
+        if (request === skillsRequest && pid === get().activeProjectId) {
+          set({ skills: res.skills, skillsDir: res.skills_dir });
+        }
       } finally {
-        set({ skillsLoading: false });
+        if (request === skillsRequest && pid === get().activeProjectId) set({ skillsLoading: false });
       }
     },
 
     toggleSkill: async (id: string, enabled: boolean) => {
       const pid = get().activeProjectId;
-      const { skill } = await api.patchSkill(id, { enabled, project_id: pid });
-      set((state) => ({
-        skills: state.skills.map((item) => (item.id === skill.id ? skill : item)),
-      }));
+      await api.patchSkill(id, { enabled, project_id: pid });
+      await get().refreshSkills();
     },
 
     refreshQuotas: async () => {
@@ -964,10 +971,21 @@ export const useAppStore = create<AppState>((set, get) => {
         }
         case "chat.message_delta": {
           if (ev.session_id !== activeSid) return;
+          const message = get().messages.find((item) => item.id === ev.message_id);
+          if (message?.metadata.streaming === true && ev.revision && !ev.replace &&
+              ev.revision > streamRevision(message) + 1) {
+            void get().selectSession(ev.session_id);
+            return;
+          }
           set((s) => ({
             messages: s.messages.map((m) =>
-              m.id === ev.message_id && m.metadata.streaming === true
-                ? { ...m, content: ev.replace ? ev.delta : m.content + ev.delta }
+              m.id === ev.message_id && m.metadata.streaming === true &&
+                (!ev.revision || ev.revision > streamRevision(m))
+                ? {
+                    ...m,
+                    content: ev.replace ? ev.delta : m.content + ev.delta,
+                    metadata: ev.revision ? { ...m.metadata, stream_revision: ev.revision } : m.metadata,
+                  }
                 : m
             ),
           }));

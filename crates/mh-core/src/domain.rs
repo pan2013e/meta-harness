@@ -575,6 +575,8 @@ pub enum WsEvent {
         member_handle: String,
         delta: String,
         #[serde(default)]
+        revision: u64,
+        #[serde(default)]
         replace: bool,
     },
     #[serde(rename = "chat.message_completed")]

@@ -10,7 +10,7 @@ use mh_core::{AdapterConfig, AppConfig, AppPaths, DispatchTaskSpec, MessageKind,
 use mh_server::auth::AuthConfig;
 use mh_server::{AppState, build_router};
 use mh_store::Store;
-use mh_switch::{SwitchEngine, SwitchError, execute_mcp_tool};
+use mh_switch::{SwitchEngine, SwitchError, TurnPurpose, execute_mcp_tool};
 
 fn mock_app_config() -> AppConfig {
     let exe = env!("CARGO_BIN_EXE_meta-harness").to_string();
@@ -671,6 +671,73 @@ async fn start_test_server_with_paths() -> (
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn timed_out_consult_retires_its_prompt_before_the_next_turn() {
+    let (base_url, switch, srv, _tmp, _paths) = start_test_server_with_paths().await;
+    let response: Value = reqwest::Client::new()
+        .post(format!("{base_url}/api/sessions"))
+        .json(&json!({"orchestrator_member":"codex"}))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let session_id = response["session"]["id"].as_str().unwrap();
+    let task = |brief: &str| DispatchTaskSpec {
+        target: "codex".into(),
+        model: None,
+        effort: None,
+        task_brief: brief.into(),
+        mode: "parallel".into(),
+    };
+    switch
+        .execute_member_turn(session_id, "warmup", task("Warm up"), TurnPurpose::Normal)
+        .await
+        .unwrap();
+
+    let timed_out = switch
+        .execute_member_turn(
+            session_id,
+            "consult",
+            task("[MOCK:SLEEP ms=12000]"),
+            TurnPurpose::PeerConsult {
+                caller: "antigravity".into(),
+                deadline: tokio::time::Instant::now() + Duration::from_secs(2),
+            },
+        )
+        .await;
+    assert!(matches!(
+        timed_out,
+        Err(SwitchError::Acp(mh_acp::AcpError::Timeout(_)))
+    ));
+    let turns = switch
+        .store
+        .list_trajectories(session_id, Some("codex"), 10)
+        .unwrap();
+    assert!(turns.iter().any(
+        |turn| turn.summary.contains("Peer consultation expired") && turn.finished_at.is_some()
+    ));
+
+    let (_, answer) = tokio::time::timeout(
+        Duration::from_secs(8),
+        switch.execute_member_turn(
+            session_id,
+            "followup",
+            task("A fresh turn"),
+            TurnPurpose::Normal,
+        ),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert!(!answer.is_empty());
+    switch.supervisor.shutdown_all().await;
+    srv.abort();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn standalone_archive_compact_and_storage_cleanup_lifecycle() {
     let (base_url, switch, srv, _tmp, paths) = start_test_server_with_paths().await;
     let http = reqwest::Client::new();
@@ -833,8 +900,10 @@ async fn standalone_archive_compact_and_storage_cleanup_lifecycle() {
     assert!(!updated_sess.working_summary.trim().is_empty());
 
     // 5. Storage stats + clear_caches (orphans) + delete_archived cleanup
-    let orphan_dir = paths.workspaces_dir.join("s_orphan_dir");
+    let orphan_dir = paths.workspaces_dir.join("s_a1b2c3d4e5");
+    let unrelated = paths.workspaces_dir.join("personal-notes");
     std::fs::create_dir_all(&orphan_dir).unwrap();
+    std::fs::create_dir_all(&unrelated).unwrap();
     std::fs::write(orphan_dir.join("junk.bin"), vec![42u8; 4096]).unwrap();
 
     let st_before: Value = http
@@ -859,6 +928,7 @@ async fn standalone_archive_compact_and_storage_cleanup_lifecycle() {
         .unwrap();
     assert_eq!(clear_resp["result"]["removed_dirs"], 1);
     assert!(!orphan_dir.exists());
+    assert!(unrelated.is_dir());
 
     // Archive again then delete archived sessions via cleanup API
     http.patch(format!("{base_url}/api/sessions/{sid}"))
@@ -1499,6 +1569,56 @@ async fn e2e_skills_builtin_install_mcp_access_and_slash_preload() {
         .await
         .unwrap();
     assert_eq!(folder_resp["installed"][0]["id"], "local-helper");
+
+    let conflicting_bundle = tempfile::tempdir().unwrap();
+    for slug in ["another-helper", "custom-audit"] {
+        let dir = conflicting_bundle.path().join(slug);
+        std::fs::create_dir(&dir).unwrap();
+        std::fs::write(
+            dir.join("SKILL.md"),
+            format!("---\nname: {slug}\n---\nReplacement\n"),
+        )
+        .unwrap();
+    }
+    let duplicate = http
+        .post(format!("{base_url}/api/skills/install-folder"))
+        .json(&json!({"path": conflicting_bundle.path().to_string_lossy()}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(duplicate.status(), reqwest::StatusCode::CONFLICT);
+    let original: Value = http
+        .get(format!("{base_url}/api/skills/custom-audit"))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(original["detail"]["skill"]["source"], "custom");
+    assert!(
+        original["detail"]["content"]
+            .as_str()
+            .unwrap()
+            .contains("Check invariants carefully.")
+    );
+    let other = http
+        .get(format!("{base_url}/api/skills/another-helper"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(other.status(), reqwest::StatusCode::NOT_FOUND);
+
+    let oversized = http.post(format!("{base_url}/api/skills"))
+        .json(&json!({"id":"retry-skill", "name":"Retry Skill", "description":"Test size validation.", "content":"x".repeat(512 * 1024)}))
+        .send().await.unwrap();
+    assert_eq!(oversized.status(), reqwest::StatusCode::BAD_REQUEST);
+    let retry = http.post(format!("{base_url}/api/skills"))
+        .json(&json!({"id":"retry-skill", "name":"Retry Skill", "description":"Test size validation.", "content":"# Valid skill"}))
+        .send().await.unwrap();
+    assert_eq!(retry.status(), reqwest::StatusCode::OK);
 
     let repo_dir = tempfile::tempdir().unwrap();
     std::fs::write(repo_dir.path().join("README.md"), "# Repo\n").unwrap();

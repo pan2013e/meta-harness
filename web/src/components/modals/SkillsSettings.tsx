@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useRef, useState } from "react";
 import {
   ChevronDown,
   ChevronRight,
@@ -62,6 +62,7 @@ export function SkillsSettings() {
   const [detailLoading, setDetailLoading] = useState(false);
   const [draftContent, setDraftContent] = useState("");
   const [confirmUninstallId, setConfirmUninstallId] = useState<string | null>(null);
+  const detailRequest = useRef(0);
 
   const runAction = async (fn: () => Promise<void>) => {
     setBusy(true);
@@ -77,7 +78,9 @@ export function SkillsSettings() {
   };
 
   const openDetailFile = async (skill: SkillSummary, file?: string) => {
+    const request = ++detailRequest.current;
     setExpandedId(skill.id);
+    setDetail(null);
     setDetailLoading(true);
     setError(null);
     try {
@@ -85,19 +88,22 @@ export function SkillsSettings() {
         projectId: activeProjectId,
         file: file ?? "SKILL.md",
       });
+      if (request !== detailRequest.current) return;
       setDetail(res.detail);
       setDraftContent(res.detail.content);
     } catch (cause) {
-      setError(cause instanceof Error ? cause.message : String(cause));
+      if (request === detailRequest.current) setError(cause instanceof Error ? cause.message : String(cause));
     } finally {
-      setDetailLoading(false);
+      if (request === detailRequest.current) setDetailLoading(false);
     }
   };
 
   const toggleExpand = (skill: SkillSummary) => {
     if (expandedId === skill.id) {
+      detailRequest.current++;
       setExpandedId(null);
       setDetail(null);
+      setDetailLoading(false);
       return;
     }
     void openDetailFile(skill, "SKILL.md");
@@ -466,6 +472,7 @@ export function SkillsSettings() {
               <div className="flex flex-wrap items-center justify-between gap-2 pt-1 border-t border-line/70">
                 <button
                   type="button"
+                  disabled={busy}
                   onClick={() => toggleExpand(skill)}
                   className="inline-flex items-center gap-1 text-[11px] font-medium text-brand-ink hover:underline"
                 >
@@ -530,6 +537,7 @@ export function SkillsSettings() {
                       <button
                         key={f}
                         type="button"
+                        disabled={busy}
                         onClick={() => void openDetailFile(skill, f)}
                         className={`rounded-md px-2 py-1 font-mono text-[10.5px] transition-colors ${
                           detail?.file_path === f
@@ -548,7 +556,7 @@ export function SkillsSettings() {
                     <>
                       <textarea
                         rows={11}
-                        readOnly={isProject}
+                        readOnly={isProject || busy}
                         value={draftContent}
                         onChange={(e) => setDraftContent(e.target.value)}
                         className="w-full rounded-lg border border-line bg-app p-2.5 font-mono text-[11px] text-ink leading-relaxed focus:outline-none focus:border-brand"

@@ -427,6 +427,7 @@ export type WsEvent =
       turn_id: string;
       member_handle: string;
       delta: string;
+      revision?: number;
       replace?: boolean;
     }
   | { type: "chat.message_completed"; message: ChatMessage }

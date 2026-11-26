@@ -1,3 +1,5 @@
+use std::collections::HashSet;
+use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::Duration;
@@ -14,8 +16,9 @@ use tokio::process::Command;
 
 use mh_acp::{ProcessTreeGuard, prepare_isolated_command, resolve_command};
 use mh_core::{
-    SkillSource, SkillSummary, ensure_skill_frontmatter, expand_user_path, is_path_within,
-    normalize_path, parse_skill_markdown, sanitize_skill_slug, scan_skill_dir,
+    MAX_SKILL_FILE_BYTES, SkillSource, SkillSummary, ensure_skill_frontmatter, expand_user_path,
+    is_path_within, normalize_path, parse_skill_markdown, resolve_skill_file, sanitize_skill_slug,
+    scan_skill_dir,
 };
 use mh_store::SkillStateRow;
 use mh_switch::{
@@ -76,8 +79,12 @@ struct TempDirGuard {
 
 impl TempDirGuard {
     fn create(prefix: &str) -> Result<Self, (StatusCode, Json<Value>)> {
-        let dir = std::env::temp_dir().join(format!("{prefix}_{}", uuid::Uuid::new_v4().simple()));
-        std::fs::create_dir_all(&dir)
+        Self::create_in(&std::env::temp_dir(), prefix)
+    }
+
+    fn create_in(parent: &Path, prefix: &str) -> Result<Self, (StatusCode, Json<Value>)> {
+        let dir = parent.join(format!("{prefix}_{}", uuid::Uuid::new_v4().simple()));
+        std::fs::create_dir(&dir)
             .map_err(|e| err_resp(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
         Ok(Self { path: dir })
     }
@@ -195,39 +202,40 @@ pub async fn create_custom_skill(
 
     let full_md = ensure_skill_frontmatter(&slug, name, description, &body.content);
     parse_skill_markdown(&full_md, &slug).map_err(|msg| err_resp(StatusCode::BAD_REQUEST, msg))?;
+    if full_md.len() as u64 > MAX_SKILL_FILE_BYTES {
+        return Err(err_resp(
+            StatusCode::BAD_REQUEST,
+            "SKILL.md cannot exceed 512 KiB.",
+        ));
+    }
 
+    let _mutation = state.switch.skill_mutations.lock().await;
     let skills_root = state.switch.app_paths.skills_dir();
     tokio::fs::create_dir_all(&skills_root)
         .await
         .map_err(|e| err_resp(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-    let dest_dir = skills_root.join(&slug);
-    if dest_dir.exists() {
-        return Err(err_resp(
-            StatusCode::CONFLICT,
-            format!("Skill '/{slug}' already exists. Open it to edit or delete it first."),
-        ));
-    }
-
-    tokio::fs::create_dir_all(&dest_dir)
+    let staging = TempDirGuard::create_in(&skills_root, ".skill-install")?;
+    let staged_skill_dir = staging.path.join(&slug);
+    tokio::fs::create_dir(&staged_skill_dir)
         .await
         .map_err(|e| err_resp(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-    tokio::fs::write(dest_dir.join("SKILL.md"), full_md)
+    tokio::fs::write(staged_skill_dir.join("SKILL.md"), full_md)
         .await
         .map_err(|e| err_resp(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
-    let now = now_millis();
-    state
-        .switch
-        .store
-        .upsert_skill_state(&SkillStateRow {
+    publish_staged_skills(
+        &state,
+        &skills_root,
+        &staging.path,
+        &[SkillStateRow {
             state_key: slug.clone(),
             source: SkillSource::Custom,
             origin: Some("inline".into()),
             enabled: true,
             builtin_hash: None,
-            updated_at: now,
-        })
-        .map_err(|e| err_resp(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+            updated_at: now_millis(),
+        }],
+    )?;
 
     let all = state
         .switch
@@ -245,6 +253,7 @@ pub async fn update_skill_content(
     AxumPath(id): AxumPath<String>,
     Json(body): Json<UpdateSkillContentRequest>,
 ) -> ApiResult<Value> {
+    let _mutation = state.switch.skill_mutations.lock().await;
     let slug = id.trim().trim_start_matches('/').to_ascii_lowercase();
     let skills = state
         .switch
@@ -271,19 +280,14 @@ pub async fn update_skill_content(
         .map(str::trim)
         .filter(|s| !s.is_empty())
         .unwrap_or("SKILL.md");
-    if rel == "SKILL.md" {
+    if rel.eq_ignore_ascii_case("SKILL.md") {
         parse_skill_markdown(&body.content, &slug)
             .map_err(|msg| err_resp(StatusCode::BAD_REQUEST, msg))?;
     }
     let root = Path::new(&existing.skill_dir);
-    let target = root.join(rel);
-    if !is_path_within(&target, root) {
-        return Err(err_resp(
-            StatusCode::BAD_REQUEST,
-            "Target file escapes skill directory.",
-        ));
-    }
-    if body.content.len() > 512 * 1024 {
+    let target =
+        resolve_skill_file(root, rel).map_err(|msg| err_resp(StatusCode::BAD_REQUEST, msg))?;
+    if body.content.len() as u64 > MAX_SKILL_FILE_BYTES {
         return Err(err_resp(
             StatusCode::BAD_REQUEST,
             "Skill file content cannot exceed 512 KiB.",
@@ -294,7 +298,12 @@ pub async fn update_skill_content(
             .await
             .map_err(|e| err_resp(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
     }
-    tokio::fs::write(&target, &body.content)
+    let staging = TempDirGuard::create_in(root, ".skill-edit")?;
+    let staged_file = staging.path.join("content");
+    tokio::fs::write(&staged_file, &body.content)
+        .await
+        .map_err(|e| err_resp(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    tokio::fs::rename(&staged_file, &target)
         .await
         .map_err(|e| err_resp(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
@@ -315,6 +324,7 @@ pub async fn patch_skill(
     AxumPath(id): AxumPath<String>,
     Json(body): Json<PatchSkillRequest>,
 ) -> ApiResult<Value> {
+    let _mutation = state.switch.skill_mutations.lock().await;
     let project_root = resolve_project_root(&state, body.project_id.as_deref())?;
     let slug = id.trim().trim_start_matches('/').to_ascii_lowercase();
     let skills = state
@@ -366,6 +376,7 @@ pub async fn reset_skill_handler(
     State(state): State<AppState>,
     AxumPath(id): AxumPath<String>,
 ) -> ApiResult<Value> {
+    let _mutation = state.switch.skill_mutations.lock().await;
     let skill = reset_builtin_skill(&state.switch.app_paths, &state.switch.store, &id)
         .map_err(map_skill_switch_err)?;
     Ok(Json(json!({ "skill": skill })))
@@ -375,6 +386,7 @@ pub async fn delete_skill(
     State(state): State<AppState>,
     AxumPath(id): AxumPath<String>,
 ) -> ApiResult<Value> {
+    let _mutation = state.switch.skill_mutations.lock().await;
     let slug = sanitize_skill_slug(&id).map_err(|msg| err_resp(StatusCode::BAD_REQUEST, msg))?;
     if slug == BUILTIN_META_HARNESS_DOCS_ID {
         return Err(err_resp(
@@ -383,11 +395,22 @@ pub async fn delete_skill(
         ));
     }
 
-    let target = state.switch.app_paths.skills_dir().join(&slug);
+    let root = state.switch.app_paths.skills_dir();
+    let target = root.join(&slug);
     if !target.exists() {
         return Err(err_resp(
             StatusCode::NOT_FOUND,
             format!("Installed skill '{slug}' not found (repo-local skills are managed in git)."),
+        ));
+    }
+    if !is_path_within(&target, &root)
+        || tokio::fs::symlink_metadata(&target)
+            .await
+            .is_ok_and(|meta| meta.file_type().is_symlink())
+    {
+        return Err(err_resp(
+            StatusCode::BAD_REQUEST,
+            "Invalid installed skill directory.",
         ));
     }
     tokio::fs::remove_dir_all(&target)
@@ -410,6 +433,7 @@ pub async fn install_skill_from_folder(
     }
     let norm = normalize_path(&expanded).unwrap_or(expanded);
     let origin = dunce::simplified(&norm).to_string_lossy().into_owned();
+    let _mutation = state.switch.skill_mutations.lock().await;
     let installed = import_skills_from_root(&state, &norm, SkillSource::Local, &origin)?;
     Ok(Json(json!({ "installed": installed })))
 }
@@ -443,6 +467,7 @@ pub async fn install_skill_from_git(
     } else {
         clone_url
     };
+    let _mutation = state.switch.skill_mutations.lock().await;
     let installed = import_skills_from_root(&state, &scan_root, SkillSource::Git, &origin)?;
     Ok(Json(json!({ "installed": installed })))
 }
@@ -453,7 +478,7 @@ fn import_skills_from_root(
     source: SkillSource,
     origin: &str,
 ) -> Result<Vec<SkillSummary>, (StatusCode, Json<Value>)> {
-    let candidates = discover_candidate_skill_dirs(root)?;
+    let candidates = discover_candidate_skill_dirs(root);
     if candidates.is_empty() {
         return Err(err_resp(
             StatusCode::BAD_REQUEST,
@@ -469,7 +494,9 @@ fn import_skills_from_root(
         .map_err(|e| err_resp(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
     let now = now_millis();
-    let mut installed_ids = Vec::new();
+    let staging = TempDirGuard::create_in(&skills_root, ".skill-import")?;
+    let mut rows = Vec::new();
+    let mut installed_ids = HashSet::new();
     for dir in candidates {
         let folder_fallback = dir
             .file_name()
@@ -486,38 +513,35 @@ fn import_skills_from_root(
                 "Cannot overwrite the preinstalled 'meta-harness-docs' skill.",
             ));
         }
-
-        let staging = skills_root.join(format!(".{slug}.tmp_{}", uuid::Uuid::new_v4().simple()));
+        if !installed_ids.insert(slug.clone()) {
+            return Err(err_resp(
+                StatusCode::CONFLICT,
+                format!("Multiple skills use '/{slug}'."),
+            ));
+        }
+        let staged_dir = staging.path.join(&slug);
         let mut total_files = 0usize;
         let mut total_bytes = 0u64;
-        if let Err(err) = copy_skill_tree(&dir, &staging, 0, &mut total_files, &mut total_bytes) {
-            let _ = std::fs::remove_dir_all(&staging);
-            return Err(err_resp(StatusCode::BAD_REQUEST, err));
-        }
-
-        let dest = skills_root.join(&slug);
-        if dest.exists() {
-            let _ = std::fs::remove_dir_all(&dest);
-        }
-        if let Err(err) = std::fs::rename(&staging, &dest) {
-            let _ = std::fs::remove_dir_all(&staging);
-            return Err(err_resp(StatusCode::INTERNAL_SERVER_ERROR, err.to_string()));
-        }
-
-        state
-            .switch
-            .store
-            .upsert_skill_state(&SkillStateRow {
-                state_key: slug.clone(),
-                source,
-                origin: Some(origin.to_string()),
-                enabled: true,
-                builtin_hash: None,
-                updated_at: now,
-            })
-            .map_err(|e| err_resp(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-        installed_ids.push(slug);
+        copy_skill_tree(
+            &dir,
+            &dir,
+            &staged_dir,
+            0,
+            &mut total_files,
+            &mut total_bytes,
+        )
+        .map_err(|err| err_resp(StatusCode::BAD_REQUEST, err))?;
+        scan_skill_dir(&staged_dir, &slug).map_err(|err| err_resp(StatusCode::BAD_REQUEST, err))?;
+        rows.push(SkillStateRow {
+            state_key: slug,
+            source,
+            origin: Some(origin.to_string()),
+            enabled: true,
+            builtin_hash: None,
+            updated_at: now,
+        });
     }
+    publish_staged_skills(state, &skills_root, &staging.path, &rows)?;
 
     let all = state
         .switch
@@ -529,13 +553,75 @@ fn import_skills_from_root(
         .collect())
 }
 
-fn discover_candidate_skill_dirs(root: &Path) -> Result<Vec<PathBuf>, (StatusCode, Json<Value>)> {
+fn publish_staged_skills(
+    state: &AppState,
+    skills_root: &Path,
+    staging: &Path,
+    rows: &[SkillStateRow],
+) -> Result<(), (StatusCode, Json<Value>)> {
+    let existing = state
+        .switch
+        .list_skills_for_project(None, None)
+        .map_err(map_skill_switch_err)?;
+    let mut published = Vec::new();
+    let result = (|| {
+        for row in rows {
+            let slug = &row.state_key;
+            let dest = skills_root.join(slug);
+            if existing.iter().any(|skill| skill.id == *slug) {
+                return Err(err_resp(
+                    StatusCode::CONFLICT,
+                    format!(
+                        "Skill '/{slug}' already exists. Open it to edit or uninstall it first."
+                    ),
+                ));
+            }
+            match std::fs::symlink_metadata(&dest) {
+                Err(err) if err.kind() == ErrorKind::NotFound => {}
+                Ok(_) => {
+                    return Err(err_resp(
+                        StatusCode::CONFLICT,
+                        format!("The folder for skill '/{slug}' already exists."),
+                    ));
+                }
+                Err(err) => {
+                    return Err(err_resp(StatusCode::INTERNAL_SERVER_ERROR, err.to_string()));
+                }
+            }
+        }
+        for row in rows {
+            let staged_dir = staging.join(&row.state_key);
+            let dest = skills_root.join(&row.state_key);
+            std::fs::rename(&staged_dir, &dest)
+                .map_err(|e| err_resp(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+            published.push((staged_dir, dest));
+        }
+        state
+            .switch
+            .store
+            .upsert_skill_states(rows)
+            .map_err(|e| err_resp(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))
+    })();
+    if result.is_err() {
+        for (staged_dir, dest) in published.into_iter().rev() {
+            if let Err(error) = std::fs::rename(&dest, &staged_dir) {
+                tracing::warn!(path = %dest.display(), %error, "Could not roll back skill installation");
+            }
+        }
+    }
+    result
+}
+
+fn discover_candidate_skill_dirs(root: &Path) -> Vec<PathBuf> {
     if root.join("SKILL.md").is_file() {
-        return Ok(vec![root.to_path_buf()]);
+        return vec![root.to_path_buf()];
     }
 
     let mut found = Vec::new();
     let collect_direct = |parent: &Path, out: &mut Vec<PathBuf>| {
+        if !is_path_within(parent, root) {
+            return;
+        }
         let Ok(rd) = std::fs::read_dir(parent) else {
             return;
         };
@@ -547,7 +633,7 @@ fn discover_candidate_skill_dirs(root: &Path) -> Result<Vec<PathBuf>, (StatusCod
             if name.starts_with('.') || name == "node_modules" {
                 continue;
             }
-            if path.is_dir() && path.join("SKILL.md").is_file() {
+            if path.is_dir() && is_path_within(&path, parent) && path.join("SKILL.md").is_file() {
                 out.push(path);
             }
         }
@@ -561,10 +647,11 @@ fn discover_candidate_skill_dirs(root: &Path) -> Result<Vec<PathBuf>, (StatusCod
             }
         }
     }
-    Ok(found)
+    found
 }
 
 fn copy_skill_tree(
+    root: &Path,
     src: &Path,
     dest: &Path,
     depth: usize,
@@ -590,9 +677,19 @@ fn copy_skill_tree(
             continue;
         }
         let src_path = entry.path();
+        if !is_path_within(&src_path, root) {
+            continue;
+        }
         let dest_path = dest.join(&name);
         if ft.is_dir() {
-            copy_skill_tree(&src_path, &dest_path, depth + 1, total_files, total_bytes)?;
+            copy_skill_tree(
+                root,
+                &src_path,
+                &dest_path,
+                depth + 1,
+                total_files,
+                total_bytes,
+            )?;
         } else if ft.is_file() {
             *total_files += 1;
             if *total_files > 200 {

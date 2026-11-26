@@ -82,17 +82,7 @@ impl Store {
 
     pub fn get_session(&self, id: &str) -> Result<Session, StoreError> {
         let conn = self.conn()?;
-        conn.query_row(
-            "SELECT id, project_id, title, base_branch, base_commit_sha,
-                    integration_branch, integration_wt_path, isolation_mode,
-                    orchestrator_member, confirm_before_dispatch, max_hops,
-                    permission_policy, working_summary, archived_at, created_at, updated_at
-             FROM sessions WHERE id = ?1",
-            params![id],
-            map_session_row,
-        )
-        .optional()?
-        .ok_or_else(|| StoreError::NotFound(format!("session {id}")))
+        read_session(&conn, id)
     }
 
     pub fn list_sessions(
@@ -155,7 +145,9 @@ impl Store {
         id: &str,
         patch: PatchSessionParams,
     ) -> Result<Session, StoreError> {
-        let mut current = self.get_session(id)?;
+        let mut conn = self.conn()?;
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let mut current = read_session(&tx, id)?;
         if let Some(t) = patch.title {
             current.title = t;
         }
@@ -177,10 +169,9 @@ impl Store {
         if let Some(arch) = patch.archived_at {
             current.archived_at = arch;
         }
-        let now = now_millis();
+        current.updated_at = now_millis();
 
-        let conn = self.conn()?;
-        conn.execute(
+        tx.execute(
             "UPDATE sessions
              SET title = ?1, orchestrator_member = ?2, confirm_before_dispatch = ?3,
                  max_hops = ?4, permission_policy = ?5, working_summary = ?6, archived_at = ?7, updated_at = ?8
@@ -193,12 +184,12 @@ impl Store {
                 current.permission_policy.as_str(),
                 current.working_summary,
                 current.archived_at,
-                now,
+                current.updated_at,
                 id,
             ],
         )?;
-        drop(conn);
-        self.get_session(id)
+        tx.commit()?;
+        Ok(current)
     }
 
     pub fn delete_archived_sessions(&self) -> Result<Vec<Session>, StoreError> {
@@ -489,6 +480,20 @@ impl Store {
         )?;
         Ok(())
     }
+}
+
+fn read_session(conn: &rusqlite::Connection, id: &str) -> Result<Session, StoreError> {
+    conn.query_row(
+        "SELECT id, project_id, title, base_branch, base_commit_sha,
+                integration_branch, integration_wt_path, isolation_mode,
+                orchestrator_member, confirm_before_dispatch, max_hops,
+                permission_policy, working_summary, archived_at, created_at, updated_at
+         FROM sessions WHERE id = ?1",
+        [id],
+        map_session_row,
+    )
+    .optional()?
+    .ok_or_else(|| StoreError::NotFound(format!("session {id}")))
 }
 
 fn map_session_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Session> {

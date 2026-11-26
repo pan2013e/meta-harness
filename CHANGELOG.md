@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+- Keep the composer and Skills settings in sync when switching projects or opening files quickly.
+- Protect installed skills from duplicate imports and validate a bundle before installing its contents.
+- Keep skill discovery within its designated directories and check every file in a brokered tool approval.
+- Finish pending ACP requests when a harness shuts down. Clean up timed-out peer consultations before accepting another turn.
+- Allow a brokered terminal to stop while another request is waiting for its exit. Keep the MCP bridge reachable on loopback when the web server binds to a LAN address.
+- Preserve staged files when creating the first session worktree. Keep cache cleanup away from unrelated folders and workspaces being created.
+- Restore partially streamed replies after reconnecting or returning to a session, without duplicating text.
+- Cancel active turns before resetting harnesses during context compaction, and apply session metadata updates atomically.
+
 ## 0.5.0
 
 - Add Agent Skills support across group chats (`SKILL.md` bundles in `<MH_DATA_DIR>/skills/` plus repo-local `.agents/skills/` discovery, `/skill-name` composer pills, auto-approved `skill_list` / `skill_read` MCP tools & read-only brokered file access, and inline skill activity pills).

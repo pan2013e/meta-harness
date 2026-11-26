@@ -505,11 +505,10 @@ export class WsHubClient {
   private sessionId: string | null = null;
   private subscribedTurn: string | null = null;
   private closed = false;
-  private hasOpened = false;
 
   constructor(
     private readonly onEvent: (ev: WsEvent) => void,
-    private readonly onReconnect?: () => void,
+    private readonly onConnected?: () => void,
   ) {}
 
   connect(sessionId: string | null) {
@@ -562,8 +561,7 @@ export class WsHubClient {
       if (this.ws !== socket) return;
       this.setSession(this.sessionId);
       this.subscribeTrajectory(this.subscribedTurn);
-      if (this.hasOpened) this.onReconnect?.();
-      this.hasOpened = true;
+      this.onConnected?.();
     };
 
     socket.onmessage = (msg) => {

@@ -50,12 +50,32 @@ struct TurnStreamAccumulator {
     prior_segments: Vec<String>,
 }
 
+#[derive(Default)]
+struct PendingRequests {
+    closed: bool,
+    calls: HashMap<i64, oneshot::Sender<Result<JsonRpcResponse, AcpError>>>,
+}
+
+impl PendingRequests {
+    fn close(&mut self, cancelled: bool) {
+        self.closed = true;
+        for (_, waiter) in self.calls.drain() {
+            let error = if cancelled {
+                AcpError::Cancelled
+            } else {
+                AcpError::ProcessExited("ACP agent stdout closed".into())
+            };
+            let _ = waiter.send(Err(error));
+        }
+    }
+}
+
 pub struct AcpClient {
     guard: std::sync::Mutex<ProcessTreeGuard>,
     child: Mutex<Child>,
     stdin: Mutex<ChildStdin>,
     next_id: AtomicI64,
-    pending: Arc<Mutex<HashMap<i64, oneshot::Sender<JsonRpcResponse>>>>,
+    pending: Arc<Mutex<PendingRequests>>,
     broker: Arc<WorkspaceBroker>,
     stderr_tail: Arc<Mutex<VecDeque<String>>>,
     active_stream: Arc<Mutex<Option<TurnStreamAccumulator>>>,
@@ -113,9 +133,7 @@ impl AcpClient {
             .ok_or_else(|| AcpError::ProcessExited("missing child stdout".into()))?;
         let stderr = child.stderr.take();
 
-        let pending = Arc::new(Mutex::new(
-            HashMap::<i64, oneshot::Sender<JsonRpcResponse>>::new(),
-        ));
+        let pending = Arc::new(Mutex::new(PendingRequests::default()));
         let stderr_tail = Arc::new(Mutex::new(VecDeque::<String>::with_capacity(100)));
         let active_stream = Arc::new(Mutex::new(None::<TurnStreamAccumulator>));
         let stream_flush = Arc::new(Mutex::new(()));
@@ -206,26 +224,13 @@ impl AcpClient {
                         // Response to a Client -> Agent request
                         if let Some(id_num) = id_val.as_i64()
                             && let Ok(resp) = serde_json::from_value::<JsonRpcResponse>(val)
-                            && let Some(tx) = pending_for_reader.lock().await.remove(&id_num)
+                            && let Some(tx) = pending_for_reader.lock().await.calls.remove(&id_num)
                         {
-                            let _ = tx.send(resp);
+                            let _ = tx.send(Ok(resp));
                         }
                     }
                 }
-                // Wake any remaining waiters if stdout closed
-                let mut guard = pending_for_reader.lock().await;
-                for (_, tx) in guard.drain() {
-                    let _ = tx.send(JsonRpcResponse {
-                        jsonrpc: "2.0".into(),
-                        id: Value::Null,
-                        result: None,
-                        error: Some(crate::protocol::JsonRpcError {
-                            code: -32000,
-                            message: "ACP agent stdout closed".into(),
-                            data: None,
-                        }),
-                    });
-                }
+                pending_for_reader.lock().await.close(false);
             });
 
             Self {
@@ -499,13 +504,17 @@ impl AcpClient {
     }
 
     pub async fn is_alive(&self) -> bool {
+        if self.pending.lock().await.closed {
+            return false;
+        }
         let mut child = self.child.lock().await;
         matches!(child.try_wait(), Ok(None))
     }
 
     pub async fn shutdown(&self) {
-        self.coalescer_task.abort();
         self.reader_task.abort();
+        self.pending.lock().await.close(true);
+        self.coalescer_task.abort();
         self.broker.cleanup_all_terminals().await;
         if let Ok(mut g) = self.guard.lock() {
             g.kill_tree();
@@ -522,23 +531,28 @@ impl AcpClient {
 
     async fn request(&self, method: &str, params: Value) -> Result<Value, AcpError> {
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
-        let (tx, rx) = oneshot::channel();
-        self.pending.lock().await.insert(id, tx);
-
-        let req = JsonRpcRequest {
+        let request = serde_json::to_string(&JsonRpcRequest {
             jsonrpc: "2.0".into(),
             id: json!(id),
             method: method.into(),
             params: Some(params),
-        };
-        if let Err(e) = self.write_line(&serde_json::to_string(&req)?).await {
-            self.pending.lock().await.remove(&id);
+        })?;
+        let (tx, rx) = oneshot::channel();
+        {
+            let mut pending = self.pending.lock().await;
+            if pending.closed {
+                return Err(AcpError::ProcessExited("ACP connection is closed".into()));
+            }
+            pending.calls.insert(id, tx);
+        }
+        if let Err(e) = self.write_line(&request).await {
+            self.pending.lock().await.calls.remove(&id);
             return Err(e);
         }
 
         let resp = rx
             .await
-            .map_err(|_| AcpError::ProcessExited("ACP request channel dropped".into()))?;
+            .map_err(|_| AcpError::ProcessExited("ACP request channel dropped".into()))??;
         if let Some(err) = resp.error {
             let lower = err.message.to_ascii_lowercase();
             if err.code == 429

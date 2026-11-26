@@ -35,6 +35,7 @@ pub struct MemberSpawnSpec {
     pub skill_read_roots: Vec<PathBuf>,
     pub permission_policy: PermissionPolicy,
     pub existing_acp_session_id: Option<String>,
+    pub startup_deadline: Option<tokio::time::Instant>,
     pub extra_env: Vec<(String, String)>,
     pub mcp_bridge_spec: Option<McpServerSpec>,
     pub rules: Arc<RwLock<Vec<PermissionRule>>>,
@@ -170,11 +171,15 @@ impl AcpSupervisor {
             debug!(adapter = %spec.adapter_id, initialize_ms, ready_ms = started.elapsed().as_millis(), "ACP session ready");
             Ok::<_, AcpError>(())
         };
-        let setup_result = tokio::time::timeout(Duration::from_secs(60), setup)
+        let startup_limit = tokio::time::Instant::now() + Duration::from_secs(60);
+        let deadline = spec
+            .startup_deadline
+            .map_or(startup_limit, |deadline| deadline.min(startup_limit));
+        let setup_result = tokio::time::timeout_at(deadline, setup)
             .await
             .unwrap_or_else(|_| {
                 Err(AcpError::Timeout(format!(
-                    "{} did not initialize an ACP session within 60 seconds",
+                    "{} did not initialize an ACP session before the deadline",
                     spec.adapter.display_name
                 )))
             });

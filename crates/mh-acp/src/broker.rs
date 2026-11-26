@@ -6,8 +6,8 @@ use async_trait::async_trait;
 use serde_json::{Value, json};
 use similar::TextDiff;
 use tokio::io::AsyncReadExt;
-use tokio::process::{Child, Command};
-use tokio::sync::{Mutex, RwLock};
+use tokio::process::Command;
+use tokio::sync::{Mutex, RwLock, watch};
 
 use mh_core::{
     PendingPermissionView, PermissionPolicy, PermissionPromptOption, PermissionRule,
@@ -66,11 +66,24 @@ pub struct MemberBrokerContext {
 }
 
 struct ManagedTerminal {
-    _guard: ProcessTreeGuard,
-    child: Mutex<Child>,
+    stop: watch::Sender<bool>,
     output: Arc<Mutex<Vec<u8>>>,
     output_limit: usize,
-    exit_code: Arc<Mutex<Option<i32>>>,
+    exit_code: watch::Receiver<Option<i32>>,
+}
+
+impl ManagedTerminal {
+    async fn wait_for_exit(&self) -> Result<i32, AcpError> {
+        let mut exit = self.exit_code.clone();
+        let status = exit.wait_for(Option::is_some).await.map_err(|_| {
+            AcpError::ProcessExited("Terminal closed without reporting its exit status".into())
+        })?;
+        Ok(status.unwrap_or(-1))
+    }
+
+    fn stop(&self) {
+        let _ = self.stop.send(true);
+    }
 }
 
 /// Brokers `fs/*`, `terminal/*`, and `session/request_permission` callbacks from an ACP harness
@@ -295,7 +308,7 @@ impl WorkspaceBroker {
         prepare_isolated_command(&mut cmd);
 
         let mut child = cmd.spawn()?;
-        let guard = ProcessTreeGuard::attach(&child);
+        let mut guard = ProcessTreeGuard::attach(&child);
         let output_buf = Arc::new(Mutex::new(Vec::<u8>::new()));
         let output_limit = params.output_byte_limit.unwrap_or(64 * 1024).max(1024);
 
@@ -313,12 +326,25 @@ impl WorkspaceBroker {
         }
 
         let terminal_id = format!("term_{}", &uuid::Uuid::new_v4().simple().to_string()[..10]);
+        let (stop, mut stop_requested) = watch::channel(false);
+        let (exit, exit_code) = watch::channel(None);
+        tokio::spawn(async move {
+            let status = tokio::select! {
+                status = child.wait() => status,
+                _ = async { let _ = stop_requested.wait_for(|stop| *stop).await; } => {
+                    guard.kill_tree();
+                    let _ = child.start_kill();
+                    child.wait().await
+                }
+            };
+            let code = status.ok().and_then(|status| status.code()).unwrap_or(-1);
+            let _ = exit.send(Some(code));
+        });
         let term = Arc::new(ManagedTerminal {
-            _guard: guard,
-            child: Mutex::new(child),
+            stop,
             output: output_buf,
             output_limit,
-            exit_code: Arc::new(Mutex::new(None)),
+            exit_code,
         });
 
         self.terminals
@@ -354,7 +380,7 @@ impl WorkspaceBroker {
             let buf = term.output.lock().await;
             String::from_utf8_lossy(&buf).into_owned()
         };
-        let exit_code = *term.exit_code.lock().await;
+        let exit_code = *term.exit_code.borrow();
         let truncated = text.len() >= term.output_limit;
         Ok(json!({
             "output": text,
@@ -368,12 +394,7 @@ impl WorkspaceBroker {
         params: TerminalIdParams,
     ) -> Result<Value, AcpError> {
         let term = self.get_terminal(&params.terminal_id).await?;
-        let code = {
-            let mut child = term.child.lock().await;
-            let status = child.wait().await?;
-            status.code().unwrap_or(-1)
-        };
-        *term.exit_code.lock().await = Some(code);
+        let code = term.wait_for_exit().await?;
 
         if let Some(turn_id) = self.ctx.active_turn_id.read().await.clone() {
             let out_tail = {
@@ -407,8 +428,8 @@ impl WorkspaceBroker {
 
     pub async fn handle_terminal_kill(&self, params: TerminalIdParams) -> Result<Value, AcpError> {
         let term = self.get_terminal(&params.terminal_id).await?;
-        let mut child = term.child.lock().await;
-        let _ = child.kill().await;
+        term.stop();
+        term.wait_for_exit().await?;
         Ok(json!({}))
     }
 
@@ -416,9 +437,10 @@ impl WorkspaceBroker {
         &self,
         params: TerminalIdParams,
     ) -> Result<Value, AcpError> {
-        if let Some(term) = self.terminals.lock().await.remove(&params.terminal_id) {
-            let mut child = term.child.lock().await;
-            let _ = child.kill().await;
+        let removed = self.terminals.lock().await.remove(&params.terminal_id);
+        if let Some(term) = removed {
+            term.stop();
+            let _ = term.wait_for_exit().await;
         }
         Ok(json!({}))
     }
@@ -468,39 +490,43 @@ impl WorkspaceBroker {
         }
 
         // Worktree-smart fast-path for edit/read tool calls inside allowed roots
-        if let Some(loc_path) = extract_tool_call_path(&params.tool_call) {
-            let resolved = resolve_member_path(&self.ctx.member_worktree, &loc_path);
-            let in_skill_root = self
-                .ctx
-                .skill_read_roots
-                .read()
-                .await
-                .iter()
-                .any(|root| is_path_within(&resolved, root));
-            let allow_read = kind == "read"
-                && (is_path_within(&resolved, &self.ctx.member_worktree)
-                    || is_path_within(&resolved, &self.ctx.project_root)
-                    || in_skill_root);
-            let allow_worktree_smart = matches!(
+        if matches!(kind, "edit" | "read" | "write" | "fs") {
+            let allow_worktree_access = matches!(
                 self.ctx.permission_policy,
                 PermissionPolicy::WorktreeSmart | PermissionPolicy::AutonomousSandbox
-            ) && matches!(kind, "edit" | "read" | "write" | "fs")
-                && is_path_within(&resolved, &self.ctx.member_worktree);
+            );
+            let paths = tool_call_paths(&params.tool_call);
+            let mut skill_reads = Vec::new();
+            let allow_paths = {
+                let skill_roots = self.ctx.skill_read_roots.read().await;
+                !paths.is_empty()
+                    && paths.into_iter().all(|path| {
+                        let target = resolve_member_path(&self.ctx.member_worktree, path);
+                        if kind == "read"
+                            && skill_roots.iter().any(|root| is_path_within(&target, root))
+                        {
+                            skill_reads.push(target);
+                            true
+                        } else {
+                            allow_worktree_access
+                                && is_path_within(&target, &self.ctx.member_worktree)
+                        }
+                    })
+            };
 
-            if (allow_read || allow_worktree_smart)
+            if allow_paths
                 && let Some(allow) = options
                     .iter()
-                    .find(|o| o.kind.starts_with("allow"))
+                    .find(|o| o.kind == "allow_once")
                     .map(|o| o.option_id.clone())
             {
-                if kind == "read"
-                    && in_skill_root
+                if !skill_reads.is_empty()
                     && let Some(turn_id) = self.ctx.active_turn_id.read().await.clone()
                 {
-                    self.callbacks()
-                        .await
-                        .record_skill_read(&turn_id, &resolved)
-                        .await;
+                    let callbacks = self.callbacks().await;
+                    for path in skill_reads {
+                        callbacks.record_skill_read(&turn_id, &path).await;
+                    }
                 }
                 return Ok(json!({
                     "outcome": {
@@ -655,9 +681,11 @@ impl WorkspaceBroker {
 
     pub async fn cleanup_all_terminals(&self) {
         let map = std::mem::take(&mut *self.terminals.lock().await);
+        for term in map.values() {
+            term.stop();
+        }
         for (_, term) in map {
-            let mut child = term.child.lock().await;
-            let _ = child.kill().await;
+            let _ = term.wait_for_exit().await;
         }
     }
 }
@@ -715,21 +743,33 @@ async fn pump_stream<R: tokio::io::AsyncRead + Unpin>(
     }
 }
 
-fn extract_tool_call_path(tool_call: &Value) -> Option<String> {
-    if let Some(p) = tool_call
-        .get("locations")
-        .and_then(|l| l.as_array())
-        .and_then(|a| a.first())
-        .and_then(|item| item.get("path"))
-        .and_then(|v| v.as_str())
-    {
-        return Some(p.to_string());
+fn tool_call_paths(tool_call: &Value) -> Vec<&str> {
+    let mut paths = Vec::new();
+    if let Some(locations) = tool_call.get("locations").and_then(Value::as_array) {
+        for item in locations {
+            let Some(path) = item
+                .get("path")
+                .and_then(Value::as_str)
+                .filter(|path| !path.is_empty())
+            else {
+                return Vec::new();
+            };
+            paths.push(path);
+        }
     }
-    tool_call
-        .get("rawInput")
-        .and_then(|r| r.get("path").or_else(|| r.get("file_path")))
-        .and_then(|v| v.as_str())
-        .map(str::to_string)
+    if let Some(input) = tool_call.get("rawInput") {
+        for key in ["path", "file_path"] {
+            if let Some(path) = input
+                .get(key)
+                .and_then(Value::as_str)
+                .filter(|path| !path.is_empty())
+                && !paths.contains(&path)
+            {
+                paths.push(path);
+            }
+        }
+    }
+    paths
 }
 
 pub fn suggest_command_pattern(cmd: &str) -> String {
@@ -867,6 +907,27 @@ mod tests {
         assert!(read_res["content"].as_str().unwrap().contains("Demo Skill"));
         assert_eq!(cb.skill_reads.lock().await.len(), 1);
 
+        let read_request = |locations: Value| RequestPermissionParams {
+            session_id: "s1".into(),
+            tool_call: json!({"kind":"read", "locations":locations}),
+            options: vec![
+                json!({"optionId":"always", "kind":"allow_always"}),
+                json!({"optionId":"once", "kind":"allow_once"}),
+                json!({"optionId":"reject_once", "kind":"reject_once"}),
+            ],
+        };
+        let skill_file = skills_root.join("demo-skill/SKILL.md");
+        let read_allowed = broker
+            .handle_request_permission(read_request(json!([{"path":skill_file}])))
+            .await
+            .unwrap();
+        assert_eq!(read_allowed["outcome"]["optionId"], "once");
+        let read_prompted = broker
+            .handle_request_permission(read_request(json!([{"path":skill_file},{"path":outside}])))
+            .await
+            .unwrap();
+        assert_eq!(read_prompted["outcome"]["optionId"], "reject_once");
+
         // Writing inside skill_read_roots stays gated!
         let write_skill_err = broker
             .handle_write_text_file(FsWriteTextFileParams {
@@ -891,6 +952,49 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(err, AcpError::PermissionDenied(_)));
+
+        let (command, args) = if cfg!(windows) {
+            (
+                "powershell.exe",
+                vec!["-NoProfile", "-Command", "Start-Sleep -Seconds 10"],
+            )
+        } else {
+            ("sleep", vec!["10"])
+        };
+        broker.ctx.rules.write().await.push(PermissionRule {
+            id: "test_sleep".into(),
+            session_id: "s1".into(),
+            tool_kind: "terminal".into(),
+            pattern: format!("{command}*"),
+            decision: "allow".into(),
+            created_at: 0,
+        });
+        let terminal = broker
+            .handle_terminal_create(TerminalCreateParams {
+                session_id: "s1".into(),
+                command: command.into(),
+                args: args.into_iter().map(str::to_string).collect(),
+                cwd: None,
+                env: Vec::new(),
+                output_byte_limit: None,
+            })
+            .await
+            .unwrap();
+        let request = TerminalIdParams {
+            session_id: "s1".into(),
+            terminal_id: terminal["terminalId"].as_str().unwrap().into(),
+        };
+        let wait = broker.handle_terminal_wait_for_exit(request.clone());
+        let stop = async {
+            tokio::time::sleep(std::time::Duration::from_millis(80)).await;
+            broker.handle_terminal_kill(request).await
+        };
+        let (waited, stopped) = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            tokio::join!(wait, stop)
+        })
+        .await
+        .unwrap();
+        assert!(waited.is_ok() && stopped.is_ok());
     }
 
     #[tokio::test]

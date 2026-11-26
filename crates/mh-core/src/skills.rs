@@ -1,4 +1,4 @@
-use std::path::Path;
+use std::path::{Component, Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
@@ -6,6 +6,7 @@ use serde::{Deserialize, Serialize};
 pub const RESERVED_SLASH_COMMANDS: &[&str] = &[
     "plan", "review", "test", "fix", "compact", "diff", "shell", "memory", "new", "archive",
 ];
+pub const MAX_SKILL_FILE_BYTES: u64 = 512 * 1024;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -68,6 +69,24 @@ pub struct ParsedSkillMeta {
     pub slug: String,
     pub name: String,
     pub description: String,
+}
+
+pub fn resolve_skill_file(root: &Path, relative: &str) -> Result<PathBuf, String> {
+    let path = Path::new(relative);
+    if relative.is_empty()
+        || path
+            .components()
+            .any(|part| !matches!(part, Component::Normal(_)))
+    {
+        return Err("Skill file must be a relative path inside the skill directory.".into());
+    }
+    let target = root.join(path);
+    if !crate::is_path_within(&target, root)
+        || std::fs::symlink_metadata(&target).is_ok_and(|meta| meta.file_type().is_symlink())
+    {
+        return Err("Skill file must stay inside the skill directory.".into());
+    }
+    Ok(target)
 }
 
 pub fn sanitize_skill_slug(raw: &str) -> Result<String, String> {
@@ -213,12 +232,15 @@ pub fn scan_skill_dir(
     fallback_slug: &str,
 ) -> Result<(ParsedSkillMeta, Vec<String>, i64), String> {
     let skill_md = dir.join("SKILL.md");
-    if !skill_md.is_file() {
-        return Err(format!("Missing SKILL.md in {}", dir.display()));
-    }
-    let meta_fs = std::fs::metadata(&skill_md)
+    let meta_fs = std::fs::symlink_metadata(&skill_md)
         .map_err(|e| format!("Failed to stat {}: {e}", skill_md.display()))?;
-    if meta_fs.len() > 512 * 1024 {
+    if !meta_fs.is_file() || !crate::is_path_within(&skill_md, dir) {
+        return Err(format!(
+            "SKILL.md must be a regular file in {}",
+            dir.display()
+        ));
+    }
+    if meta_fs.len() > MAX_SKILL_FILE_BYTES {
         return Err("SKILL.md exceeds 512 KiB size limit.".into());
     }
     let updated_at = meta_fs
@@ -232,17 +254,9 @@ pub fn scan_skill_dir(
         .map_err(|e| format!("Failed to read {}: {e}", skill_md.display()))?;
     let parsed = parse_skill_markdown(&raw, fallback_slug)?;
 
-    let mut rel_files = Vec::new();
+    let mut rel_files = vec!["SKILL.md".to_string()];
     collect_skill_files(dir, dir, 0, &mut rel_files);
-    rel_files.sort_by(|a, b| {
-        if a == "SKILL.md" {
-            std::cmp::Ordering::Less
-        } else if b == "SKILL.md" {
-            std::cmp::Ordering::Greater
-        } else {
-            a.cmp(b)
-        }
-    });
+    rel_files[1..].sort();
 
     Ok((parsed, rel_files, updated_at))
 }
@@ -295,10 +309,10 @@ fn collect_skill_files(root: &Path, current: &Path, depth: usize, out: &mut Vec<
         let Ok(ft) = entry.file_type() else {
             continue;
         };
-        if ft.is_symlink() {
+        let path = entry.path();
+        if ft.is_symlink() || path == root.join("SKILL.md") || !crate::is_path_within(&path, root) {
             continue;
         }
-        let path = entry.path();
         if ft.is_dir() {
             collect_skill_files(root, &path, depth + 1, out);
         } else if ft.is_file()

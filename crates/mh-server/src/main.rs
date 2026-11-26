@@ -208,7 +208,26 @@ async fn run(
 
     let listener = TcpListener::bind(&bind).await?;
     let local_addr = listener.local_addr()?;
-    let internal_mcp_url = format!("http://127.0.0.1:{}/internal/mcp", local_addr.port());
+    let (bridge_addr, bridge_task) = if local_addr.ip().is_loopback() {
+        (local_addr, None)
+    } else {
+        // A listener bound to a particular LAN address cannot receive loopback connections.
+        let bridge_listener = TcpListener::bind("127.0.0.1:0").await?;
+        let bridge_addr = bridge_listener.local_addr()?;
+        let bridge_router = axum::Router::new()
+            .route(
+                "/internal/mcp",
+                axum::routing::post(mh_server::routes::internal_mcp_handler),
+            )
+            .with_state(state.clone());
+        let task = tokio::spawn(async move {
+            if let Err(error) = axum::serve(bridge_listener, bridge_router).await {
+                warn!(%error, "local MCP listener stopped");
+            }
+        });
+        (bridge_addr, Some(task))
+    };
+    let internal_mcp_url = format!("http://{bridge_addr}/internal/mcp");
     switch.set_internal_mcp_url(internal_mcp_url).await;
 
     let display_url = if auth.required {
@@ -244,6 +263,9 @@ async fn run(
 
     info!("shutting down ACP child processes...");
     supervisor.shutdown_all().await;
+    if let Some(task) = bridge_task {
+        task.abort();
+    }
     Ok(())
 }
 

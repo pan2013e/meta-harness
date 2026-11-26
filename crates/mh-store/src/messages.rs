@@ -97,6 +97,28 @@ impl Store {
         self.get_message(id)
     }
 
+    /// Persists a coalesced streaming update and returns its revision for replay and reconnect.
+    pub fn append_message_delta(
+        &self,
+        id: &str,
+        delta: &str,
+        replace: bool,
+    ) -> Result<u64, StoreError> {
+        self.conn()?
+            .query_row(
+                "UPDATE messages
+             SET content = CASE WHEN ?2 THEN ?3 ELSE content || ?3 END,
+                 metadata_json = json_set(metadata_json, '$.stream_revision',
+                     COALESCE(json_extract(metadata_json, '$.stream_revision'), 0) + 1)
+             WHERE id = ?1 AND json_extract(metadata_json, '$.streaming') = 1
+             RETURNING json_extract(metadata_json, '$.stream_revision')",
+                params![id, replace, delta],
+                |row| row.get(0),
+            )
+            .optional()?
+            .ok_or_else(|| StoreError::NotFound(format!("streaming message {id}")))
+    }
+
     pub fn get_message(&self, id: &str) -> Result<ChatMessage, StoreError> {
         let conn = self.conn()?;
         conn.query_row(

@@ -149,11 +149,14 @@ pub async fn inspect_repo(project_root: &Path) -> RepoStatus {
         };
     }
 
-    let head_branch = run_git(project_root, &["rev-parse", "--abbrev-ref", "HEAD"])
-        .await
-        .ok()
-        .filter(|(ok, s, _)| *ok && !s.is_empty() && s != "HEAD")
-        .map(|(_, s, _)| s);
+    let head_branch = run_git(
+        project_root,
+        &["symbolic-ref", "--quiet", "--short", "HEAD"],
+    )
+    .await
+    .ok()
+    .filter(|(ok, s, _)| *ok && !s.is_empty() && s != "HEAD")
+    .map(|(_, s, _)| s);
 
     let head_sha = run_git(project_root, &["rev-parse", "HEAD"])
         .await
@@ -254,6 +257,7 @@ pub async fn ensure_session_integration_worktree(
                 project_root,
                 &[
                     "commit",
+                    "--only",
                     "--allow-empty",
                     "-m",
                     "chore: initial empty base commit",
@@ -408,38 +412,18 @@ pub async fn integrate_member_turn(
     summary: &str,
     keep_conflict_for_orchestrator: bool,
 ) -> Result<MergeOutcome, AcpError> {
-    let (_, dirty, _) = run_git(member_wt, &["status", "--porcelain"]).await?;
-    if !dirty.is_empty() {
-        let (add_ok, _, add_err) = run_git(member_wt, &["add", "-A"]).await?;
-        if !add_ok {
-            return Err(AcpError::Git(format!("git add failed: {add_err}")));
-        }
-        let short_sum: String = summary
-            .lines()
-            .next()
-            .unwrap_or("worktree updates")
-            .chars()
-            .take(64)
-            .collect();
-        let commit_msg = if short_sum.trim().is_empty() {
-            format!("mh({handle}): turn updates")
-        } else {
-            format!("mh({handle}): {short_sum}")
-        };
-        let (commit_ok, _, commit_err) =
-            run_git_with_author(member_wt, &["commit", "-m", &commit_msg]).await?;
-        if !commit_ok && !commit_err.contains("nothing to commit") {
-            return Err(AcpError::Git(format!("git commit failed: {commit_err}")));
-        }
-    }
+    commit_worktree_if_dirty(member_wt, handle, summary).await?;
 
     let range = format!("{integration_branch}..{member_branch}");
-    let (cnt_ok, cnt_out, _) = run_git(integration_wt, &["rev-list", "--count", &range]).await?;
-    let ahead: u32 = if cnt_ok {
-        cnt_out.parse().unwrap_or(0)
-    } else {
-        0
-    };
+    let (cnt_ok, cnt_out, err) = run_git(integration_wt, &["rev-list", "--count", &range]).await?;
+    if !cnt_ok {
+        return Err(AcpError::Git(format!(
+            "could not compare integration and member branches: {err}"
+        )));
+    }
+    let ahead = cnt_out
+        .parse::<u64>()
+        .map_err(|error| AcpError::Git(format!("invalid branch commit count: {error}")))?;
     if ahead == 0 {
         return Ok(MergeOutcome::NoChanges);
     }
@@ -942,6 +926,33 @@ pub async fn prune_session_worktrees(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn first_worktree_preserves_staged_files_and_the_unborn_branch_name() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        assert!(
+            run_git(root, &["init", "-b", "development"])
+                .await
+                .unwrap()
+                .0
+        );
+        std::fs::write(root.join("staged.txt"), "my staged change\n").unwrap();
+        assert!(run_git(root, &["add", "staged.txt"]).await.unwrap().0);
+
+        let worktree = ensure_session_integration_worktree(root, "unborn")
+            .await
+            .unwrap();
+        assert_eq!(worktree.base_branch.as_deref(), Some("development"));
+        assert!(!worktree.path.join("staged.txt").exists());
+        assert_eq!(
+            run_git(root, &["diff", "--cached", "--name-only"])
+                .await
+                .unwrap()
+                .1,
+            "staged.txt"
+        );
+    }
 
     #[tokio::test]
     async fn diff_includes_untracked_work_and_excludes_later_main_commits() {

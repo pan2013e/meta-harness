@@ -5,8 +5,8 @@ use serde_json::json;
 use tracing::warn;
 
 use mh_core::{
-    AppPaths, MessageKind, SenderKind, Session, SkillDetail, SkillSource, SkillSummary,
-    compute_skill_tree_hash, is_path_within, is_reserved_slash_command, normalize_path,
+    AppPaths, MAX_SKILL_FILE_BYTES, MessageKind, SenderKind, Session, SkillDetail, SkillSource,
+    SkillSummary, compute_skill_tree_hash, is_path_within, normalize_path, resolve_skill_file,
     sanitize_skill_slug, scan_skill_dir,
 };
 use mh_store::{NewMessageParams, SkillStateRow, Store};
@@ -48,7 +48,7 @@ pub fn ensure_builtin_skills(paths: &AppPaths, store: &Store) {
 
 fn ensure_builtin_skills_inner(paths: &AppPaths, store: &Store) -> Result<(), SwitchError> {
     let embedded_hash = compute_skill_tree_hash(BUILTIN_META_HARNESS_DOCS_FILES);
-    let skill_dir = paths.skills_dir().join(BUILTIN_META_HARNESS_DOCS_ID);
+    let skill_dir = builtin_skill_dir(paths)?;
     let state = store.get_skill_state(BUILTIN_META_HARNESS_DOCS_ID)?;
     let now = chrono::Utc::now().timestamp_millis();
 
@@ -108,7 +108,7 @@ pub fn reset_builtin_skill(
             "unknown built-in skill: {skill_id}"
         )));
     }
-    let skill_dir = paths.skills_dir().join(BUILTIN_META_HARNESS_DOCS_ID);
+    let skill_dir = builtin_skill_dir(paths)?;
     if skill_dir.exists() {
         std::fs::remove_dir_all(&skill_dir)?;
     }
@@ -132,7 +132,25 @@ pub fn reset_builtin_skill(
         .ok_or_else(|| SwitchError::NotFound("meta-harness-docs missing after reset".into()))
 }
 
+fn builtin_skill_dir(paths: &AppPaths) -> Result<PathBuf, SwitchError> {
+    let root = paths.skills_dir();
+    std::fs::create_dir_all(&root)?;
+    let dir = root.join(BUILTIN_META_HARNESS_DOCS_ID);
+    if !is_path_within(&dir, &root)
+        || std::fs::symlink_metadata(&dir).is_ok_and(|meta| meta.file_type().is_symlink())
+    {
+        return Err(SwitchError::Validation(
+            "Invalid built-in skill directory".into(),
+        ));
+    }
+    Ok(dir)
+}
+
 fn write_embedded_skill_files(dir: &Path, files: &[(&str, &str)]) -> std::io::Result<()> {
+    std::fs::create_dir_all(dir)?;
+    for (rel, _) in files {
+        resolve_skill_file(dir, rel).map_err(std::io::Error::other)?;
+    }
     for (rel, content) in files {
         let dest = dir.join(rel);
         if let Some(parent) = dest.parent() {
@@ -186,13 +204,16 @@ pub fn list_skills_with_roots(
         dirs.sort_by_key(|e| e.file_name());
         for entry in dirs {
             let dir_path = entry.path();
-            if !dir_path.is_dir() {
+            if !dir_path.is_dir() || !is_path_within(&dir_path, &global_root) {
                 continue;
             }
             let dir_name = entry.file_name().to_string_lossy().into_owned();
             let Ok(id) = sanitize_skill_slug(&dir_name) else {
                 continue;
             };
+            if seen_ids.contains(&id) {
+                continue;
+            }
             let Ok((meta, files, updated_at)) = scan_skill_dir(&dir_path, &id) else {
                 continue;
             };
@@ -240,19 +261,21 @@ pub fn list_skills_with_roots(
     let key_root = project_root.or(active_worktree);
     if let (Some(base), Some(key_base)) = (scan_root, key_root) {
         let local_skills_dir = base.join(".agents").join("skills");
-        if let Ok(rd) = std::fs::read_dir(&local_skills_dir) {
+        if is_path_within(&local_skills_dir, base)
+            && let Ok(rd) = std::fs::read_dir(&local_skills_dir)
+        {
             let mut dirs: Vec<_> = rd.flatten().collect();
             dirs.sort_by_key(|e| e.file_name());
             for entry in dirs {
                 let dir_path = entry.path();
-                if !dir_path.is_dir() {
+                if !dir_path.is_dir() || !is_path_within(&dir_path, &local_skills_dir) {
                     continue;
                 }
                 let dir_name = entry.file_name().to_string_lossy().into_owned();
                 let Ok(id) = sanitize_skill_slug(&dir_name) else {
                     continue;
                 };
-                if is_reserved_slash_command(&id) || seen_ids.contains(&id) {
+                if seen_ids.contains(&id) {
                     continue;
                 }
                 let Ok((meta, files, updated_at)) = scan_skill_dir(&dir_path, &id) else {
@@ -305,12 +328,7 @@ pub fn read_skill_file_from_summary(
         .filter(|s| !s.is_empty())
         .unwrap_or("SKILL.md");
     let root = Path::new(&skill.skill_dir);
-    let candidate = root.join(chosen_rel);
-    if !is_path_within(&candidate, root) {
-        return Err(SwitchError::Validation(
-            "Requested skill file escapes skill directory.".into(),
-        ));
-    }
+    let candidate = resolve_skill_file(root, chosen_rel).map_err(SwitchError::Validation)?;
     if !candidate.is_file() {
         return Err(SwitchError::NotFound(format!(
             "Skill file '{}' not found in '{}'",
@@ -318,7 +336,7 @@ pub fn read_skill_file_from_summary(
         )));
     }
     let meta = std::fs::metadata(&candidate)?;
-    if meta.len() > 512 * 1024 {
+    if meta.len() > MAX_SKILL_FILE_BYTES {
         return Err(SwitchError::Validation(
             "Skill file exceeds 512 KiB read limit.".into(),
         ));
@@ -527,4 +545,50 @@ pub fn session_skill_read_roots(skills: &[SkillSummary]) -> Vec<PathBuf> {
         .filter(|s| s.enabled)
         .map(|s| PathBuf::from(&s.skill_dir))
         .collect()
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+    use std::os::unix::fs::symlink;
+
+    #[test]
+    fn skill_discovery_stays_inside_the_configured_roots() {
+        let tmp = tempfile::tempdir().unwrap();
+        let project = tmp.path().join("project");
+        let outside = tmp.path().join("elsewhere");
+        let local_root = project.join(".agents/skills");
+        let paths = AppPaths {
+            config_dir: tmp.path().join("config"),
+            data_dir: tmp.path().join("data"),
+            workspaces_dir: tmp.path().join("workspaces"),
+        };
+        let store = Store::open_in_memory().unwrap();
+        std::fs::create_dir_all(local_root.join("linked-file")).unwrap();
+        std::fs::create_dir_all(local_root.join("local-skill")).unwrap();
+        std::fs::create_dir_all(paths.skills_dir()).unwrap();
+        std::fs::create_dir(&outside).unwrap();
+        std::fs::write(
+            outside.join("SKILL.md"),
+            "# A file outside the skills roots",
+        )
+        .unwrap();
+        std::fs::write(local_root.join("local-skill/SKILL.md"), "# Local skill").unwrap();
+        symlink(&outside, local_root.join("linked-directory")).unwrap();
+        symlink(&outside, paths.skills_dir().join("external-skill")).unwrap();
+        symlink(
+            outside.join("SKILL.md"),
+            local_root.join("linked-file/SKILL.md"),
+        )
+        .unwrap();
+
+        let skills = list_skills_with_roots(&paths, &store, Some(&project), None).unwrap();
+        assert_eq!(
+            skills
+                .iter()
+                .map(|skill| skill.id.as_str())
+                .collect::<Vec<_>>(),
+            ["local-skill"]
+        );
+    }
 }

@@ -4,6 +4,7 @@ pub mod mcp_bridge;
 pub mod pty;
 pub mod routes;
 mod settings;
+mod web_preview;
 pub mod ws;
 
 use std::sync::Arc;
@@ -198,6 +199,10 @@ pub fn build_router(state: AppState) -> Router {
 
     Router::new()
         .merge(public_and_authed_api)
+        .route(
+            "/preview/{session_id}/{grant}/{*path}",
+            get(web_preview::read),
+        )
         .route("/internal/mcp", post(routes::internal_mcp_handler))
         .fallback(routes::serve_embedded_spa)
         .with_state(state)

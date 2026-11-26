@@ -62,6 +62,7 @@ function notices() {
     "Meta-Harness third-party notices\n\n" + sections.join("\n\n") + "\n");
 }
 
+run(process.execPath, ["scripts/version.mjs", "--check"]);
 npm(["ci"], "web");
 notices();
 npm(["run", "build"], "web");

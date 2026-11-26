@@ -24,6 +24,7 @@ jobs:
           cache-dependency-path: web/package-lock.json
       - run: rustup update stable
       - run: rustup component add rustfmt clippy
+      - run: node scripts/version.mjs --check
       - run: npm ci
         working-directory: web
       - run: npm run typecheck

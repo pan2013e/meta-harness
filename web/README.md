@@ -1,2 +1,3 @@
-# Frontend SPA (`Vite` + `React 19` + `TypeScript` + `Tailwind CSS v4`) lives here.
-# See `AGENTS.md` and `docs/IMPLEMENTATION_PLAN.md` (Phase 0 & Phase 5) before scaffolding.
+# Web frontend
+
+The workspace UI uses Vite, React, TypeScript, and Tailwind. See the [repository README](../README.md#build-a-desktop-release) for local development commands and the [technical specification](../docs/SPECIFICATION.md#73-workspace-ui) for UI behavior.

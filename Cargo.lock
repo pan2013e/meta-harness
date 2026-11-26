@@ -1716,7 +1716,7 @@ dependencies = [
 
 [[package]]
 name = "mh-acp"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "async-trait",
  "chrono",
@@ -1740,7 +1740,7 @@ dependencies = [
 
 [[package]]
 name = "mh-core"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "dirs 6.0.0",
  "dunce",
@@ -1754,7 +1754,7 @@ dependencies = [
 
 [[package]]
 name = "mh-server"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "axum",
@@ -1769,6 +1769,7 @@ dependencies = [
  "portable-pty",
  "rand 0.8.8",
  "reqwest",
+ "ring",
  "rust-embed",
  "serde",
  "serde_json",
@@ -1787,7 +1788,7 @@ dependencies = [
 
 [[package]]
 name = "mh-store"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "chrono",
  "mh-core",
@@ -1801,7 +1802,7 @@ dependencies = [
 
 [[package]]
 name = "mh-switch"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "async-trait",
  "chrono",

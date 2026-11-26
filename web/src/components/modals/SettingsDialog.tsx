@@ -69,6 +69,7 @@ export function SettingsDialog({ onClose }: { onClose: () => void }) {
   const [error, setError] = useState<string | null>(null);
   const [cleanupNotice, setCleanupNotice] = useState<string | null>(null);
   const [showUninstalled, setShowUninstalled] = useState(false);
+  const [buildInfo, setBuildInfo] = useState<Awaited<ReturnType<typeof api.buildInfo>> | null>(null);
 
   const [personaHandle, setPersonaHandle] = useState("codex-reviewer");
   const [personaAdapter, setPersonaAdapter] = useState("codex");
@@ -119,6 +120,15 @@ export function SettingsDialog({ onClose }: { onClose: () => void }) {
       void loadStorage();
     }
   }, [section, loadStorage]);
+
+  useEffect(() => {
+    if (section !== "about" || buildInfo) return;
+    const controller = new AbortController();
+    void api.buildInfo(controller.signal).then((info) => {
+      if (!controller.signal.aborted) setBuildInfo(info);
+    }).catch(() => undefined);
+    return () => controller.abort();
+  }, [section, buildInfo]);
 
   useEffect(() => {
     if (installedAdapters.length > 0 && !installedAdapters.includes(personaAdapter)) {
@@ -288,13 +298,19 @@ export function SettingsDialog({ onClose }: { onClose: () => void }) {
                   <img src="/meta-harness.svg" alt="" className="h-12 w-12" />
                   <div>
                     <h2 className="text-base font-semibold">Meta-Harness</h2>
-                    <p className="text-xs text-ink-muted">Version {version}</p>
+                    <p className="flex items-center gap-2 text-xs text-ink-muted">
+                      Version {buildInfo?.version ?? version}
+                      {buildInfo?.commit && <code aria-label={"Commit " + buildInfo.commit}>{buildInfo.commit}</code>}
+                    </p>
                   </div>
                 </div>
                 <div className="space-y-1">
                   <p>Created by Zhiyuan Pan</p>
                   <p className="text-ink-muted">© 2026 Zhiyuan Pan</p>
-                  <a className="text-brand-ink underline" href="https://github.com/pan2013e/meta-harness/blob/main/LICENSE" target="_blank" rel="noreferrer">MIT License</a>
+                  <div className="flex flex-wrap gap-x-4 gap-y-1 text-brand-ink">
+                    <a className="underline" href="https://github.com/pan2013e/meta-harness" target="_blank" rel="noreferrer">GitHub repository</a>
+                    <a className="underline" href="https://github.com/pan2013e/meta-harness/blob/main/LICENSE" target="_blank" rel="noreferrer">MIT License</a>
+                  </div>
                 </div>
                 <div className="space-y-2 border-t border-line pt-4">
                   <h3 className="font-medium">Open-source software</h3>

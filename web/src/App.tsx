@@ -7,13 +7,21 @@ import { FolderPickerModal } from "./components/modals/FolderPickerModal";
 import { MemoryModal } from "./components/modals/MemoryModal";
 import { SettingsDialog } from "./components/modals/SettingsDialog";
 import { Sidebar } from "./components/sidebar/Sidebar";
-import { useAppStore } from "./store/useAppStore";
+import { useAppStore, type StartupTask } from "./store/useAppStore";
+
+const STARTUP_LABELS: Record<StartupTask, string> = {
+  workspace: "Opening workspace",
+  models: "Loading model choices",
+  quota: "Checking subscription usage",
+};
 
 export function App() {
   const {
     authRequired,
     authenticated,
     bootstrapping,
+    startupPhase,
+    startupTasks,
     errorBanner,
     folderModalOpen,
     settingsOpen,
@@ -51,10 +59,16 @@ export function App() {
 
   if (bootstrapping) {
     return (
-      <div className="h-screen w-screen bg-app text-ink-muted flex items-center justify-center gap-2.5 text-sm">
-        <Loader2 className="w-4 h-4 animate-spin text-brand-ink" />
-        <span>Connecting to Meta-Harness Switch...</span>
-      </div>
+      <main className="grid h-dvh w-full place-items-center bg-app px-4">
+        <div role="status" className="min-w-60 rounded-2xl border border-line bg-panel px-7 py-6 text-center shadow-sm">
+          <img src="/meta-harness.svg" alt="" className="mx-auto mb-3 h-11 w-11" />
+          <h1 className="font-semibold text-ink">Meta-Harness</h1>
+          <p className="mt-2 flex items-center justify-center gap-2 text-xs text-ink-muted">
+            <Loader2 aria-hidden="true" className="h-3.5 w-3.5 animate-spin text-brand-ink motion-reduce:animate-none" />
+            {startupPhase === "connecting" ? "Connecting to the server" : "Checking harnesses and projects"}
+          </p>
+        </div>
+      </main>
     );
   }
 
@@ -105,6 +119,13 @@ export function App() {
           >
             <X className="w-3.5 h-3.5" />
           </button>
+        </div>
+      )}
+
+      {startupTasks.length > 0 && (
+        <div role="status" className="flex shrink-0 items-center gap-2 border-b border-line bg-panel px-4 py-1.5 text-xs text-ink-muted">
+          <Loader2 aria-hidden="true" className="h-3.5 w-3.5 shrink-0 animate-spin text-brand-ink motion-reduce:animate-none" />
+          <span>{startupTasks.map((task) => STARTUP_LABELS[task]).join(" · ")}</span>
         </div>
       )}
 

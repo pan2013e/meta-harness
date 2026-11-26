@@ -1,5 +1,6 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
+import { App } from "./App";
 import { MarkdownBlock } from "./components/common/MarkdownBlock";
 import { formatCreditsDisplay, QuotaMeter } from "./components/common/Badges";
 import { DiffViewer } from "./components/common/DiffViewer";
@@ -8,6 +9,7 @@ import { Composer } from "./components/chat/Composer";
 import { MentionEditor, serializeMentionDom } from "./components/chat/MentionEditor";
 import { MessageRow } from "./components/chat/MessageRow";
 import { DiffReviewModal } from "./components/modals/DiffReviewModal";
+import { FilePreviewModal } from "./components/modals/FilePreviewModal";
 import { SettingsDialog } from "./components/modals/SettingsDialog";
 import { SharedAntigravityUsage } from "./components/modals/SharedAntigravityUsage";
 import { PersonaModelFields } from "./components/modals/PersonaModelFields";
@@ -24,6 +26,67 @@ afterEach(() => {
   vi.restoreAllMocks();
   vi.unstubAllGlobals();
   useAppStore.setState(useAppStore.getInitialState(), true);
+});
+
+describe("Startup and file previews", () => {
+  it("keeps the composer available while model and quota lookups finish", async () => {
+    let connect!: () => void;
+    let loadModels!: () => void;
+    let loadQuota!: () => void;
+    const connection = new Promise<void>((resolve) => { connect = resolve; });
+    const models = new Promise<void>((resolve) => { loadModels = resolve; });
+    const quota = new Promise<void>((resolve) => { loadQuota = resolve; });
+    vi.spyOn(api, "authStatus").mockImplementation(async () => {
+      await connection;
+      return { required: false, authenticated: true };
+    });
+    vi.spyOn(api, "listAdapters").mockImplementation(async (_refresh, summary) => {
+      if (!summary) await models;
+      return { adapters: {} };
+    });
+    vi.spyOn(api, "listQuotas").mockImplementation(async () => {
+      await quota;
+      return { quotas: [] };
+    });
+    vi.spyOn(api, "listProjects").mockResolvedValue({ projects: [] });
+    vi.spyOn(api, "listStandaloneSessions").mockResolvedValue({ sessions: [] });
+    vi.spyOn(api, "probeAdapters").mockResolvedValue({
+      probes: [{
+        adapter_id: "codex", display_name: "Codex", accent_color: "#10a37f",
+        installed: true, resolved_command: "/usr/bin/codex",
+        auth_detected: true, auth_hint: "Ready", strengths: [],
+      }],
+    });
+    vi.spyOn(WsHubClient.prototype, "connect").mockImplementation(() => undefined);
+    render(<App />);
+    expect(screen.getByRole("status").textContent).toContain("Connecting to the server");
+
+    connect();
+    await screen.findByRole("textbox", { name: "Message group chat" });
+    expect(screen.getByRole("status").textContent).toMatch(/Loading model choices.*Checking subscription usage/);
+
+    loadModels();
+    await waitFor(() => expect(screen.getByRole("status").textContent).toBe("Checking subscription usage"));
+    loadQuota();
+    await waitFor(() => expect(screen.queryByRole("status")).toBeNull());
+  });
+
+  it("renders HTML at the session file URL in an isolated frame", async () => {
+    if (!HTMLDialogElement.prototype.showModal) {
+      HTMLDialogElement.prototype.showModal = function () { this.open = true; };
+    }
+    const fetchFile = vi.fn().mockResolvedValue(new Response(null, {
+      headers: { "content-type": "text/html; charset=utf-8", "x-meta-harness-preview": "fixture-grant" },
+    }));
+    vi.stubGlobal("fetch", fetchFile);
+    render(<FilePreviewModal sessionId="fixture" path="site/index.html" onClose={vi.fn()} />);
+
+    const frame = await screen.findByTitle("index.html webpage");
+    const url = "/api/sessions/fixture/files/site/index.html?preview=true";
+    expect(fetchFile).toHaveBeenCalledWith(url, expect.objectContaining({ method: "HEAD" }));
+    expect(frame.getAttribute("src")).toBe("/preview/fixture/fixture-grant/site/index.html");
+    expect(frame.getAttribute("sandbox")).toBe("allow-scripts");
+  });
 });
 
 describe("Session navigation", () => {

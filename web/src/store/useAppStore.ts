@@ -31,6 +31,7 @@ import type {
 } from "../types/api";
 
 export type DrawerTab = "trajectory" | "memory" | "settings";
+export type StartupTask = "workspace" | "models" | "quota";
 
 const VALID_THEMES: ThemeId[] = ["obsidian", "tokyo-night", "catppuccin", "daylight"];
 
@@ -78,6 +79,8 @@ interface AppState {
   authRequired: boolean;
   authenticated: boolean;
   bootstrapping: boolean;
+  startupPhase: "connecting" | "detecting";
+  startupTasks: StartupTask[];
   errorBanner: string | null;
 
   theme: ThemeId;
@@ -241,6 +244,7 @@ export const useAppStore = create<AppState>((set, get) => {
   let memoryRequest = 0;
   let trajectoryRequest = 0;
   let catalogRequest = 0;
+  let startupRequest = 0;
   let sessionLoad: { id: string; events: WsEvent[] } | null = null;
   const turnRequests = new Map<string, Promise<void>>();
 
@@ -259,6 +263,8 @@ export const useAppStore = create<AppState>((set, get) => {
     authRequired: false,
     authenticated: true,
     bootstrapping: true,
+    startupPhase: "connecting",
+    startupTasks: [],
     errorBanner: null,
 
     theme: getInitialTheme(),
@@ -342,6 +348,13 @@ export const useAppStore = create<AppState>((set, get) => {
     init: async () => {
       if (initializing) return;
       initializing = true;
+      const startup = ++startupRequest;
+      set({ bootstrapping: true, startupPhase: "connecting", startupTasks: [] });
+      const finish = (task: StartupTask) => {
+        if (startup === startupRequest) {
+          set((state) => ({ startupTasks: state.startupTasks.filter((pending) => pending !== task) }));
+        }
+      };
       applyThemeToDom(get().theme);
       try {
         const urlParams = new URLSearchParams(window.location.search);
@@ -365,6 +378,7 @@ export const useAppStore = create<AppState>((set, get) => {
           return;
         }
 
+        set({ startupPhase: "detecting" });
         const [adaptersRes, probeRes, projRes] = await Promise.all([
           api.listAdapters(false, true),
           api.probeAdapters(),
@@ -385,6 +399,9 @@ export const useAppStore = create<AppState>((set, get) => {
           authRequired: auth.required,
           authenticated: true,
           bootstrapping: false,
+          startupTasks: probeRes.probes.some((probe) => probe.installed)
+            ? ["workspace", "models", "quota"]
+            : ["workspace"],
           adapters: adaptersRes.adapters,
           adapterCatalogs: adaptersRes.catalogs ?? {},
           adapterDefaults: adaptersRes.defaults ?? {},
@@ -395,21 +412,21 @@ export const useAppStore = create<AppState>((set, get) => {
           wsClient: ws,
         });
 
-        void get().refreshQuotas().catch((error: unknown) => reportError(error));
+        void get().refreshQuotas()
+          .catch((error: unknown) => { if (startup === startupRequest) reportError(error); })
+          .finally(() => finish("quota"));
         const request = ++catalogRequest;
         void api.listAdapters().then(({ catalogs }) => {
           if (catalogs && request === catalogRequest) set({ adapterCatalogs: catalogs });
-        }).catch(() => undefined);
+        }).catch(() => undefined).finally(() => finish("models"));
 
-        if (projRes.projects.length > 0) {
-          await get().selectProject(projRes.projects[0].id);
-        } else {
-          await get().selectProject(null);
-        }
+        await get().selectProject(projRes.projects[0]?.id ?? null);
+        finish("workspace");
       } catch (e) {
         const auth = await api.authStatus().catch(() => null);
         set({
           bootstrapping: false,
+          startupTasks: [],
           ...(auth && { authRequired: auth.required, authenticated: auth.authenticated }),
           errorBanner: e instanceof Error ? e.message : String(e),
         });
@@ -420,7 +437,7 @@ export const useAppStore = create<AppState>((set, get) => {
 
     authenticateWithToken: async (token: string) => {
       if (get().bootstrapping || !token) return;
-      set({ bootstrapping: true, errorBanner: null });
+      set({ bootstrapping: true, startupPhase: "connecting", errorBanner: null });
       try {
         await api.createAuthSession(token);
         setBearerToken(null);

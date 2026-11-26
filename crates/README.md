@@ -1,2 +1,3 @@
-# Rust workspace crates (`mh-core`, `mh-store`, `mh-acp`, `mh-switch`, `mh-server`) live here.
-# See `AGENTS.md` and `docs/IMPLEMENTATION_PLAN.md` (Phase 0) before creating Cargo manifests.
+# Rust workspace
+
+See [AGENTS.md](../AGENTS.md#4-code-organization--module-boundaries) for crate boundaries and verification commands. The [technical specification](../docs/SPECIFICATION.md) covers the ACP supervisor, switch, storage, and server protocols.

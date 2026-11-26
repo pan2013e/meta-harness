@@ -6,7 +6,7 @@ use std::{
 use axum::{
     Json,
     extract::{Path as AxumPath, Query, State},
-    http::{StatusCode, header},
+    http::{Method, StatusCode, header},
     response::{IntoResponse, Response},
 };
 use serde::{Deserialize, Serialize};
@@ -51,6 +51,7 @@ pub async fn health(State(state): State<AppState>) -> Json<Value> {
     Json(json!({
         "status": "ok",
         "version": env!("CARGO_PKG_VERSION"),
+        "commit": option_env!("MH_BUILD_COMMIT"),
         "active_subprocesses": active_procs,
         "os": std::env::consts::OS,
         "arch": std::env::consts::ARCH,
@@ -1394,10 +1395,36 @@ pub async fn serve_session_worktree_file(
     State(state): State<AppState>,
     AxumPath((session_id, rel_path)): AxumPath<(String, String)>,
     Query(query): Query<SessionFileQuery>,
+    method: Method,
+) -> Response {
+    let mut response =
+        read_session_worktree_file(&state, &session_id, &rel_path, query.preview, method).await;
+    if query.preview
+        && response.status().is_success()
+        && guess_mime(&rel_path).starts_with("text/html")
+        && let Ok(grant) = header::HeaderValue::from_str(&crate::web_preview::issue(&session_id))
+    {
+        response
+            .headers_mut()
+            .insert(crate::web_preview::GRANT_HEADER, grant);
+        response.headers_mut().insert(
+            header::CACHE_CONTROL,
+            header::HeaderValue::from_static("private, no-store"),
+        );
+    }
+    response
+}
+
+pub(crate) async fn read_session_worktree_file(
+    state: &AppState,
+    session_id: &str,
+    rel_path: &str,
+    preview: bool,
+    method: Method,
 ) -> Response {
     use tokio::io::AsyncReadExt;
 
-    let Ok(sess) = state.switch.store.get_session(&session_id) else {
+    let Ok(sess) = state.switch.store.get_session(session_id) else {
         return (StatusCode::NOT_FOUND, "session not found").into_response();
     };
     let Ok(repo_root) = state.switch.resolve_session_repo_root(&sess) else {
@@ -1416,20 +1443,24 @@ pub async fn serve_session_worktree_file(
     if !is_path_within(&candidate, root) || !candidate.is_file() {
         return (StatusCode::NOT_FOUND, "file not found").into_response();
     }
-    const PREVIEW_LIMIT: usize = 24 * 1024 * 1024;
+    const PREVIEW_LIMIT: u64 = 24 * 1024 * 1024;
     let Ok(file) = tokio::fs::File::open(&candidate).await else {
         return (StatusCode::FORBIDDEN, "cannot read file").into_response();
     };
     let mut data = Vec::new();
-    let max_bytes = if query.preview {
-        PREVIEW_LIMIT as u64 + 1
+    let size = if method == Method::HEAD {
+        let Ok(metadata) = file.metadata().await else {
+            return (StatusCode::FORBIDDEN, "cannot read file").into_response();
+        };
+        metadata.len()
     } else {
-        u64::MAX
+        let max_bytes = if preview { PREVIEW_LIMIT + 1 } else { u64::MAX };
+        if file.take(max_bytes).read_to_end(&mut data).await.is_err() {
+            return (StatusCode::FORBIDDEN, "cannot read file").into_response();
+        }
+        data.len() as u64
     };
-    if file.take(max_bytes).read_to_end(&mut data).await.is_err() {
-        return (StatusCode::FORBIDDEN, "cannot read file").into_response();
-    }
-    if query.preview && data.len() > PREVIEW_LIMIT {
+    if preview && size > PREVIEW_LIMIT {
         return (
             StatusCode::PAYLOAD_TOO_LARGE,
             "File is too large to preview.",
@@ -1437,19 +1468,25 @@ pub async fn serve_session_worktree_file(
             .into_response();
     }
     let mime = guess_mime(&candidate.to_string_lossy());
-    (
+    let content_policy = if preview && mime.starts_with("text/html") {
+        "sandbox allow-scripts; default-src 'self' data: blob:; script-src 'self' 'unsafe-inline' blob:; style-src 'self' 'unsafe-inline'; connect-src 'none'; form-action 'none'; frame-src 'none'; object-src 'none'; base-uri 'none'"
+    } else {
+        "sandbox allow-scripts allow-forms"
+    };
+    let mut response = (
         StatusCode::OK,
         [
             (header::CONTENT_TYPE, mime),
-            (
-                header::CONTENT_SECURITY_POLICY,
-                "sandbox allow-scripts allow-forms",
-            ),
+            (header::CONTENT_SECURITY_POLICY, content_policy),
             (header::X_CONTENT_TYPE_OPTIONS, "nosniff"),
         ],
         data,
     )
-        .into_response()
+        .into_response();
+    response
+        .headers_mut()
+        .insert(header::CONTENT_LENGTH, header::HeaderValue::from(size));
+    response
 }
 
 #[derive(Deserialize)]

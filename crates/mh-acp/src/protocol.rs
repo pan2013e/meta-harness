@@ -3,6 +3,13 @@ use serde_json::Value;
 
 use mh_core::{ConfigOptionChoice, DiscoveredConfigOption, PermissionPromptOption};
 
+pub(crate) const CODEX_APP_SERVER_INITIALIZE: &str = concat!(
+    r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"clientInfo":{"name":"meta-harness","version":""#,
+    env!("CARGO_PKG_VERSION"),
+    r#""},"capabilities":{"experimentalApi":true}}}"#,
+    "\n",
+);
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct JsonRpcRequest {
     pub jsonrpc: String,

@@ -1,13 +1,13 @@
 import { Suspense, lazy, useEffect, useRef, useState } from "react";
 import { Download, X } from "lucide-react";
-import { sessionFileUrl } from "../../api/client";
+import { sessionFileUrl, sessionPreviewUrl } from "../../api/client";
 
 const CodePreview = lazy(() => import("./preview/CodePreview"));
 const PdfPreview = lazy(() => import("./preview/PdfPreview"));
 
 const CODE_LANGUAGES: Readonly<Record<string, string>> = {
   bat: "bat", c: "cpp", cc: "cpp", cpp: "cpp", cs: "csharp", css: "css",
-  go: "go", h: "cpp", hpp: "cpp", htm: "html", html: "html", ini: "ini",
+  go: "go", h: "cpp", hpp: "cpp", ini: "ini",
   java: "java", js: "javascript", json: "json", jsx: "javascript",
   kt: "kotlin", md: "markdown", mjs: "javascript", php: "php", ps1: "powershell",
   py: "python", rb: "ruby", rs: "rust", sh: "shell", sql: "sql", swift: "swift",
@@ -17,6 +17,7 @@ const CODE_LANGUAGES: Readonly<Record<string, string>> = {
 
 type Preview =
   | { type: "loading" }
+  | { type: "html"; src: string }
   | { type: "image"; url: string }
   | { type: "pdf"; file: Blob }
   | { type: "code"; value: string; language: string }
@@ -41,16 +42,27 @@ export function FilePreviewModal({ sessionId, path, onClose }: {
     let imageUrl: string | undefined;
     const load = async () => {
       try {
-        const response = await fetch(url + "?preview=true", {
+        const previewUrl = url + "?preview=true";
+        const htmlFile = /\.html?$/i.test(filename);
+        const response = await fetch(previewUrl, {
+          method: htmlFile ? "HEAD" : "GET",
           signal: abort.signal, credentials: "same-origin",
         });
         if (!response.ok) {
           const message = response.status === 413 ? "This file is too large to preview." : "The file could not be opened.";
           throw new Error(message);
         }
+        if (abort.signal.aborted) return;
+        const mime = response.headers.get("content-type")?.split(";")[0].trim().toLowerCase() ?? "";
+        if (mime === "text/html") {
+          void response.body?.cancel().catch(() => undefined);
+          const grant = response.headers.get("x-meta-harness-preview");
+          if (!grant) throw new Error("The server could not start the webpage preview.");
+          setPreview({ type: "html", src: sessionPreviewUrl(sessionId, grant, path) });
+          return;
+        }
         const file = await response.blob();
         if (abort.signal.aborted) return;
-        const mime = file.type.split(";")[0].toLowerCase();
         if (mime.startsWith("image/")) {
           imageUrl = URL.createObjectURL(file);
           setPreview({ type: "image", url: imageUrl });
@@ -81,7 +93,7 @@ export function FilePreviewModal({ sessionId, path, onClose }: {
       abort.abort();
       if (imageUrl) URL.revokeObjectURL(imageUrl);
     };
-  }, [filename, url]);
+  }, [filename, path, sessionId, url]);
 
   const loading = <p role="status" className="p-5 text-sm text-ink-muted">Loading preview…</p>;
   return (
@@ -102,6 +114,11 @@ export function FilePreviewModal({ sessionId, path, onClose }: {
           <Suspense fallback={loading}>
             {preview.type === "loading" && loading}
             {preview.type === "message" && <p className="p-5 text-sm text-ink-muted">{preview.text}</p>}
+            {preview.type === "html" && (
+              <iframe src={preview.src} title={filename + " webpage"}
+                sandbox="allow-scripts" referrerPolicy="no-referrer"
+                className="block h-full w-full border-0 bg-white" />
+            )}
             {preview.type === "image" && (
               <div className="flex h-full items-center justify-center p-4">
                 <img src={preview.url} alt={filename} className="max-h-full max-w-full object-contain"

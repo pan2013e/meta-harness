@@ -162,8 +162,7 @@ async fn run(
     let mut cfg = AppConfig::load_or_default(config_path.as_deref(), &paths)?;
     mh_server::harness_jobs::restore_profiles(&mut cfg, &paths.data_dir);
     let bind = bind_opt.unwrap_or_else(|| cfg.server.bind.clone());
-    let open_browser =
-        !no_open && !cli.desktop_child && tray_ready.is_none() && cfg.server.open_browser_on_start;
+    let open_browser = !no_open && !cli.desktop_child && cfg.server.open_browser_on_start;
 
     let store = Store::open(&paths.db_path())?;
     let quota = Arc::new(QuotaTracker::new());
@@ -213,10 +212,9 @@ async fn run(
     switch.set_internal_mcp_url(internal_mcp_url).await;
 
     let display_url = if auth.required {
-        let host = local_addr.ip();
-        format!("http://{host}:{}/?token={}", local_addr.port(), auth.token)
+        format!("http://{local_addr}/?token={}", auth.token)
     } else {
-        format!("http://127.0.0.1:{}/", local_addr.port())
+        format!("http://{local_addr}/")
     };
 
     info!("Meta-Harness listening on http://{}", local_addr);
@@ -233,7 +231,7 @@ async fn run(
     }
 
     if open_browser
-        && !auth.required
+        && local_addr.ip().is_loopback()
         && let Err(e) = open_url_in_browser(&display_url)
     {
         warn!("could not open browser automatically: {e}");

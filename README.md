@@ -1,32 +1,31 @@
 # Meta-Harness
 
-**Meta-Harness** is a lightweight, local-first web application that turns multiple AI coding harnesses (**Codex**, **Claude Code**, **Antigravity / Gemini**, and any ACP-compatible agent) into a collaborative **project-scoped group chat** connected through a programmable **ACP Network Switch** and **per-harness Git worktree isolation**.
+**Meta-Harness** is a local-first workspace for collaborating with **Codex**, **Claude Code**, **Antigravity / Gemini**, and other **Agent Client Protocol (ACP)** harnesses. It provides project group chats with isolated Git worktrees and Quick Sessions for work without an existing repository.
 
-All harnesses run locally over the **Agent Client Protocol (ACP)** using your **existing AI subscriptions**—no separate API keys or third-party proxy billing required.
+Meta-Harness launches the harness CLIs locally over ACP. The adapters use your existing CLI sign-ins and subscription plans.
+
+## Quick start
+
+1. Get the Electron package or standalone executable for your platform from [Release build](https://github.com/pan2013e/meta-harness/actions/workflows/release-build.yml), or [build from source](#build-a-desktop-release).
+2. Start Meta-Harness. The standalone executable opens the loopback web UI at `127.0.0.1:4410` by default. Electron opens the app in its own window.
+3. Use **Settings → Harnesses & Models** to check which CLIs and sign-ins are available. Open a project folder or start a **Quick Session**, then send a message to the orchestrator or address a member with `@handle`.
 
 ---
 
 ## Core Capabilities
 
-1. **Project-Scoped Sessions with Git Worktree Isolation**:
-   - Every session creates a clean **Session Integration Branch/Worktree** (`mh/s-<id>`) plus **isolated Git worktrees per executor member** (`@codex`, `@claude`, `@antigravity`, or custom personas like `@codex-reviewer`), leaving your main checkout untouched while multiple harnesses work in parallel.
-   - Clean turns auto-merge into the session branch in Rust at zero token cost; merge conflicts or multi-agent waves automatically wake the **Orchestrator** to integrate and resolve conflicts. Preview/test integrated changes and promote back to your main checkout via **Fast-Forward/Merge**, **Squash Merge**, or **Apply Patch**.
-2. **ACP Network Switch, Sync Consults & Trajectory Sharing**:
-   - Injects a single-binary MCP bridge (`meta-harness mcp-bridge`) into every harness via ACP `session/new`.
-   - Harnesses can run in parallel, post async `@mention` handoffs in Group Chat, invoke deadlock-checked synchronous mid-turn consults (`peer_consult`), and inspect peer trajectories (`trajectory_read`).
-3. **`@mention` Routing & Quota-Aware Orchestrator**:
-   - Direct `@handle` messages route straight to those members; unmentioned prompts route to your configured **Orchestrator Harness** (which can also dispatch executor work to its own harness brand via a separate worktree while sharing the adapter's quota pool).
-   - Evaluates live subscription headroom (local CLI logs + ACP status + 429 circuit breakers + opt-in exact probes), task complexity, model strengths, and project memory to select executor(s), `model`, and `reasoning_effort` via `session/set_config_option`.
-4. **Orchestrator-Curated Episodic Memory**:
-   - After each completed job, the Orchestrator runs a lightweight, low-effort curation pass (folded into merge/synthesis turns when active) to record *who did what job*, module ownership, and harness performance notes in project-wide **SQLite + FTS5** memory.
-5. **Cross-Platform & Lightweight (+ Optional LAN/Tailscale Mode)**:
-   - Cross-platform single Rust binary for **Windows, macOS, and Linux** (`axum` + `tokio` + `rusqlite`) serving a virtualized `Vite + React 19 + TypeScript + Tailwind v4` UI on `127.0.0.1:4410` by default, with optional `--bind` + bearer-token auth for mobile/laptop access over LAN or Tailscale.
+- **Worktree isolation.** Git-backed sessions use an integration branch at `mh/<session_id>/integration` and lazily create per-executor branches at `mh/<session_id>/exec-<handle>`. The Git broker merges clean edits automatically and escalates conflicts to the orchestrator. Review changes and promote them to the project checkout using merge, squash, or patch. Non-Git folders use serialized shared-folder sessions.
+- **Harness collaboration.** Direct `@mentions` route to members. Unmentioned messages go to the orchestrator, which can use model choices, quota data, and project memory to dispatch work. The embedded MCP bridge supports asynchronous handoffs, cycle-checked synchronous consults in isolated sessions, and peer trajectory inspection.
+- **Live subscription usage.** Built-in adapters use provider probes by default where available. Usage is tracked per adapter and shared by its personas. The composer shows subscription usage alongside context usage, and unavailable quota windows are labeled accordingly.
+- **Review and preview.** The session header opens the diff review and terminal. Hiding the terminal preserves its interactive shell. File previews render HTML with its relative assets, images, PDFs, and read-only source in Monaco within the app.
+- **Project memory.** SQLite and FTS5 store job summaries and project facts. The orchestrator can curate entries for completed project work, with deterministic records as a fallback.
+- **Local and remote access.** The standalone Rust binary serves the same React UI used by Electron. A non-loopback `--bind` enables token authentication for access over a LAN or Tailscale.
 
 ---
 
 ## Separate harness profiles
 
-In **Settings → Harnesses**, choose **Create profile & sign in** for Codex, Claude Code, or Antigravity. Follow the provider's sign-in steps shown in Settings. Meta-Harness activates the new directory after sign-in completes and restores it on restart. A preconfigured `profile_dir` takes precedence.
+In **Settings → Harnesses & Models**, choose **Create profile & sign in** for Codex, Claude Code, or Antigravity. Follow the provider's sign-in steps shown in Settings. Meta-Harness activates the new directory after sign-in completes and restores it on restart. A preconfigured `profile_dir` takes precedence.
 
 For profiles created in the web app, **Use default CLI profile** returns to the CLI's ordinary sign-in. **Use saved separate profile** switches back using the saved credentials. The selection persists across restarts.
 
@@ -70,15 +69,17 @@ meta-harness/
 ├── configs/
 │   └── harnesses.example.toml    # Example ACP adapter & switch configuration
 ├── docs/
-│   ├── SPECIFICATION.md          # Detailed system, worktree, switch/MCP, DB, and UI specification
-│   └── IMPLEMENTATION_PLAN.md    # Phased roadmap (Phase 0 -> Phase 6) & verification gates
+│   └── SPECIFICATION.md          # System, protocol, storage, and UI specification
+├── desktop/                      # Electron launcher and packaging
+├── scripts/                      # Release builds and synchronized version bumps
 ├── crates/                       # Rust workspace crates
 │   ├── mh-core/                  # Domain types, @mention parser, wait-for DAG, quota/complexity models
 │   ├── mh-store/                 # SQLite + FTS5 persistence & project episodic memory
 │   ├── mh-acp/                   # ACP stdio supervisor, worktree & git broker, permissions, quota probes
 │   ├── mh-switch/                # Parallel router, hop & deadlock guard, orchestrator, MCP bridge handlers
 │   └── mh-server/                # Axum HTTP/WS server, optional LAN auth, CLI & `mcp-bridge` subcommand
-└── web/                          # Vite + React 19 + TypeScript + Tailwind v4 frontend
+├── web/                          # Vite + React 19 + TypeScript + Tailwind v4 frontend
+└── CHANGELOG.md                  # Notable and milestone changes
 ```
 
 ---
@@ -86,8 +87,8 @@ meta-harness/
 ## Documentation for Developers & Agents
 
 - **[AGENTS.md](AGENTS.md)** — Mandatory architectural invariants, coding standards, and Windows toolchain instructions for any agent implementing features in this repository.
-- **[docs/SPECIFICATION.md](docs/SPECIFICATION.md)** — End-to-end architecture, Git worktree lifecycle, ACP + MCP switch wire contracts, orchestrator policy, SQLite DDL, and UI layout.
-- **[docs/IMPLEMENTATION_PLAN.md](docs/IMPLEMENTATION_PLAN.md)** — Step-by-step milestone plan (Phase 0 -> Phase 6) with acceptance criteria.
+- **[docs/SPECIFICATION.md](docs/SPECIFICATION.md)** — Architecture, Git worktree lifecycle, ACP and MCP contracts, storage, server APIs, and UI behavior.
+
 ## Build a desktop release
 
 Install Node.js 24, Git, and the stable Rust toolchain for your OS. On Windows use Visual Studio C++ Build Tools for the MSVC toolchain or put the matching MinGW-w64 tools on PATH for the GNU toolchain. On macOS install the Xcode Command Line Tools.
@@ -99,4 +100,16 @@ node scripts/build.mjs --cli-only
 
 The full build puts the Electron installer and archive in `dist/desktop` and the standalone native binary in `dist/cli`. Use `--unpacked` to build an unpacked desktop app for local testing. GitHub Actions also offers a **Release build** workflow for Windows and macOS artifacts.
 
-The native release starts in the Windows system tray or macOS menu bar. Choose **Open Meta-Harness** to open it in your browser. Use `--no-tray` for foreground server operation. The Electron app opens in its own window and keeps running in the tray when you close the window. **Quit Meta-Harness** stops the app and its backend. Local packages are unsigned unless signing is configured.
+The native release starts in the Windows system tray or macOS menu bar and opens your browser when the server is bound to loopback. Use `--no-open` to skip opening the browser and `--no-tray` for foreground operation. The Electron app opens in its own window and keeps running in the tray when you close the window. **Quit Meta-Harness** stops the app and its backend. Local packages are unsigned unless signing is configured.
+
+For a development build, run `npm --prefix web ci` and `npm --prefix web run build` before starting the server with `cargo run --locked --bin meta-harness`. With the backend running on port 4410, `npm --prefix web run dev` serves the frontend at port 5173 and proxies API and WebSocket requests to the server.
+
+## Versioning
+
+Meta-Harness uses semantic versions across the Rust CLI, web UI, and Electron package. The initial release is `v0.1.0`.
+
+Use `node scripts/version.mjs patch` for fixes, `minor` for compatible features, or `major` for a breaking stable release. The script updates all three manifests and their lockfiles together. Include the bump with the next change commit. CI and the release build check that the versions agree.
+
+Record noteworthy changes in [CHANGELOG.md](CHANGELOG.md). When publishing a milestone, add a versioned heading for its notes and tag the release commit as `vMAJOR.MINOR.PATCH`.
+
+The About page shows the server version, a six-character build commit when available, the repository link, and license information.

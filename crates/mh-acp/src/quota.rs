@@ -666,10 +666,7 @@ async fn probe_codex_app_server(
 
     let rpc_fut = async {
         stdin
-            .write_all(
-                br#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"clientInfo":{"name":"meta-harness","version":"0.1.0"},"capabilities":{"experimentalApi":true}}}
-"#,
-            )
+            .write_all(crate::protocol::CODEX_APP_SERVER_INITIALIZE.as_bytes())
             .await
             .ok()?;
         stdin.flush().await.ok()?;

@@ -66,15 +66,22 @@ async function apiFetch<T>(path: string, init?: RequestInit): Promise<T> {
   return (await resp.json()) as T;
 }
 
-export function sessionFileUrl(sessionId: string, relPath: string): string {
-  const safeSegments = relPath
+function encodeFilePath(relPath: string): string {
+  return relPath
     .replace(/\\/g, "/")
     .replace(/^\/+/, "")
     .split("/")
     .filter(Boolean)
     .map(encodeURIComponent)
     .join("/");
-  return `/api/sessions/${encodeURIComponent(sessionId)}/files/${safeSegments}`;
+}
+
+export function sessionFileUrl(sessionId: string, relPath: string): string {
+  return `/api/sessions/${encodeURIComponent(sessionId)}/files/${encodeFilePath(relPath)}`;
+}
+
+export function sessionPreviewUrl(sessionId: string, grant: string, relPath: string): string {
+  return `/preview/${encodeURIComponent(sessionId)}/${encodeURIComponent(grant)}/${encodeFilePath(relPath)}`;
 }
 
 export function ptyWsUrl(
@@ -100,6 +107,8 @@ export function ptyWsUrl(
 }
 
 export const api = {
+  buildInfo: (signal?: AbortSignal) =>
+    apiFetch<{ version: string; commit: string | null }>("/api/health", { signal }),
   estimateDraftTokens: (text: string, signal: AbortSignal) =>
     apiFetch<{ tokens: number }>("/api/context/estimate", { method: "POST", body: JSON.stringify({ text }), signal }),
   authStatus: () =>

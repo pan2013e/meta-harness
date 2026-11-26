@@ -24,6 +24,9 @@ export function MemoryModal({ onClose }: { onClose: () => void }) {
       onClick={onClose}
     >
       <div
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby="project-memory-title"
         className="w-full max-w-3xl max-h-[85dvh] rounded-2xl border border-line-strong bg-panel shadow-2xl flex flex-col overflow-hidden"
         onClick={(e) => e.stopPropagation()}
       >
@@ -33,12 +36,12 @@ export function MemoryModal({ onClose }: { onClose: () => void }) {
               <Brain className="w-4 h-4" />
             </div>
             <div>
-              <h2 className="text-sm font-semibold text-ink">
+              <h2 id="project-memory-title" className="text-sm font-semibold text-ink">
                 Project Memory{activeProject ? ` · ${activeProject.name}` : ""}
               </h2>
-              <p className="text-[11px] text-ink-muted">
+              {activeProjectId && <p className="text-[11px] text-ink-muted">
                 Episodic ledger of who did what, plus pinned project rules shared across sessions
-              </p>
+              </p>}
             </div>
           </div>
           <button
@@ -51,7 +54,7 @@ export function MemoryModal({ onClose }: { onClose: () => void }) {
           </button>
         </header>
 
-        <div className="flex-1 overflow-y-auto p-5 space-y-5 text-xs">
+        {activeProjectId ? <div className="flex-1 overflow-y-auto p-5 space-y-5 text-xs">
           <div className="relative">
             <Search className="w-3.5 h-3.5 text-ink-muted absolute left-3 top-2.5" />
             <input
@@ -249,7 +252,11 @@ export function MemoryModal({ onClose }: { onClose: () => void }) {
               ))}
             </div>
           </section>
-        </div>
+        </div> : (
+          <p className="p-5 text-sm text-ink-muted">
+            Open a project to view its saved jobs and pinned notes.
+          </p>
+        )}
       </div>
     </div>
   );

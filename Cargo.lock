@@ -1716,7 +1716,7 @@ dependencies = [
 
 [[package]]
 name = "mh-acp"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "async-trait",
  "chrono",
@@ -1740,7 +1740,7 @@ dependencies = [
 
 [[package]]
 name = "mh-core"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "dirs 6.0.0",
  "dunce",
@@ -1754,7 +1754,7 @@ dependencies = [
 
 [[package]]
 name = "mh-server"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "anyhow",
  "axum",
@@ -1788,7 +1788,7 @@ dependencies = [
 
 [[package]]
 name = "mh-store"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "chrono",
  "mh-core",
@@ -1802,7 +1802,7 @@ dependencies = [
 
 [[package]]
 name = "mh-switch"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "async-trait",
  "chrono",

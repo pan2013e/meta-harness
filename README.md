@@ -1,117 +1,109 @@
 # Meta-Harness
 
-**Meta-Harness** is a local-first workspace for collaborating with **Codex**, **Claude Code**, **Antigravity / Gemini**, and other **Agent Client Protocol (ACP)** harnesses. It provides project group chats with isolated Git worktrees and Quick Sessions for work without an existing repository.
+**Meta-Harness** is a local-first workspace where you collaborate side-by-side with **Codex**, **Claude Code**, **Antigravity / Gemini**, and custom **Agent Client Protocol (ACP)** harnesses inside one group chat.
 
-Meta-Harness launches the harness CLIs locally over ACP. The adapters use your existing CLI sign-ins and subscription plans.
+- **Use your existing subscriptions.** Launches local harness CLIs over ACP (`codex`, `claude`, `agy` / `gemini`) with live quota tracking, model/reasoning selectors, and optional separate sign-in profiles.
+- **Isolated parallel Git worktrees.** Each session gets an integration branch (`mh/<session_id>/integration`) and lazy per-agent worktrees (`mh/<session_id>/exec-<handle>`). Clean edits auto-merge without extra LLM calls, leaving your main checkout untouched until you promote.
+- **Real multi-agent coordination.** Address agents directly with `@mentions`, let the **Orchestrator** triage unmentioned prompts across quota headroom and capabilities, or let agents consult peers (`peer_consult`) and inspect each other's trajectories (`trajectory_read`).
+- **Built-in developer tools.** Review unified diffs and promote (`merge` / `squash` / `patch`), preview HTML/code/images/PDFs in-app, run an interactive multi-tab terminal inside each worktree, and retain shared **Project Memory** across sessions.
 
-## Quick start
+![Meta-Harness multi-agent workflow: User to Agent, User to Orchestrator, Orchestrator Dispatch, and Agent-to-Agent collaboration](docs/media/demo.gif)
 
-1. Get the Electron package or standalone executable for your platform from [Release build](https://github.com/pan2013e/meta-harness/actions/workflows/release-build.yml), or [build from source](#build-a-desktop-release).
-2. Start Meta-Harness. The standalone executable opens the loopback web UI at `127.0.0.1:4410` by default. Electron opens the app in its own window.
-3. Use **Settings → Harnesses & Models** to check which CLIs and sign-ins are available. Open a project folder or start a **Quick Session**, then send a message to the orchestrator or address a member with `@handle`.
-
----
-
-## Core Capabilities
-
-- **Worktree isolation.** Git-backed sessions use an integration branch at `mh/<session_id>/integration` and lazily create per-executor branches at `mh/<session_id>/exec-<handle>`. The Git broker merges clean edits automatically and escalates conflicts to the orchestrator. Review changes and promote them to the project checkout using merge, squash, or patch. Non-Git folders use serialized shared-folder sessions.
-- **Harness collaboration.** Direct `@mentions` route to members. Unmentioned messages go to the orchestrator, which can use model choices, quota data, and project memory to dispatch work. The embedded MCP bridge supports asynchronous handoffs, cycle-checked synchronous consults in isolated sessions, and peer trajectory inspection.
-- **Live subscription usage.** Built-in adapters use provider probes by default where available. Usage is tracked per adapter and shared by its personas. The composer shows subscription usage alongside context usage, and unavailable quota windows are labeled accordingly.
-- **Review and preview.** The session header opens the diff review and terminal. Hiding the terminal preserves its interactive shell. File previews render HTML with its relative assets, images, PDFs, and read-only source in Monaco within the app.
-- **Project memory.** SQLite and FTS5 store job summaries and project facts. The orchestrator can curate entries for completed project work, with deterministic records as a fallback.
-- **Local and remote access.** The standalone Rust binary serves the same React UI used by Electron. A non-loopback `--bind` enables token authentication for access over a LAN or Tailscale.
+*Example walkthrough: `User → @codex` direct prompt, unmentioned `User → @antigravity (Orchestrator)` triage & parallel dispatch, `@claude ↔ @codex` trajectory inspection + sync consult + `@mention` handoff, and in-app Diff Review & HTML Preview.*
 
 ---
 
-## Separate harness profiles
+## Installation
 
-In **Settings → Harnesses & Models**, choose **Create profile & sign in** for Codex, Claude Code, or Antigravity. Follow the provider's sign-in steps shown in Settings. Meta-Harness activates the new directory after sign-in completes and restores it on restart. A preconfigured `profile_dir` takes precedence.
+### Prerequisites
 
-For profiles created in the web app, **Use default CLI profile** returns to the CLI's ordinary sign-in. **Use saved separate profile** switches back using the saved credentials. The selection persists across restarts.
+Install **Git** and at least one supported ACP harness CLI signed in with your own subscription:
 
-Codex's primary sign-in button opens the provider's browser login on the machine running Meta-Harness. **Use device code** starts the alternative flow, where you enter the code on the provider's page. Antigravity usage comes from the shared CLI profile by default. When a private profile is active, the quota display notes that the shared account's usage may differ.
+- **Codex** (`codex` / `@agentclientprotocol/codex-acp`)
+- **Claude Code** (`claude` / `@agentclientprotocol/claude-agent-acp`)
+- **Antigravity / Gemini** (`agy acp` or `gemini --acp`)
 
-Use **Check CLI version** and **Upgrade CLI** in the same card for supported launchers. Upgrades run the vendor updater or refresh the compatible npm bundle for the default Codex ACP launcher.
+### Option 1: Prebuilt Desktop App or Standalone Binary (Recommended)
 
-Under **Settings → Session**, a persona can inherit its harness's defaults or choose its own model and reasoning effort. Removing a persona preserves its chat history and worktree.
+Download the Electron installer/archive or standalone native binary for Windows or macOS from the [GitHub Releases](https://github.com/pan2013e/meta-harness/releases) or [Release build workflow](https://github.com/pan2013e/meta-harness/actions/workflows/release-build.yml).
 
-Set `profile_dir` under an adapter in your Meta-Harness config, then restart Meta-Harness. Relative paths are rooted in the Meta-Harness data directory. Each adapter can use a different profile.
+- **Desktop App (Electron):** Opens Meta-Harness in its own native window and stays accessible from the system tray / menu bar.
+- **Standalone Binary (`meta-harness`):** Serves the full web UI at `http://127.0.0.1:4410` and opens your browser automatically (with native tray controls on Windows/macOS; pass `--no-tray` or `--no-open` for headless operation).
 
-```toml
-[adapters.codex]
-profile_dir = "profiles/codex"
+### Option 2: Build from Source
 
-[adapters.claude]
-profile_dir = "profiles/claude"
-
-[adapters.antigravity]
-profile_dir = "profiles/antigravity"
-```
-
-Add these keys to the existing adapter sections in `configs/harnesses.local.toml`, or start with `configs/harnesses.example.toml`. Meta-Harness creates the directories on first launch of each harness and starts a fresh ACP session when the profile changes. Existing chat stays in Meta-Harness, and existing native conversations stay in their original profiles.
-
-For Codex or Claude Code, sign in to the separate directory using the harness CLI with `CODEX_HOME` or `CLAUDE_CONFIG_DIR` pointing to the resolved profile path shown in Settings. For Antigravity, the ACP launcher uses `--gemini-dir <profile> --app-data-dir antigravity-cli`. The OS keyring may still supply the same Google account. When needed, run `agy acp --login` with the same directory flags. Gemini CLI fallback uses `GEMINI_CLI_HOME`.
-
-## Global personas and settings backups
-
-Create reusable personas under **Settings → Global Personas**. New sessions include saved personas whose harnesses are available. Use **Add to session** for an existing session. Each session keeps its own copy of the persona's instructions and defaults.
-
-Address several agents at the start of a message to get a model and reasoning effort tab for each recipient. Selections in the composer apply to messages from that composer. Set a persona's persistent defaults in Settings.
-
-Put direct recipients at the start of a message. For example, `@codex say hello to @antigravity` starts Codex first and leaves the handoff to Codex. Ambiguous inline references can use a short orchestrator pass that stays out of the chat transcript.
-
-Use **Settings → Storage & Data → Settings backup** to export or import versioned JSON containing the theme, harness model defaults, quota preferences, and global personas. Import merges records by harness ID or persona handle. Keep machine-specific TOML, sign-in profiles, and session data in their original locations.
-
-## Repository Map
-
-```text
-meta-harness/
-├── AGENTS.md                     # Canonical engineering contract & general specs for coding agents
-├── CLAUDE.md                     # Entrypoint pointer for Claude Code -> AGENTS.md
-├── configs/
-│   └── harnesses.example.toml    # Example ACP adapter & switch configuration
-├── docs/
-│   └── SPECIFICATION.md          # System, protocol, storage, and UI specification
-├── desktop/                      # Electron launcher and packaging
-├── scripts/                      # Release builds and synchronized version bumps
-├── crates/                       # Rust workspace crates
-│   ├── mh-core/                  # Domain types, @mention parser, wait-for DAG, quota/complexity models
-│   ├── mh-store/                 # SQLite + FTS5 persistence & project episodic memory
-│   ├── mh-acp/                   # ACP stdio supervisor, worktree & git broker, permissions, quota probes
-│   ├── mh-switch/                # Parallel router, hop & deadlock guard, orchestrator, MCP bridge handlers
-│   └── mh-server/                # Axum HTTP/WS server, optional LAN auth, CLI & `mcp-bridge` subcommand
-├── web/                          # Vite + React 19 + TypeScript + Tailwind v4 frontend
-└── CHANGELOG.md                  # Notable and milestone changes
-```
-
----
-
-## Documentation for Developers & Agents
-
-- **[AGENTS.md](AGENTS.md)** — Mandatory architectural invariants, coding standards, and Windows toolchain instructions for any agent implementing features in this repository.
-- **[docs/SPECIFICATION.md](docs/SPECIFICATION.md)** — Architecture, Git worktree lifecycle, ACP and MCP contracts, storage, server APIs, and UI behavior.
-
-## Build a desktop release
-
-Install Node.js 24, Git, and the stable Rust toolchain for your OS. On Windows use Visual Studio C++ Build Tools for the MSVC toolchain or put the matching MinGW-w64 tools on PATH for the GNU toolchain. On macOS install the Xcode Command Line Tools.
+Requires **Node.js 24**, **Git**, and a stable **Rust** toolchain *(Windows: Visual Studio C++ Build Tools for MSVC or MinGW-w64 `WinLibs` on `PATH`; macOS: Xcode Command Line Tools; Linux: `build-essential`)*. See [AGENTS.md](AGENTS.md#3-environment--toolchain-bootstrap-notes-windows-macos--linux) if you need toolchain setup steps.
 
 ```sh
+git clone https://github.com/pan2013e/meta-harness.git
+cd meta-harness
+
+# Build the Electron desktop bundle (dist/desktop) + standalone CLI (dist/cli)
 node scripts/build.mjs
+
+# Or build only the single-file native CLI binary (dist/cli)
 node scripts/build.mjs --cli-only
 ```
 
-The full build puts the Electron installer and archive in `dist/desktop` and the standalone native binary in `dist/cli`. Use `--unpacked` to build an unpacked desktop app for local testing. GitHub Actions also offers a **Release build** workflow for Windows and macOS artifacts.
+For quick local development against a hot-reloading frontend:
 
-The native release starts in the Windows system tray or macOS menu bar and opens your browser when the server is bound to loopback. Use `--no-open` to skip opening the browser and `--no-tray` for foreground operation. The Electron app opens in its own window and keeps running in the tray when you close the window. **Quit Meta-Harness** stops the app and its backend. Local packages are unsigned unless signing is configured.
+```sh
+npm --prefix web ci && npm --prefix web run build
+cargo run --locked --bin meta-harness          # Starts backend on 127.0.0.1:4410
+npm --prefix web run dev                         # Optional Vite dev server on :5173
+```
 
-For a development build, run `npm --prefix web ci` and `npm --prefix web run build` before starting the server with `cargo run --locked --bin meta-harness`. With the backend running on port 4410, `npm --prefix web run dev` serves the frontend at port 5173 and proxies API and WebSocket requests to the server.
+---
 
-## Versioning
+## Getting Started
 
-Meta-Harness uses semantic versions across the Rust CLI, web UI, and Electron package. The initial release is `v0.1.0`.
+1. **Launch Meta-Harness** — Open the desktop app or run `meta-harness` from your terminal.
+2. **Check your harnesses & quotas** — Open **Settings → Harnesses & Models** to confirm detected CLIs, inspect live subscription usage, set default models/reasoning effort, or create isolated CLI sign-in profiles.
+3. **Open a repository or start a Quick Session** — Click **Open** in the sidebar to load a local project folder *(Git repos use isolated worktrees; non-Git folders can initialize Git or run in shared-folder mode)*, or stay in **Quick Sessions** for scratch work managed under `~/.meta-harness/workspaces`.
+4. **Chat & orchestrate** — Send any message normally to let the **Orchestrator** plan and route work, or address members directly with `@codex`, `@claude`, `@antigravity`, `@all`, and `/plan` / `/review` / `/diff` / `/shell` / `/memory` slash commands.
 
-Include one version bump in each change commit. Use `node scripts/version.mjs patch` for fixes and maintenance, `minor` for compatible features or breaking changes during the `0.x` series, and `major` for breaking changes starting at 1.0.0. The script updates all three manifests and their lockfiles together. CI and the release build check that the versions agree.
+![Meta-Harness Group Chat Workspace](docs/media/workspace-chat.png)
 
-Record noteworthy changes in [CHANGELOG.md](CHANGELOG.md). When publishing a milestone, add a versioned heading for its notes and tag the release commit as `vMAJOR.MINOR.PATCH`.
+> **Next:** Read the **[Usage Guide (docs/USAGE.md)](docs/USAGE.md)** for screenshots and detailed walkthroughs of worktree diff promotion, in-app HTML/code previews, the interactive multi-tab terminal, Project Memory, global personas, storage cleanup, and LAN token pairing.
 
-The About page shows the server version, a six-character build commit when available, the repository link, and license information.
+---
+
+## How Multi-Agent Collaboration Works
+
+| Collaboration Flow | How It Works in Meta-Harness |
+| :--- | :--- |
+| **User ↔ Agent** | Start a message with `@handle` (or `@a @b`) to route directly to one or more harnesses in isolated executor worktrees, with per-recipient model & reasoning overrides. |
+| **User ↔ Orchestrator** | Send an unmentioned prompt to talk with the session's **Orchestrator**, which sees subscription quota headroom, model catalogs, and **Project Memory**. |
+| **Orchestrator ↔ Agents** | The orchestrator can answer directly or invoke `orchestrator_dispatch` to fan out parallel/sequential worktree tasks (optionally pausing for approval when **Plan first** is active). |
+| **Agent ↔ Agent** | Harnesses coordinate over Meta-Harness's embedded MCP bridge (`meta-harness mcp-bridge`) using async `@mention` handoffs, cycle-checked synchronous `peer_consult` threads, and `trajectory_read` inspection. |
+
+---
+
+## Repository Structure & Documentation
+
+- **[docs/USAGE.md](docs/USAGE.md)** — Complete user guide covering sessions, routing, terminal, previews, memory, settings, profiles, and CLI options.
+- **[docs/SPECIFICATION.md](docs/SPECIFICATION.md)** — System architecture, Git worktree lifecycle, ACP/MCP protocol contracts, SQLite schema, and REST/WebSocket APIs.
+- **[AGENTS.md](AGENTS.md)** — Mandatory architectural invariants, quality gates, and toolchain setup for contributors and coding agents.
+- **[CHANGELOG.md](CHANGELOG.md)** — Release history and unreleased changes.
+
+```text
+meta-harness/
+├── crates/
+│   ├── mh-core/        # Domain DTOs, mention parser, wait-for DAG, config, paths
+│   ├── mh-store/       # SQLite (WAL) + FTS5 persistence & episodic memory
+│   ├── mh-acp/         # ACP stdio client, Git worktree broker, quota probes, permissions
+│   ├── mh-switch/      # Parallel switch router, hop guard, orchestrator, MCP handlers
+│   └── mh-server/      # Axum HTTP/WS server, PTY terminal, static SPA, CLI & mcp-bridge
+├── web/                # React 19 + TypeScript + Tailwind v4 + xterm.js UI
+├── desktop/            # Electron desktop launcher & packaging
+├── configs/            # Example adapter configuration (harnesses.example.toml)
+├── docs/               # User guide, technical spec, and media assets
+└── scripts/            # Synchronized SemVer bumps & release packaging scripts
+```
+
+### Versioning & Release Checks
+
+- Bump versions across Rust, web, and Electron manifests together with `node scripts/version.mjs <patch|minor|major>` and validate alignment with `node scripts/version.mjs --check`.
+- Pre-commit quality gates:
+  - Web: `npm --prefix web run typecheck && npm --prefix web run test && npm --prefix web run build`
+  - Rust: `cargo fmt --all -- --check && cargo clippy --workspace --all-targets -- -D warnings && cargo test --locked --workspace`

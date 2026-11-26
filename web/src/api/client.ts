@@ -264,7 +264,7 @@ export const api = {
       archived?: boolean;
     }
   ) =>
-    apiFetch<{ session: Session }>(
+    apiFetch<{ session: Session; harness_warnings?: string[] }>(
       `/api/sessions/${encodeURIComponent(sessionId)}`,
       { method: "PATCH", body: JSON.stringify(payload) }
     ),
@@ -274,7 +274,7 @@ export const api = {
       { method: "POST" }
     ),
   deleteSession: (sessionId: string) =>
-    apiFetch<{ deleted: boolean }>(
+    apiFetch<{ deleted: boolean; harness_warnings?: string[] }>(
       `/api/sessions/${encodeURIComponent(sessionId)}`,
       { method: "DELETE" }
     ),

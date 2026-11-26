@@ -3,7 +3,7 @@ import { ChevronDown, ChevronRight, FileDiff, Loader2, ShieldAlert, Sparkles, Te
 import { useAppStore } from "../../store/useAppStore";
 import { MarkdownBlock } from "../common/MarkdownBlock";
 import { TrajectoryRow } from "../drawer/TrajectoryRow";
-import { cleanWorktreePath, groupTrajectoryEvents } from "../drawer/trajectory";
+import { cleanWorktreePath, groupTrajectoryEvents, switchToolLabel } from "../drawer/trajectory";
 
 export function WaitingForTurn({ waitingForApproval = false }: { waitingForApproval?: boolean }) {
   return (
@@ -22,12 +22,14 @@ export function TurnActivityTimeline({
   streaming,
   waitingForApproval,
   intermediateNotes,
+  actor,
 }: {
   turnId: string;
   sessionId: string;
   streaming: boolean;
   waitingForApproval: boolean;
   intermediateNotes: string[];
+  actor: string;
 }) {
   const [expanded, setExpanded] = useState(false);
   const events = useAppStore((s) => s.turnEvents[turnId]);
@@ -68,7 +70,7 @@ export function TurnActivityTimeline({
       return fallbackNotes.at(-1)?.slice(0, 72) ?? null;
     }
     if (last.type === "tool") {
-      return cleanWorktreePath(last.title ?? last.name ?? "Running tool");
+      return switchToolLabel(last, actor) ?? cleanWorktreePath(last.title ?? last.name ?? "Running tool");
     }
     if (last.event.event_kind === "diff") {
       const p = typeof last.event.payload.path === "string" ? last.event.payload.path : "file";
@@ -78,7 +80,7 @@ export function TurnActivityTimeline({
       return "Thinking";
     }
     return last.event.event_kind;
-  }, [entries, fallbackNotes]);
+  }, [entries, fallbackNotes, actor]);
 
   const summaryLabel = streaming
     ? waitingForApproval
@@ -149,7 +151,7 @@ export function TurnActivityTimeline({
           ))}
 
           {entries.map((entry) => (
-            <TrajectoryRow key={entry.key} entry={entry} sessionId={sessionId} />
+            <TrajectoryRow key={entry.key} entry={entry} sessionId={sessionId} actor={actor} />
           ))}
 
           {entries.length === 0 && fallbackNotes.length === 0 && (

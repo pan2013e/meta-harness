@@ -495,7 +495,7 @@ export function Sidebar() {
         >
           <h2 id="delete-session-title" className="font-semibold">Delete session?</h2>
           <p id="delete-session-description" className="mt-2 break-words text-sm text-ink-soft">
-            “{deleteTarget.title}” and its worktrees will be permanently deleted.
+            Delete “{deleteTarget.title}”, its worktrees, and linked conversations in supported harnesses?
           </p>
           {deleteError && <p role="alert" className="mt-3 text-sm text-neg">{deleteError}</p>}
           <div className="mt-5 flex justify-end gap-2 text-sm">

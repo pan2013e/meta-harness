@@ -155,7 +155,6 @@ export function Composer({
   onConsumePreset?: () => void;
 }) {
   const {
-    activeProjectId,
     activeSession,
     members,
     adapters,
@@ -536,17 +535,19 @@ export function Composer({
     );
   }, [contextMemberHandle, targetMember, orchestrator, contextMembersList]);
 
-  const contextTotalWithDraft = activeContextBreakdown
-    ? activeContextBreakdown.used_tokens + draftTokens
-    : draftTokens;
   const contextMember = availableMembers.find((member) => member.handle === activeContextBreakdown?.handle);
   const contextModel = (contextMember && modelOverrides[recipientKey(contextMember)]?.model) ??
     activeContextBreakdown?.model;
   const reportedContext = activeContextBreakdown?.context_window ?? 200_000;
   const sameModel = contextModel === activeContextBreakdown?.model;
+  const reportedUsage = activeContextBreakdown?.is_exact === true && sameModel;
   const modelFallback = contextMember ? adapterCatalogs[contextMember.adapter_id]?.default_context_window : undefined;
-  const contextWindow = Math.max(activeContextBreakdown?.is_exact && sameModel
+  const contextWindow = Math.max(reportedUsage
     ? reportedContext : modelContextWindow(contextModel, sameModel ? reportedContext : modelFallback ?? 200_000), 1);
+  const contextSegments = activeContextBreakdown
+    ? contextUsageSegments(activeContextBreakdown, reportedUsage, draftTokens)
+    : [];
+  const contextTotalWithDraft = contextSegments.reduce((sum, segment) => sum + segment.tokens, 0);
   const contextPct = Math.min(100, (contextTotalWithDraft / contextWindow) * 100);
   const quotaIds = [...new Set(recipients.map((member) => member.adapter_id))];
   const reportedQuotaUse = quotaIds.map((id) => quotaUsed(quotas[id])).filter((value): value is number => value !== null);
@@ -578,10 +579,8 @@ export function Composer({
       return;
     }
     if (lowerRaw === "/memory") {
-      if (activeProjectId) {
-        setText("");
-        setMemoryModalOpen(true);
-      }
+      setText("");
+      setMemoryModalOpen(true);
       return;
     }
     if (lowerRaw === "/new") {
@@ -737,16 +736,20 @@ export function Composer({
             value={text}
             validHandles={validHandleSet}
             slashCommands={DEFAULT_SLASH_COMMANDS}
-            disabled={!availableMembers.length}
             placeholder={
               availableMembers.length
                 ? "Message the group… Use @ to mention or / for commands"
-                : "No CLI harnesses detected yet — open Settings to check requirements"
+                : "No agent harnesses available. Type / for local commands."
             }
             onChange={setText}
             onMentionQuery={setMentionQuery}
             onSlashQuery={setSlashQuery}
             onKeyDown={(e) => {
+              if (e.key === "Enter" && !e.shiftKey && raw.toLowerCase() === "/memory") {
+                e.preventDefault();
+                void handleSend();
+                return;
+              }
               if (activeAutocompleteCount > 0) {
                 if (e.key === "ArrowDown") {
                   e.preventDefault();
@@ -1097,12 +1100,11 @@ export function Composer({
                         <div className="flex items-center justify-between gap-2">
                           <div className="flex items-center gap-1.5 font-semibold text-ink">
                             <Gauge className="w-3.5 h-3.5 text-brand-ink" />
-                            <span>Context Composition</span>
+                            <span>Context usage</span>
                           </div>
                           <span className="font-mono text-[10.5px] text-ink-muted">
                             {formatCompactTokens(contextTotalWithDraft)} /{" "}
                             {formatCompactTokens(contextWindow)}
-                            {activeContextBreakdown.is_exact ? " · ACP" : " · est"}
                           </span>
                         </div>
 
@@ -1126,10 +1128,12 @@ export function Composer({
                         )}
 
                         <ContextBreakdownBar
-                          breakdown={activeContextBreakdown}
-                          draftTokens={draftTokens}
+                          segments={contextSegments}
                           contextWindow={contextWindow}
                         />
+                        <p className="text-[11px] text-ink-muted">
+                          {reportedUsage ? "Window reported by the harness" : "Estimated context and model window"}
+                        </p>
                       </div>
                     </>
                   )}
@@ -1203,16 +1207,10 @@ function ContextRing({ pct, accent = "var(--mh-brand)" }: { pct: number; accent?
   );
 }
 
-function ContextBreakdownBar({
-  breakdown,
-  draftTokens,
-  contextWindow,
-}: {
-  breakdown: MemberContextBreakdown;
-  draftTokens: number;
-  contextWindow: number;
-}) {
-  const segments = [
+function contextUsageSegments(breakdown: MemberContextBreakdown, reported: boolean, draftTokens: number) {
+  const segments = reported ? [
+    { label: "Harness context", tokens: breakdown.used_tokens, color: "bg-indigo-500" },
+  ] : [
     {
       label: "System & Persona",
       tokens: breakdown.system_and_persona_tokens,
@@ -1233,12 +1231,20 @@ function ContextBreakdownBar({
       tokens: breakdown.agent_and_tool_tokens,
       color: "bg-sky-500",
     },
-    {
-      label: "Current Draft",
-      tokens: draftTokens,
-      color: "bg-fuchsia-500",
-    },
   ];
+  if (draftTokens > 0) {
+    segments.push({ label: "Draft (estimated)", tokens: draftTokens, color: "bg-fuchsia-500" });
+  }
+  return segments;
+}
+
+function ContextBreakdownBar({
+  segments,
+  contextWindow,
+}: {
+  segments: ReturnType<typeof contextUsageSegments>;
+  contextWindow: number;
+}) {
   const denom = Math.max(
     contextWindow,
     segments.reduce((sum, s) => sum + s.tokens, 0),
@@ -1255,7 +1261,7 @@ function ContextBreakdownBar({
             <div
               key={s.label}
               className={`h-full ${s.color}`}
-              style={{ width: `${Math.max(widthPct, 1)}%` }}
+              style={{ width: `${widthPct}%` }}
               title={`${s.label}: ${s.tokens} tokens`}
             />
           );

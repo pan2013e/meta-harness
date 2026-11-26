@@ -19,7 +19,9 @@ use tracing::{debug, info};
 use crate::AcpError;
 use crate::broker::{BrokerCallbacks, MemberBrokerContext, PermissionResolution};
 use crate::client::{AcpClient, TurnStreamListener};
-use crate::platform::{ProcessTreeGuard, find_cli_binary, prepare_isolated_command};
+use crate::platform::{
+    ProcessTreeGuard, find_cli_binary, prepare_isolated_command, resolve_command,
+};
 use crate::protocol::{McpEnvVar, McpServerSpec, SWITCH_MCP_SERVER_NAME};
 
 #[derive(Debug, Clone)]
@@ -218,10 +220,10 @@ impl AcpSupervisor {
         &self,
         session_id: &str,
         member_handle: &str,
-    ) -> Option<(u64, u64)> {
+    ) -> Option<(u64, u64, Option<String>)> {
         let guard = self.clients.lock().await;
         if let Some(m) = guard.get(&(session_id.to_string(), member_handle.to_string())) {
-            *m.client.latest_usage.read().await
+            m.client.latest_usage.read().await.clone()
         } else {
             None
         }
@@ -604,20 +606,36 @@ pub(crate) fn codex_model_command(adapter: &AdapterConfig) -> Option<Command> {
     find_cli_binary("codex").map(Command::new)
 }
 
-async fn read_codex_result(lines: &mut Lines<BufReader<ChildStdout>>, id: i64) -> Option<Value> {
-    while let Some(line) = lines.next_line().await.ok().flatten() {
+async fn read_rpc_result(
+    lines: &mut Lines<BufReader<ChildStdout>>,
+    id: i64,
+) -> Result<Value, AcpError> {
+    while let Some(line) = lines.next_line().await? {
         if let Ok(mut frame) = serde_json::from_str::<Value>(&line)
             && frame.get("id").and_then(Value::as_i64) == Some(id)
         {
-            return frame.get_mut("result").map(Value::take);
+            if let Some(error) = frame.get("error") {
+                return Err(AcpError::Rpc {
+                    code: error.get("code").and_then(Value::as_i64).unwrap_or(-32000),
+                    message: error
+                        .get("message")
+                        .and_then(Value::as_str)
+                        .unwrap_or("Harness request failed")
+                        .to_string(),
+                    data: error.get("data").cloned(),
+                });
+            }
+            if let Some(result) = frame.get_mut("result") {
+                return Ok(result.take());
+            }
         }
     }
-    None
+    Err(AcpError::ProcessExited("Harness returned no result".into()))
 }
 
-async fn probe_codex_models(adapter: &AdapterConfig) -> Option<AdapterModelCatalog> {
+fn codex_app_server_command(adapter: &AdapterConfig, profile: Option<&Path>) -> Option<Command> {
     let mut cmd = codex_model_command(adapter)?;
-    if let Some(profile) = adapter.profile_dir.as_deref() {
+    if let Some(profile) = profile {
         cmd.env("CODEX_HOME", dunce::simplified(profile));
     }
     cmd.args(["app-server", "--stdio"])
@@ -626,6 +644,170 @@ async fn probe_codex_models(adapter: &AdapterConfig) -> Option<AdapterModelCatal
         .stderr(Stdio::null())
         .kill_on_drop(true);
     prepare_isolated_command(&mut cmd);
+    Some(cmd)
+}
+
+#[derive(Debug, Clone, Copy)]
+pub enum HarnessConversationAction {
+    Archive,
+    Restore,
+    Delete,
+}
+
+pub async fn update_harness_conversations(
+    adapter: &AdapterConfig,
+    action: HarnessConversationAction,
+    references: &[String],
+) -> bool {
+    let mut profiles = HashMap::<Option<PathBuf>, HashSet<String>>::new();
+    let mut complete = true;
+    for reference in references {
+        if let Some((profile, thread_id)) = crate::profile::stored_profile_session(reference) {
+            profiles.entry(profile).or_default().insert(thread_id);
+        } else {
+            complete = false;
+        }
+    }
+    for (profile, thread_ids) in profiles {
+        let result =
+            change_profile_conversations(adapter, profile.as_deref(), action, thread_ids).await;
+        if let Err(error) = result {
+            tracing::warn!(?action, adapter = %adapter.display_name, %error, "Could not update all recorded conversations");
+            complete = false;
+        }
+    }
+    complete
+}
+
+async fn change_profile_conversations(
+    adapter: &AdapterConfig,
+    profile: Option<&Path>,
+    action: HarnessConversationAction,
+    thread_ids: HashSet<String>,
+) -> Result<(), AcpError> {
+    let codex = adapter.quota_provider == "codex_local";
+    let mut cmd = if codex {
+        codex_app_server_command(adapter, profile)
+            .ok_or_else(|| AcpError::CommandNotFound("codex".into()))?
+    } else {
+        let (command, args) = resolve_adapter_command(adapter)?;
+        let (executable, args) = resolve_command(&command, &args)?;
+        let mut cmd = Command::new(executable);
+        cmd.args(args)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .kill_on_drop(true);
+        if let Some(profile) = profile {
+            cmd.env("CLAUDE_CONFIG_DIR", dunce::simplified(profile));
+        }
+        prepare_isolated_command(&mut cmd);
+        cmd
+    };
+    let mut child = cmd.spawn()?;
+    let mut guard = ProcessTreeGuard::attach(&child);
+    let mut stdin = child
+        .stdin
+        .take()
+        .ok_or_else(|| AcpError::ProcessExited("Missing harness stdin".into()))?;
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| AcpError::ProcessExited("Missing harness stdout".into()))?;
+    let result = tokio::time::timeout(Duration::from_secs(8), async {
+        let mut lines = BufReader::new(stdout).lines();
+        if codex {
+            stdin.write_all(crate::protocol::CODEX_APP_SERVER_INITIALIZE.as_bytes()).await?;
+        } else {
+            // Request only the Claude adapter's documented archive extension on this connection.
+            let initialize = json!({"jsonrpc":"2.0", "id":1, "method":"initialize", "params":{
+                "protocolVersion":1,
+                "clientInfo":{"name":"meta-harness", "version":env!("CARGO_PKG_VERSION")},
+                "clientCapabilities":{"_meta":{"jetbrains":{"air":{"version":1,"capabilities":["sessionIndex"]}}}}
+            }});
+            stdin.write_all(format!("{initialize}\n").as_bytes()).await?;
+        }
+        let initialized = read_rpc_result(&mut lines, 1).await?;
+        if codex {
+            stdin.write_all(b"{\"jsonrpc\":\"2.0\",\"method\":\"initialized\"}\n").await?;
+        }
+        let (method, id_field) = conversation_method(codex, action, &initialized).ok_or_else(|| AcpError::Rpc {
+            code: -32601, message: "Harness did not advertise session archive support".into(), data: None,
+        })?;
+
+        let mut failure = None;
+        for (id, thread_id) in (2..).zip(thread_ids) {
+            let request =
+                json!({"jsonrpc":"2.0", "id":id, "method":method, "params":{(id_field):thread_id}});
+            stdin.write_all(format!("{request}\n").as_bytes()).await?;
+            if let Err(error) = read_rpc_result(&mut lines, id).await {
+                if matches!(error, AcpError::Rpc { code: -32601, .. }) {
+                    return Err(error);
+                }
+                failure = Some(error);
+            }
+        }
+        failure.map_or(Ok(()), Err)
+    })
+    .await;
+    guard.kill_tree();
+    let _ = tokio::time::timeout(Duration::from_millis(200), child.wait()).await;
+    result.unwrap_or_else(|_| {
+        Err(AcpError::Timeout(
+            "Harness session lifecycle request".into(),
+        ))
+    })
+}
+
+fn conversation_method(
+    codex: bool,
+    action: HarnessConversationAction,
+    initialized: &Value,
+) -> Option<(&'static str, &'static str)> {
+    use HarnessConversationAction::{Archive, Delete, Restore};
+    if codex {
+        return Some((
+            match action {
+                Archive => "thread/archive",
+                Restore => "thread/unarchive",
+                Delete => "thread/delete",
+            },
+            "threadId",
+        ));
+    }
+    if matches!(action, Delete) {
+        return Some(("session/delete", "sessionId"));
+    }
+    if initialized
+        .pointer("/agentCapabilities/sessionCapabilities/archive")
+        .is_some_and(|value| value.is_object() || value.as_bool() == Some(true))
+    {
+        return Some((
+            match action {
+                Archive => "session/archive",
+                _ => "session/unarchive",
+            },
+            "sessionId",
+        ));
+    }
+    let supported = initialized
+        .pointer("/_meta/jetbrains/air/capabilities")
+        .and_then(Value::as_array)
+        .is_some_and(|list| {
+            list.iter()
+                .any(|cap| cap.as_str() == Some("sessionArchive"))
+        });
+    supported.then_some((
+        match action {
+            Archive => "_session/archive",
+            _ => "_session/unarchive",
+        },
+        "sessionId",
+    ))
+}
+
+async fn probe_codex_models(adapter: &AdapterConfig) -> Option<AdapterModelCatalog> {
+    let mut cmd = codex_app_server_command(adapter, adapter.profile_dir.as_deref())?;
 
     let mut child = cmd.spawn().ok()?;
     let mut guard = ProcessTreeGuard::attach(&child);
@@ -640,7 +822,7 @@ async fn probe_codex_models(adapter: &AdapterConfig) -> Option<AdapterModelCatal
         stdin.flush().await.ok()?;
 
         let mut lines = BufReader::new(stdout).lines();
-        read_codex_result(&mut lines, 1).await?;
+        read_rpc_result(&mut lines, 1).await.ok()?;
 
         stdin
             .write_all(
@@ -661,7 +843,7 @@ async fn probe_codex_models(adapter: &AdapterConfig) -> Option<AdapterModelCatal
                 .await
                 .ok()?;
             stdin.flush().await.ok()?;
-            let mut page = read_codex_result(&mut lines, id).await?;
+            let mut page = read_rpc_result(&mut lines, id).await.ok()?;
             models.append(page.get_mut("data")?.as_array_mut()?);
             cursor = page
                 .get("nextCursor")
@@ -1052,6 +1234,33 @@ pub fn build_mcp_bridge_spec(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn session_lifecycle_respects_the_adapter_protocol_and_archive_capability() {
+        use HarnessConversationAction::{Archive, Delete, Restore};
+        assert_eq!(
+            conversation_method(true, Delete, &Value::Null),
+            Some(("thread/delete", "threadId"))
+        );
+        assert_eq!(
+            conversation_method(false, Delete, &Value::Null),
+            Some(("session/delete", "sessionId"))
+        );
+        assert_eq!(conversation_method(false, Archive, &Value::Null), None);
+        assert_eq!(
+            conversation_method(
+                false,
+                Archive,
+                &json!({"agentCapabilities":{"sessionCapabilities":{"archive":{}}}})
+            ),
+            Some(("session/archive", "sessionId"))
+        );
+        let air = json!({"_meta":{"jetbrains":{"air":{"capabilities":["sessionIndex","sessionArchive"]}}}});
+        assert_eq!(
+            conversation_method(false, Restore, &air),
+            Some(("_session/unarchive", "sessionId"))
+        );
+    }
 
     #[test]
     fn codex_catalog_keeps_public_model_slugs_and_skips_invalid_rows() {

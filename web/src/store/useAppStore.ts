@@ -591,7 +591,7 @@ export const useAppStore = create<AppState>((set, get) => {
     archiveSession: async (sessionId: string, archived: boolean) => {
       const pid = get().activeProjectId;
       const request = projectRequest;
-      const { session } = await api.patchSession(sessionId, { archived });
+      const { session, harness_warnings } = await api.patchSession(sessionId, { archived });
       const { sessions } = pid
         ? await api.listSessions(pid, true)
         : await api.listStandaloneSessions(true);
@@ -610,12 +610,13 @@ export const useAppStore = create<AppState>((set, get) => {
       } else if (!archived) {
         await get().selectSession(session.id);
       }
+      if (harness_warnings?.length) get().setError(harness_warnings.join(" "));
     },
 
     deleteSessionById: async (sessionId: string) => {
       const pid = get().activeProjectId;
       const request = projectRequest;
-      await api.deleteSession(sessionId);
+      const { harness_warnings } = await api.deleteSession(sessionId);
       const { sessions } = pid
         ? await api.listSessions(pid, true)
         : await api.listStandaloneSessions(true);
@@ -629,6 +630,7 @@ export const useAppStore = create<AppState>((set, get) => {
           clearSession();
         }
       }
+      if (harness_warnings?.length) get().setError(harness_warnings.join(" "));
     },
 
     compactActiveSession: async () => {

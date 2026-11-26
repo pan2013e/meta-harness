@@ -221,6 +221,19 @@ impl Store {
         Ok(())
     }
 
+    pub fn list_harness_conversations(
+        &self,
+        session_id: &str,
+    ) -> Result<Vec<(String, String)>, StoreError> {
+        let conn = self.conn()?;
+        let mut stmt = conn.prepare(
+            "SELECT adapter_id, acp_session_id FROM session_harness_conversations
+             WHERE session_id = ?1 ORDER BY adapter_id, acp_session_id",
+        )?;
+        let rows = stmt.query_map([session_id], |row| Ok((row.get(0)?, row.get(1)?)))?;
+        Ok(rows.collect::<Result<_, _>>()?)
+    }
+
     pub fn vacuum(&self) -> Result<(), StoreError> {
         let conn = self.conn()?;
         conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE); VACUUM;")?;

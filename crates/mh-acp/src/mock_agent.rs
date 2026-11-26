@@ -108,29 +108,7 @@ pub async fn run_mock_acp_agent_stdio() {
                             "id": id,
                             "result": {
                                 "sessionId": sid,
-                                "configOptions": [
-                                    {
-                                        "id": "model",
-                                        "category": "model",
-                                        "name": "Model",
-                                        "currentValue": st.model,
-                                        "options": [
-                                            { "value": "mock-fast", "name": "Mock Fast" },
-                                            { "value": "mock-pro", "name": "Mock Pro" }
-                                        ]
-                                    },
-                                    {
-                                        "id": "reasoning_effort",
-                                        "category": "thought_level",
-                                        "name": "Reasoning Effort",
-                                        "currentValue": st.effort,
-                                        "options": [
-                                            { "value": "low", "name": "Low" },
-                                            { "value": "medium", "name": "Medium" },
-                                            { "value": "high", "name": "High" }
-                                        ]
-                                    }
-                                ]
+                                "configOptions": mock_config_options(&st.model, &st.effort)
                             }
                         }),
                     )
@@ -155,7 +133,14 @@ pub async fn run_mock_acp_agent_stdio() {
                     }
                 }
                 if let Some(id) = id {
-                    write_json(&stdout, json!({ "jsonrpc": "2.0", "id": id, "result": {} })).await;
+                    let state = state.lock().await;
+                    write_json(
+                        &stdout,
+                        json!({ "jsonrpc": "2.0", "id": id, "result": {
+                        "configOptions": mock_config_options(&state.model, &state.effort)
+                    } }),
+                    )
+                    .await;
                 }
             }
             "session/cancel" => {
@@ -185,6 +170,26 @@ pub async fn run_mock_acp_agent_stdio() {
             }
         }
     }
+}
+
+fn mock_config_options(model: &str, effort: &str) -> Value {
+    json!([
+        {
+            "id": "model", "category": "model", "name": "Model", "currentValue": model,
+            "options": [
+                { "value": "mock-fast", "name": "Mock Fast" },
+                { "value": "mock-pro", "name": "Mock Pro" }
+            ]
+        },
+        {
+            "id": "reasoning_effort", "category": "thought_level", "name": "Reasoning Effort", "currentValue": effort,
+            "options": [
+                { "value": "low", "name": "Low" },
+                { "value": "medium", "name": "Medium" },
+                { "value": "high", "name": "High" }
+            ]
+        }
+    ])
 }
 
 async fn handle_prompt(
@@ -265,6 +270,26 @@ async fn handle_prompt(
             .await;
         }
         return;
+    }
+
+    if directive_text.contains("[MOCK:CHILD_UPDATE]") {
+        let child_id = format!("{sid}-child");
+        for (id, used, size) in [(&sid, 17_000, 475_000), (&child_id, 100, 2_000)] {
+            write_json(
+                &stdout,
+                json!({"jsonrpc":"2.0", "method":"session/update", "params":{
+                    "sessionId": id, "update":{"sessionUpdate":"usage_update", "used":used, "size":size}
+                }}),
+            )
+            .await;
+        }
+        emit_update(
+            &stdout,
+            &child_id,
+            "agent_message_chunk",
+            json!({"type":"text","text":"Child-only content"}),
+        )
+        .await;
     }
 
     if directive_text.contains("[MOCK:429]") {

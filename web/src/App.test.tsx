@@ -10,6 +10,7 @@ import { MentionEditor, serializeMentionDom } from "./components/chat/MentionEdi
 import { MessageRow } from "./components/chat/MessageRow";
 import { DiffReviewModal } from "./components/modals/DiffReviewModal";
 import { FilePreviewModal } from "./components/modals/FilePreviewModal";
+import { MemoryModal } from "./components/modals/MemoryModal";
 import { SettingsDialog } from "./components/modals/SettingsDialog";
 import { PersonaModelFields } from "./components/modals/PersonaModelFields";
 import { Sidebar } from "./components/sidebar/Sidebar";
@@ -280,6 +281,20 @@ describe("UI primitives", () => {
     } }} />);
     expect(screen.getByText("Testing key-event text entry").tagName).toBe("STRONG");
     expect(screen.getByText("Next, run the check.")).toBeTruthy();
+  });
+
+  it.each([
+    "Run mcp_meta-harness-switch_chat_read_messages",
+    "mcp.meta-harness-switch.chat_read_messages",
+  ])("summarizes internal switch activity from %s", (title) => {
+    const [entry] = groupTrajectoryEvents([{
+      id: 1, turn_id: "turn", event_kind: "tool_call", created_at: 0,
+      payload: { title, status: "completed", rawInput: { limit: 40 } },
+    }]);
+    render(<TrajectoryRow entry={entry} actor="Orchestrator" />);
+    expect(screen.getByText("Orchestrator read group chat messages")).toBeTruthy();
+    expect(screen.queryByText(title)).toBeNull();
+    expect(screen.queryByText("Input")).toBeNull();
   });
 
   it("decodes per-terminal directory reports without interpreting other OSC notifications", () => {
@@ -650,6 +665,41 @@ describe("UI primitives", () => {
 
     fireEvent.click(screen.getByRole("button", { name: "Remove /plan" }));
     expect(onChange).toHaveBeenLastCalledWith(" @codex /diff");
+  });
+
+  it("opens project memory from a Quick Session without a harness or network request", () => {
+    const getMemory = vi.spyOn(api, "getMemory");
+    function QuickSessionComposer() {
+      const open = useAppStore((state) => state.memoryModalOpen);
+      return <><Composer />{open && <MemoryModal onClose={() => {}} />}</>;
+    }
+    render(<QuickSessionComposer />);
+    const textbox = screen.getByRole("textbox", { name: "Message group chat" });
+    textbox.textContent = "/memory";
+    fireEvent.input(textbox);
+    fireEvent.keyDown(textbox, { key: "Enter" });
+    expect(screen.getByRole("dialog", { name: "Project Memory" })).toBeTruthy();
+    expect(screen.getByText("Open a project to view its saved jobs and pinned notes.")).toBeTruthy();
+    expect(serializeMentionDom(textbox)).toBe("");
+    expect(getMemory).not.toHaveBeenCalled();
+  });
+
+  it("displays the harness-reported context with its own usage and limit", () => {
+    useAppStore.setState({ sessionContext: {
+      session_id: "s_quick",
+      members: [{
+        handle: "codex", adapter_id: "codex", model: "gpt-6.2-sol",
+        used_tokens: 17_000, context_window: 475_000, is_exact: true,
+        system_and_persona_tokens: 280, memory_and_telemetry_tokens: 80,
+        chat_history_tokens: 223, agent_and_tool_tokens: 10,
+      }],
+    } });
+    render(<Composer />);
+    fireEvent.click(screen.getByRole("button", { name: "Context usage" }));
+    expect(screen.getByText("17k / 475k")).toBeTruthy();
+    expect(screen.getByText("Harness context")).toBeTruthy();
+    expect(screen.getByText("Window reported by the harness")).toBeTruthy();
+    expect(screen.queryByText("System & Persona")).toBeNull();
   });
 
   it("follows mentions in the model menu and keeps effort overrides scoped to the recipient", async () => {
@@ -1039,6 +1089,8 @@ describe("UI primitives", () => {
     });
 
     fireEvent.click(screen.getByRole("button", { name: /Delete Archived Sessions/i }));
+    expect(api.cleanupStorage).not.toHaveBeenCalledWith("delete_archived");
+    fireEvent.click(screen.getByRole("button", { name: "Delete sessions" }));
     await waitFor(() => {
       expect(api.cleanupStorage).toHaveBeenCalledWith("delete_archived");
       expect(screen.getByText(/Deleted 2 archived sessions/)).toBeTruthy();

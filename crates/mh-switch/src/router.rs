@@ -2287,8 +2287,8 @@ impl SwitchEngine {
                     .or_else(|| catalog_model.map(|item| item.value.as_str())),
                 catalog.default_context_window,
             );
-            let (is_exact, used_tokens, context_window) = match live_usage {
-                Some((used, size)) => (true, used, size),
+            let (is_exact, used_tokens, context_window, model) = match live_usage {
+                Some((used, size, model)) => (true, used, size, model.or(effective_model)),
                 None => (
                     false,
                     system_and_persona_tokens
@@ -2296,13 +2296,14 @@ impl SwitchEngine {
                         + chat_history_tokens
                         + agent_and_tool_tokens,
                     context_default,
+                    effective_model,
                 ),
             };
 
             breakdowns.push(MemberContextBreakdown {
                 handle: m.handle,
                 adapter_id: m.adapter_id,
-                model: effective_model,
+                model,
                 used_tokens,
                 context_window,
                 is_exact,

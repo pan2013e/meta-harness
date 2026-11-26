@@ -64,7 +64,7 @@ pub struct AcpClient {
     pub acp_session_id: RwLock<Option<String>>,
     pub config_options: RwLock<Vec<DiscoveredConfigOption>>,
     session_defaults: RwLock<Vec<DiscoveredConfigOption>>,
-    pub latest_usage: RwLock<Option<(u64, u64)>>,
+    pub latest_usage: RwLock<Option<(u64, u64, Option<String>)>>,
     reader_task: tokio::task::JoinHandle<()>,
     coalescer_task: tokio::task::JoinHandle<()>,
 }
@@ -656,7 +656,16 @@ impl AcpClient {
         if method != "session/update" {
             return;
         }
-        let Some(update) = msg.get("params").and_then(|p| p.get("update")) else {
+        let Some(params) = msg.get("params") else {
+            return;
+        };
+        if let Some(reported_id) = params.get("sessionId").and_then(Value::as_str)
+            && let Some(active_id) = self.acp_session_id.read().await.as_deref()
+            && reported_id != active_id
+        {
+            return;
+        }
+        let Some(update) = params.get("update") else {
             return;
         };
         let kind = update
@@ -751,7 +760,13 @@ impl AcpClient {
                 if let (Some(u), Some(s)) = (used, size)
                     && s > 0
                 {
-                    *self.latest_usage.write().await = Some((u, s));
+                    let model = find_option_by_category_or_id(
+                        &self.config_options.read().await,
+                        &["model"],
+                        &["model"],
+                    )
+                    .and_then(|option| option.current_value.clone());
+                    *self.latest_usage.write().await = Some((u, s, model));
                 }
             }
             _ => {}

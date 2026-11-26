@@ -243,5 +243,28 @@ pub fn apply_migrations(conn: &Connection) -> Result<(), StoreError> {
          );
          INSERT OR IGNORE INTO schema_migrations (version) VALUES (4);",
     )?;
+    if current_ver < 5 {
+        conn.execute_batch(
+            "BEGIN;
+             CREATE TABLE session_harness_conversations (
+                 session_id     TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+                 adapter_id     TEXT NOT NULL,
+                 acp_session_id TEXT NOT NULL,
+                 PRIMARY KEY (session_id, adapter_id, acp_session_id)
+             );
+             INSERT OR IGNORE INTO session_harness_conversations
+                 SELECT session_id, adapter_id, acp_session_id FROM session_members
+                 WHERE acp_session_id IS NOT NULL;
+             CREATE TRIGGER track_harness_conversation
+             AFTER UPDATE OF acp_session_id ON session_members
+             WHEN NEW.acp_session_id IS NOT NULL AND NEW.acp_session_id IS NOT OLD.acp_session_id
+             BEGIN
+                 INSERT OR IGNORE INTO session_harness_conversations
+                     VALUES (NEW.session_id, NEW.adapter_id, NEW.acp_session_id);
+             END;
+             INSERT INTO schema_migrations (version) VALUES (5);
+             COMMIT;",
+        )?;
+    }
     Ok(())
 }

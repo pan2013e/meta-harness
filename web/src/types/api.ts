@@ -239,6 +239,7 @@ export interface StorageSummary {
 }
 
 export interface StorageCleanupResult {
+  harness_warnings?: string[];
   action: "clear_caches" | "delete_archived";
   removed_sessions: number;
   removed_dirs: number;

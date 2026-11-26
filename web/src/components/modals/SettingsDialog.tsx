@@ -45,6 +45,7 @@ export function SettingsDialog({ onClose }: { onClose: () => void }) {
   const [saving, setSaving] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [cleanupNotice, setCleanupNotice] = useState<string | null>(null);
+  const [confirmArchivedDelete, setConfirmArchivedDelete] = useState(false);
   const [showUninstalled, setShowUninstalled] = useState(false);
   const [buildInfo, setBuildInfo] = useState<Awaited<ReturnType<typeof api.buildInfo>> | null>(null);
 
@@ -141,6 +142,7 @@ export function SettingsDialog({ onClose }: { onClose: () => void }) {
         setCleanupNotice(
           `Deleted ${res.removed_sessions} archived sessions & ${res.removed_dirs} worktree dirs (freed ${formatBytes(res.freed_bytes)}).`
         );
+        if (res.harness_warnings?.length) setError(res.harness_warnings.join(" "));
       }
     } catch (cause) {
       setError(cause instanceof Error ? cause.message : String(cause));
@@ -409,7 +411,7 @@ export function SettingsDialog({ onClose }: { onClose: () => void }) {
                         disabled={
                           storageLoading || storageSummary.archived_sessions_count === 0
                         }
-                        onClick={() => void handleCleanup("delete_archived")}
+                        onClick={() => setConfirmArchivedDelete(true)}
                         className="inline-flex items-center gap-1.5 rounded-xl bg-neg-soft hover:bg-neg/20 border border-neg/30 px-3.5 py-2 text-xs font-medium text-neg disabled:opacity-40 transition-colors"
                       >
                         <Archive className="w-3.5 h-3.5" />
@@ -418,6 +420,25 @@ export function SettingsDialog({ onClose }: { onClose: () => void }) {
                         </span>
                       </button>
                     </div>
+                    {confirmArchivedDelete && (
+                      <div className="flex flex-wrap items-center justify-between gap-3 rounded-xl border border-neg/30 bg-neg-soft p-3">
+                        <p>Permanently delete the archived sessions and their linked conversations in supported harnesses?</p>
+                        <div className="flex gap-2">
+                          <button type="button" onClick={() => setConfirmArchivedDelete(false)} className="rounded-lg px-3 py-1.5 hover:bg-hover">Cancel</button>
+                          <button
+                            type="button"
+                            disabled={storageLoading || storageSummary.archived_sessions_count === 0}
+                            onClick={() => {
+                              setConfirmArchivedDelete(false);
+                              void handleCleanup("delete_archived");
+                            }}
+                            className="rounded-lg bg-neg px-3 py-1.5 font-medium text-white disabled:opacity-40"
+                          >
+                            Delete sessions
+                          </button>
+                        </div>
+                      </div>
+                    )}
                   </>
                 ) : (
                   <div className="rounded-xl border border-line bg-inset p-6 text-center text-ink-muted">

@@ -22,6 +22,35 @@ export interface ToolEntry {
 
 export type TrajectoryEntry = ToolEntry | { type: "event"; key: string; event: TrajectoryEvent };
 
+const switchActions: Record<string, [action: string, completed: string]> = {
+  chat_list_peers: ["list group members", "listed group members"],
+  chat_read_messages: ["read group chat messages", "read group chat messages"],
+  chat_send_message: ["send a group message", "sent a group message"],
+  peer_consult: ["consult another agent", "consulted another agent"],
+  trajectory_list: ["list agent activity", "listed agent activity"],
+  trajectory_read: ["review an agent's activity", "reviewed an agent's activity"],
+  memory_recall: ["look up project memory", "looked up project memory"],
+  memory_record_fact: ["save a project note", "saved a project note"],
+  quota_get_status: ["check subscription usage", "checked subscription usage"],
+  models_list_catalog: ["check available models", "checked available models"],
+  orchestrator_dispatch: ["request a task handoff", "requested a task handoff"],
+  memory_curate_job: ["save a job summary", "saved a job summary"],
+};
+
+export function switchToolLabel(entry: ToolEntry, actor?: string): string | undefined {
+  const switchName = /^(?:Run\s+)?(?:mcp_meta-harness-switch_|mcp__meta-harness-switch__|mcp\.meta-harness-switch\.|meta-harness-switch\/)([a-z][a-z_]+)$/i;
+  const name = (switchName.exec(entry.name ?? "")?.[1] ?? switchName.exec(entry.title ?? "")?.[1])?.toLowerCase();
+  if (!name) return;
+  const [action, completed] = Object.hasOwn(switchActions, name) ? switchActions[name] : ["use group tools", "used group tools"];
+  if (entry.status === "completed") return actor ? `${actor} ${completed}` : capitalize(completed);
+  if (entry.status === "failed") return `Couldn’t ${action}`;
+  return capitalize(action);
+}
+
+function capitalize(text: string) {
+  return text.charAt(0).toUpperCase() + text.slice(1);
+}
+
 export const asRecord = (value: unknown): Record<string, unknown> =>
   value && typeof value === "object" && !Array.isArray(value) ? value as Record<string, unknown> : {};
 

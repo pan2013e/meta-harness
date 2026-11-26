@@ -245,10 +245,10 @@ HTML preview documents can load local styles, scripts, and other relative assets
 
 ### 7.3 Workspace UI
 
-- The left sidebar lists projects, Quick Sessions, active sessions, and archived sessions. `Ctrl+B` collapses it. Session deletion uses an in-app confirmation dialog.
+- The left sidebar lists projects, Quick Sessions, active sessions, and archived sessions. `Ctrl+B` collapses it. Session deletion uses an in-app confirmation dialog. Archive, restore, and deletion (including archived-session cleanup) act on linked conversations in their original profiles through Codex App Server and compatible Claude Code ACP versions. Claude adapters that advertise the AIR archive extension use its archived-title convention. Harnesses without supported lifecycle operations keep their own histories and the UI reports this.
 - The session header shows the orchestrator and opens diff review, shell, promotion, and project memory when applicable. Hiding the shell preserves its PTY. File links open in-page previews for HTML, images, PDFs, and source code. Source previews use read-only Monaco.
-- Chat renders Markdown, right-aligned user messages, dispatch and approval cards, consult threads, and inline turn activity. Trajectory tool updates and terminal chunks group under the corresponding tool call.
-- The composer offers mention and slash-command autocomplete, a per-recipient model and reasoning-effort menu, context and subscription meters, and Worktree, Strict, and Auto approval modes.
+- Chat renders Markdown, right-aligned user messages, dispatch and approval cards, consult threads, and inline turn activity. Trajectory tool updates and terminal chunks group under the corresponding tool call. The timeline summarizes Meta-Harness switch calls in plain language. Native harness subagents can appear in the parent turn's tool activity. Separate ACP child-session updates do not contribute to the parent transcript or context totals.
+- The composer offers mention and slash-command autocomplete, a per-recipient model and reasoning-effort menu, context and subscription meters, and Worktree, Strict, and Auto approval modes. Context shows the harness-reported total and window when available or an estimated Meta-Harness breakdown. `/memory` opens Project Memory, with an empty state for Quick Sessions.
 - Startup shows connection and harness checks first. Model, quota, and workspace lookups can finish with progress indicators while the main UI is available.
 - Settings contains Appearance, Harnesses & Models, Global Personas, Session, Storage & Data, and About. The browser persists theme selection in local storage.
 

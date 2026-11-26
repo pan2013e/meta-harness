@@ -231,6 +231,7 @@ export const MessageRow = memo(function MessageRow({ message, consultReplies }: 
               streaming={streaming}
               waitingForApproval={waitingForApproval}
               intermediateNotes={intermediateNotes}
+              actor={message.sender_kind === "orchestrator" ? "Orchestrator" : `@${message.sender_id}`}
             />
           )}
 

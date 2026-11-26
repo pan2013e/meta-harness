@@ -17,13 +17,16 @@ pub fn store_profile_session(profile: Option<&Path>, id: &str) -> String {
 }
 
 pub fn resume_profile_session(profile: Option<&Path>, stored: &str) -> Option<String> {
-    match (profile, stored.strip_prefix(PROFILE_SESSION_PREFIX)) {
-        (None, None) => Some(stored.to_string()),
-        (Some(profile), Some(reference)) => {
-            let (previous, id): (PathBuf, String) = serde_json::from_str(reference).ok()?;
-            (previous == profile).then_some(id)
-        }
-        _ => None,
+    let (previous, id) = stored_profile_session(stored)?;
+    (previous.as_deref() == profile).then_some(id)
+}
+
+pub(crate) fn stored_profile_session(stored: &str) -> Option<(Option<PathBuf>, String)> {
+    if let Some(reference) = stored.strip_prefix(PROFILE_SESSION_PREFIX) {
+        let (profile, id): (PathBuf, String) = serde_json::from_str(reference).ok()?;
+        Some((Some(profile), id))
+    } else {
+        Some((None, stored.to_string()))
     }
 }
 

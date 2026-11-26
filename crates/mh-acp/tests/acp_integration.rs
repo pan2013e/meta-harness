@@ -138,7 +138,7 @@ async fn acp_config_options_diff_capture_and_cancel() {
         .client
         .prompt(
             "turn_1",
-            "[MOCK:WRITE path=\"src/main.rs\" content=\"fn main() {}\\n\"]",
+            "[MOCK:CHILD_UPDATE] [MOCK:WRITE path=\"src/main.rs\" content=\"fn main() {}\\n\"]",
             listener.clone(),
         )
         .await
@@ -146,6 +146,11 @@ async fn acp_config_options_diff_capture_and_cancel() {
     *managed.active_turn_id.write().await = None;
 
     assert!(output.final_text.contains("mock-pro:high"));
+    assert!(!output.final_text.contains("Child-only content"));
+    assert_eq!(
+        sup.get_latest_usage("s_acp", "mock").await,
+        Some((17_000, 475_000, Some("mock-pro".into())))
+    );
     assert!(wt.join("src/main.rs").exists());
     assert!(
         cb.events

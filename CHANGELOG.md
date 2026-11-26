@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+## 0.4.0
+
+- Archive, restore, and delete linked Codex and compatible Claude Code conversations in their original profiles. Preserve conversation references across context resets and profile changes, and report when a harness keeps its own history.
+- Distinguish harness-reported context usage from estimates and use the reported window for the active model.
+- Open Project Memory with `/memory` even when a Quick Session or no harness is active.
+- Summarize internal switch calls in the activity timeline and keep native child-session updates separate from the parent turn.
+- Add an illustrated usage guide and a README walkthrough of multi-agent collaboration.
+
 ## 0.3.0
 
 - Route leading recipient lists directly and resolve ambiguous inline references with a hidden orchestrator pass.

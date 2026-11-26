@@ -1,11 +1,23 @@
 import { memo } from "react";
-import { ChevronRight, FileCode, ListChecks, Terminal, Wrench } from "lucide-react";
+import { ChevronRight, FileCode, ListChecks, Network, Terminal, Wrench } from "lucide-react";
 import { DiffViewer } from "../common/DiffViewer";
 import { MarkdownBlock } from "../common/MarkdownBlock";
-import { asRecord, type TrajectoryEntry } from "./trajectory";
+import { asRecord, switchToolLabel, type TrajectoryEntry } from "./trajectory";
 
-export const TrajectoryRow = memo(function TrajectoryRow({ entry, sessionId }: { entry: TrajectoryEntry; sessionId?: string }) {
+export const TrajectoryRow = memo(function TrajectoryRow({ entry, sessionId, actor }: { entry: TrajectoryEntry; sessionId?: string; actor?: string }) {
   if (entry.type === "tool") {
+    const activity = switchToolLabel(entry, actor);
+    if (activity) {
+      return (
+        <div className="flex items-center gap-2 rounded-xl border border-line bg-elevated/40 px-3 py-2.5 text-xs">
+          <Network size={15} aria-hidden="true" className="shrink-0 text-brand-ink" />
+          <span className={`flex-1 font-medium ${entry.status === "failed" ? "text-neg" : ""}`}>{activity}</span>
+          {entry.status && entry.status !== "failed" && entry.status !== "completed" && (
+            <span className="shrink-0 capitalize text-ink-muted">{entry.status.replaceAll("_", " ")}</span>
+          )}
+        </div>
+      );
+    }
     const terminal = entry.category === "execute" || entry.exitCode != null || !!entry.output;
     const Icon = terminal ? Terminal : entry.edits.length ? FileCode : Wrench;
     const status = entry.exitCode != null ? `Exit ${entry.exitCode}` : entry.status?.replaceAll("_", " ");

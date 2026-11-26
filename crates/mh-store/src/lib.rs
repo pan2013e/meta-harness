@@ -102,6 +102,24 @@ mod tests {
             })
             .unwrap();
 
+        for thread in ["thread-a", "thread-b", "thread-b"] {
+            store
+                .update_member_runtime(&sess.id, "codex", Some(thread), None, None)
+                .unwrap();
+        }
+        store.clear_session_acp_ids(&sess.id).unwrap();
+        assert_eq!(
+            store.get_member(&sess.id, "codex").unwrap().acp_session_id,
+            None
+        );
+        assert_eq!(
+            store.list_harness_conversations(&sess.id).unwrap(),
+            vec![
+                ("codex".into(), "thread-a".into()),
+                ("codex".into(), "thread-b".into()),
+            ]
+        );
+
         let m1 = store
             .append_message(NewMessageParams {
                 id: None,

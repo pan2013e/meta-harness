@@ -12,6 +12,7 @@ use axum::{
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
+use mh_acp::supervisor::{HarnessConversationAction, update_harness_conversations};
 use mh_acp::{
     checkpoint_session_worktrees, commit_worktree_if_dirty, ensure_session_integration_worktree,
     get_session_diff, init_git_repo, inspect_repo, probe_installed_adapters, promote_session,
@@ -958,7 +959,6 @@ pub async fn patch_session(
                     format!("Could not archive the session: {error}"),
                 ));
             }
-            let _ = state.switch.store.clear_session_acp_ids(&session_id);
             let now_ms = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap_or_default()
@@ -1011,16 +1011,87 @@ pub async fn patch_session(
             archived_at: archived_at_patch,
         },
     );
-    if matches!(archived_at_patch, Some(None)) && patched.is_ok()
-        || matches!(archived_at_patch, Some(Some(_))) && patched.is_err()
-    {
+    if matches!(archived_at_patch, Some(Some(_))) && patched.is_err() {
         state.switch.supervisor.reopen_session(&session_id).await;
     }
     let sess = patched.map_err(|error| err_resp(StatusCode::BAD_REQUEST, error.to_string()))?;
+    let harness_warnings = match archived_at_patch {
+        Some(Some(_)) => {
+            sync_harness_conversations(&state, &session_id, HarnessConversationAction::Archive)
+                .await
+        }
+        Some(None) => {
+            let warnings =
+                sync_harness_conversations(&state, &session_id, HarnessConversationAction::Restore)
+                    .await;
+            state.switch.supervisor.reopen_session(&session_id).await;
+            warnings
+        }
+        None => Vec::new(),
+    };
     let _ = state.switch.events_tx.send(WsEvent::SessionUpdated {
         session: sess.clone(),
     });
-    Ok(Json(json!({ "session": sess })))
+    Ok(Json(
+        json!({ "session": sess, "harness_warnings": harness_warnings }),
+    ))
+}
+
+async fn sync_harness_conversations(
+    state: &AppState,
+    session_id: &str,
+    action: HarnessConversationAction,
+) -> Vec<String> {
+    let verb = match action {
+        HarnessConversationAction::Archive => "archive",
+        HarnessConversationAction::Restore => "restore",
+        HarnessConversationAction::Delete => "delete",
+    };
+    let references = match state.switch.store.list_harness_conversations(session_id) {
+        Ok(references) => references,
+        Err(error) => {
+            tracing::warn!(%error, session_id, "Could not load recorded harness conversations");
+            return vec![format!(
+                "Couldn’t find the harness conversations to {verb}."
+            )];
+        }
+    };
+    let mut by_adapter = std::collections::BTreeMap::<_, Vec<_>>::new();
+    for (adapter, reference) in references {
+        by_adapter.entry(adapter).or_default().push(reference);
+    }
+    let adapters = state.switch.config.read().await.adapters.clone();
+    let mut warnings = Vec::new();
+    for (id, references) in by_adapter {
+        let Some(adapter) = adapters.get(&id) else {
+            warnings.push(format!("Couldn’t {verb} conversations for @{id}."));
+            continue;
+        };
+        if matches!(
+            adapter.quota_provider.as_str(),
+            "codex_local" | "claude_local"
+        ) {
+            let _activity = state
+                .switch
+                .supervisor
+                .adapter_activity(&id)
+                .await
+                .read_owned()
+                .await;
+            if !update_harness_conversations(adapter, action, &references).await {
+                warnings.push(format!(
+                    "{} couldn’t {verb} all linked conversations.",
+                    adapter.display_name
+                ));
+            }
+        } else {
+            warnings.push(format!(
+                "{} keeps its own conversation history.",
+                adapter.display_name
+            ));
+        }
+    }
+    warnings
 }
 
 #[derive(Debug, Deserialize)]
@@ -1109,33 +1180,58 @@ pub async fn delete_session(
     State(state): State<AppState>,
     AxumPath(session_id): AxumPath<String>,
 ) -> ApiResult<Value> {
+    let runtime = state.switch.runtime(&session_id).await;
+    let _lifecycle = runtime.lifecycle_lock.lock().await;
     let sess = state
         .switch
         .store
         .get_session(&session_id)
         .map_err(|e| err_resp(StatusCode::NOT_FOUND, e.to_string()))?;
 
-    state.switch.cancel_all_in_session(&session_id).await;
-    state.switch.supervisor.shutdown_session(&session_id).await;
-    if let Ok(repo_root) = state.switch.resolve_session_repo_root(&sess) {
-        let _ = prune_session_worktrees(&repo_root, &session_id).await;
-        if sess.project_id.is_none() {
-            for attempt in 0..4 {
-                if tokio::fs::remove_dir_all(&repo_root).await.is_ok() || !repo_root.exists() {
-                    break;
+    let (_, harness_warnings) = remove_session(&state, &sess).await?;
+    Ok(Json(
+        json!({ "deleted": true, "harness_warnings": harness_warnings }),
+    ))
+}
+
+async fn remove_session(
+    state: &AppState,
+    session: &Session,
+) -> Result<(bool, Vec<String>), (StatusCode, Json<Value>)> {
+    let session_id = &session.id;
+    state.switch.cancel_all_in_session(session_id).await;
+    state.switch.supervisor.shutdown_session(session_id).await;
+    let warnings =
+        sync_harness_conversations(state, session_id, HarnessConversationAction::Delete).await;
+    let removed_checkout = match state.switch.resolve_session_repo_root(session) {
+        Ok(repo_root) => {
+            let pruned = prune_session_worktrees(&repo_root, session_id)
+                .await
+                .is_ok();
+            if session.project_id.is_none() {
+                let mut removed = false;
+                for attempt in 0..4 {
+                    if tokio::fs::remove_dir_all(&repo_root).await.is_ok() || !repo_root.exists() {
+                        removed = true;
+                        break;
+                    }
+                    if attempt < 3 {
+                        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                    }
                 }
-                if attempt < 3 {
-                    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-                }
+                removed
+            } else {
+                pruned
             }
         }
-    }
+        Err(_) => false,
+    };
     state
         .switch
         .store
-        .delete_session(&session_id)
+        .delete_session(session_id)
         .map_err(|e| err_resp(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-    Ok(Json(json!({ "deleted": true })))
+    Ok((removed_checkout, warnings))
 }
 
 pub async fn upsert_session_member(
@@ -2005,6 +2101,7 @@ pub async fn cleanup_storage_handler(
     let before = compute_storage_summary(&state.switch).await;
     let mut removed_sessions = 0usize;
     let mut removed_dirs = 0usize;
+    let mut harness_warnings = std::collections::BTreeSet::new();
 
     if action == "clear_caches" {
         let all_ids: std::collections::HashSet<String> = state
@@ -2065,32 +2162,22 @@ pub async fn cleanup_storage_handler(
         let archived = state
             .switch
             .store
-            .delete_archived_sessions()
+            .list_all_sessions(true)
             .map_err(|e| err_resp(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-        removed_sessions = archived.len();
-        for sess in &archived {
-            state.switch.supervisor.shutdown_session(&sess.id).await;
-            if let Some(ref pid) = sess.project_id {
-                if let Ok(proj) = state.switch.store.get_project(pid)
-                    && prune_session_worktrees(Path::new(&proj.root_path), &sess.id)
-                        .await
-                        .is_ok()
-                {
-                    removed_dirs += 1;
-                }
-            } else {
-                let ws_root = state.switch.app_paths.standalone_session_root(&sess.id);
-                if ws_root.exists() {
-                    for attempt in 0..4 {
-                        if tokio::fs::remove_dir_all(&ws_root).await.is_ok() || !ws_root.exists() {
-                            removed_dirs += 1;
-                            break;
-                        }
-                        if attempt < 3 {
-                            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-                        }
-                    }
-                }
+        for session in archived
+            .iter()
+            .filter(|session| session.archived_at.is_some())
+        {
+            let runtime = state.switch.runtime(&session.id).await;
+            let _lifecycle = runtime.lifecycle_lock.lock().await;
+            let Ok(session) = state.switch.store.get_session(&session.id) else {
+                continue;
+            };
+            if session.archived_at.is_some() {
+                let (removed_checkout, warnings) = remove_session(&state, &session).await?;
+                removed_sessions += 1;
+                removed_dirs += usize::from(removed_checkout);
+                harness_warnings.extend(warnings);
             }
         }
         let _ = state.switch.store.vacuum();
@@ -2104,6 +2191,7 @@ pub async fn cleanup_storage_handler(
             "removed_sessions": removed_sessions,
             "removed_dirs": removed_dirs,
             "freed_bytes": freed_bytes,
+            "harness_warnings": harness_warnings,
         },
         "storage": after,
     })))

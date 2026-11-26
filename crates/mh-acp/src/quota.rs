@@ -87,6 +87,7 @@ struct LiveProbeOutcome {
     windows: Vec<QuotaWindow>,
     credits_label: Option<String>,
     status_note: Option<String>,
+    shared_profile_usage: bool,
     source: Option<QuotaSource>,
     rate_limited_until: Option<i64>,
 }
@@ -356,6 +357,7 @@ impl QuotaTracker {
                 }],
                 credits_label: None,
                 status_note: Some("429 cooldown active".into()),
+                shared_profile_usage: false,
                 updated_at: now,
             };
         }
@@ -457,6 +459,7 @@ impl QuotaTracker {
             windows: outcome.windows,
             credits_label: outcome.credits_label,
             status_note: outcome.status_note,
+            shared_profile_usage: outcome.shared_profile_usage,
             updated_at: now,
         }
     }
@@ -521,6 +524,7 @@ impl QuotaTracker {
             windows,
             credits_label: None,
             status_note: None,
+            shared_profile_usage: false,
             updated_at: now,
         }
     }
@@ -1087,15 +1091,7 @@ async fn probe_google_live(
             .map(|p| p.to_string_lossy().into_owned())
     });
     if let Some(command) = executable.as_deref().filter(|command| is_agy(command)) {
-        let credentials = has_google_cli_auth(profile, true);
-        if profile.is_some() {
-            return (LiveProbeOutcome {
-                plan_label: credentials.then(|| "Google Account".into()),
-                status_note: Some("Antigravity's usage command reads the shared CLI profile; private-profile quota is unavailable".into()),
-                source: Some(QuotaSource::Unavailable),
-                ..Default::default()
-            }, LIVE_QUOTA_CACHE_TTL_MS);
-        }
+        let credentials = has_google_cli_auth(None, true);
         let windows = if credentials {
             crate::antigravity::run_agy(command, None, &["-p", "/usage", "--print-timeout", "12s"])
                 .await
@@ -1124,6 +1120,7 @@ async fn probe_google_live(
                     windows,
                     source: Some(QuotaSource::LiveProbe),
                     status_note: Some("Live · Antigravity CLI".into()),
+                    shared_profile_usage: profile.is_some(),
                     ..Default::default()
                 },
                 LIVE_QUOTA_CACHE_TTL_MS,
@@ -1134,9 +1131,9 @@ async fn probe_google_live(
                 plan_label: credentials.then(|| "Google Account".into()),
                 status_note: Some(
                     if credentials {
-                        "Antigravity CLI usage is unavailable"
+                        "Shared Antigravity CLI usage is unavailable"
                     } else {
-                        "Antigravity sign-in status unavailable"
+                        "Sign in to the shared Antigravity CLI for usage"
                     }
                     .into(),
                 ),

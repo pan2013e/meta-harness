@@ -17,10 +17,9 @@ import {
 } from "lucide-react";
 import { api } from "../../api/client";
 import { useAppStore } from "../../store/useAppStore";
-import type { PermissionPolicy } from "../../types/api";
 import { HarnessAvatar, QuotaSnapshotSummary, THEMES } from "../common/Badges";
+import { APPROVAL_MODES } from "../common/approvalModes";
 import { HarnessMaintenance } from "./HarnessMaintenance";
-import { SharedAntigravityUsage } from "./SharedAntigravityUsage";
 import { PersonaModelFields, type PersonaModel } from "./PersonaModelFields";
 import { GlobalPersonas } from "./GlobalPersonas";
 import { SettingsBackup } from "./SettingsBackup";
@@ -37,28 +36,6 @@ function formatBytes(bytes: number): string {
   }
   return `${idx === 0 ? val.toFixed(0) : val.toFixed(val >= 10 ? 1 : 2)} ${units[idx]}`;
 }
-
-const PERMISSION_OPTIONS: Array<{
-  value: PermissionPolicy;
-  label: string;
-  desc: string;
-}> = [
-  {
-    value: "worktree_smart",
-    label: "Worktree",
-    desc: "Auto-allow reads/writes inside worktree; prompt shell commands",
-  },
-  {
-    value: "strict",
-    label: "Strict",
-    desc: "Prompt all file edits and shell executions",
-  },
-  {
-    value: "autonomous_sandbox",
-    label: "Auto",
-    desc: "Auto-allow local worktree & non-destructive tools",
-  },
-];
 
 export function SettingsDialog({ onClose }: { onClose: () => void }) {
   const dialog = useRef<HTMLDialogElement>(null);
@@ -593,10 +570,9 @@ export function SettingsDialog({ onClose }: { onClose: () => void }) {
                           offersSignIn={["codex_local", "claude_local"].includes(adapter?.quota_provider ?? "") || isAntigravityCli}
                         />
 
-                        {(quota || (isAntigravityCli && adapter?.profile_dir)) && (
+                        {quota && (
                           <div className="border-t border-line pt-3">
-                            {quota && <QuotaSnapshotSummary quota={quota} />}
-                            {isAntigravityCli && adapter?.profile_dir && <SharedAntigravityUsage adapterId={probe.adapter_id} />}
+                            <QuotaSnapshotSummary quota={quota} />
                           </div>
                         )}
 
@@ -861,15 +837,15 @@ export function SettingsDialog({ onClose }: { onClose: () => void }) {
                         Permissions &amp; Loop Guard
                       </h2>
                       <div className="space-y-1.5">
-                        {PERMISSION_OPTIONS.map((opt) => {
-                          const active = activeSession.permission_policy === opt.value;
+                        {APPROVAL_MODES.map(({ value, label, description, Icon, color }) => {
+                          const active = activeSession.permission_policy === value;
                           return (
                             <button
-                              key={opt.value}
+                              key={value}
                               type="button"
                               onClick={async () => {
                                 await api.patchSession(activeSession.id, {
-                                  permission_policy: opt.value,
+                                  permission_policy: value,
                                 });
                                 await selectSession(activeSession.id);
                               }}
@@ -879,8 +855,11 @@ export function SettingsDialog({ onClose }: { onClose: () => void }) {
                                   : "bg-inset border-line text-ink-soft hover:bg-hover"
                               }`}
                             >
-                              <div className="font-medium text-ink">{opt.label}</div>
-                              <div className="text-[11px] text-ink-muted">{opt.desc}</div>
+                              <div className="flex items-center gap-1.5 font-medium text-ink">
+                                <Icon aria-hidden="true" className={`h-3.5 w-3.5 ${color}`} />
+                                {label}
+                              </div>
+                              <div className="text-[11px] text-ink-muted">{description}</div>
                             </button>
                           );
                         })}

@@ -13,7 +13,7 @@ import { useAppStore } from "../../store/useAppStore";
 import type { ChatMessage, DispatchTaskSpec, PendingPermissionView } from "../../types/api";
 import { HarnessAvatar } from "../common/Badges";
 import { MarkdownBlock } from "../common/MarkdownBlock";
-import { TurnActivityTimeline } from "./TurnActivityTimeline";
+import { TurnActivityTimeline, WaitingForTurn } from "./TurnActivityTimeline";
 
 interface Props {
   message: ChatMessage;
@@ -26,6 +26,14 @@ export const MessageRow = memo(function MessageRow({ message, consultReplies }: 
     return (member && state.adapters[member.adapter_id]?.accent_color) || "#6366f1";
   });
   const [consultExpanded, setConsultExpanded] = useState(false);
+  const streaming = message.metadata.streaming === true;
+  const waitingForApproval = useAppStore((state) =>
+    streaming && state.pendingPermissions.some((prompt) =>
+      prompt.session_id === message.session_id &&
+      prompt.member_handle === message.sender_id &&
+      (prompt.turn_id === null || prompt.turn_id === message.turn_id)
+    )
+  );
 
   if (message.kind === "activity_pill") {
     return (
@@ -162,7 +170,6 @@ export const MessageRow = memo(function MessageRow({ message, consultReplies }: 
   const isUser = message.sender_kind === "user";
   const model = typeof message.metadata.model === "string" ? message.metadata.model : null;
   const effort = typeof message.metadata.effort === "string" ? message.metadata.effort : null;
-  const streaming = message.metadata.streaming === true;
   const intermediateNotes = Array.isArray(message.metadata.intermediate_notes)
     ? message.metadata.intermediate_notes.filter((x): x is string => typeof x === "string")
     : [];
@@ -222,13 +229,18 @@ export const MessageRow = memo(function MessageRow({ message, consultReplies }: 
               turnId={message.turn_id}
               sessionId={message.session_id}
               streaming={streaming}
+              waitingForApproval={waitingForApproval}
               intermediateNotes={intermediateNotes}
             />
           )}
 
-          {(message.content || streaming) && (
+          {!message.turn_id && streaming && !message.content.trim() && (
+            <WaitingForTurn waitingForApproval={waitingForApproval} />
+          )}
+
+          {message.content.trim() && (
             <MarkdownBlock
-              content={message.content || "_Thinking..._"}
+              content={message.content}
               sessionId={message.session_id}
             />
           )}

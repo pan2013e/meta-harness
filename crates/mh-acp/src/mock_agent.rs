@@ -92,7 +92,7 @@ pub async fn run_mock_acp_agent_stdio() {
                     .get("sessionId")
                     .and_then(|v| v.as_str())
                     .map(str::to_string)
-                    .unwrap_or_else(|| "mock_sess_1".into());
+                    .unwrap_or_else(|| format!("mock_{}", uuid::Uuid::new_v4().simple()));
                 {
                     let mut st = state.lock().await;
                     st.cwd = cwd;
@@ -222,23 +222,35 @@ async fn handle_prompt(
 
     let directive_text = strip_context_blocks(&prompt_text);
 
-    if prompt_text.contains("<session_title_request>") {
-        let user_line = prompt_text
-            .lines()
-            .rev()
-            .find(|l| !l.trim().is_empty() && !l.trim_start().starts_with('<'))
-            .unwrap_or("Mock Session");
-        let words: Vec<&str> = user_line.split_whitespace().take(4).collect();
-        let title = if words.is_empty() {
-            "Mock Session Title".to_string()
+    let routing = prompt_text.contains("<recipient_routing_request>");
+    if routing || prompt_text.contains("<session_title_request>") {
+        let reply = if routing {
+            let input = prompt_text
+                .lines()
+                .find_map(|line| serde_json::from_str::<Value>(line).ok());
+            let recipient = input
+                .as_ref()
+                .and_then(|input| input.get("candidates")?.as_array()?.last())
+                .and_then(Value::as_str);
+            json!({ "recipients": recipient.into_iter().collect::<Vec<_>>() }).to_string()
         } else {
-            words.join(" ")
+            let user_line = prompt_text
+                .lines()
+                .rev()
+                .find(|line| !line.trim().is_empty() && !line.trim_start().starts_with('<'))
+                .unwrap_or("Mock Session");
+            let words: Vec<&str> = user_line.split_whitespace().take(4).collect();
+            if words.is_empty() {
+                "Mock Session Title".to_string()
+            } else {
+                words.join(" ")
+            }
         };
         emit_update(
             &stdout,
             &sid,
             "agent_message_chunk",
-            json!({ "type": "text", "text": title }),
+            json!({ "type": "text", "text": reply }),
         )
         .await;
         if let Some(id) = id {
@@ -272,8 +284,13 @@ async fn handle_prompt(
 
     if let Some(ms_str) = extract_tag_attr(&directive_text, "[MOCK:SLEEP", "ms") {
         let ms: u64 = ms_str.parse().unwrap_or(2000);
+        let gate =
+            extract_tag_attr(&directive_text, "[MOCK:SLEEP", "until").map(|path| cwd.join(path));
         let steps = (ms / 25).max(1);
         for _ in 0..steps {
+            if gate.as_ref().is_some_and(|path| path.is_file()) {
+                break;
+            }
             if state.lock().await.cancel_requested {
                 if let Some(id) = id {
                     write_json(
@@ -381,13 +398,43 @@ async fn handle_prompt(
     if let Some(tool) = extract_tag_attr(&directive_text, "[MOCK:MCP", "tool") {
         let args_json = extract_tag_json(&directive_text, "[MOCK:MCP", "args").unwrap_or(json!({}));
         if let Some(spec) = mcp_spec.as_ref() {
-            match invoke_mcp_bridge(spec, &cwd, &tool, args_json).await {
-                Ok(res) => {
-                    reply = format!("MCP {tool} ok: {res}");
+            let allowed = if extract_tag_attr(&directive_text, "[MOCK:MCP", "permission").as_deref()
+                == Some("required")
+            {
+                let server = spec["name"].as_str().unwrap_or_default();
+                let name = format!("mcp_{server}_{tool}");
+                let response = call_client(
+                    &stdout,
+                    &req_seq,
+                    &pending_calls,
+                    "session/request_permission",
+                    json!({
+                        "sessionId": sid,
+                        "toolCall": {
+                            "name": name,
+                            "kind": "other",
+                            "title": format!("Run {name}"),
+                            "rawInput": &args_json,
+                        },
+                        "options": [
+                            {"optionId": "always", "kind": "allow_always"},
+                            {"optionId": "once", "kind": "allow_once"},
+                            {"optionId": "reject", "kind": "reject_once"}
+                        ],
+                    }),
+                )
+                .await;
+                response["result"]["outcome"]["optionId"] == "once"
+            } else {
+                true
+            };
+            if allowed {
+                match invoke_mcp_bridge(spec, &cwd, &tool, args_json).await {
+                    Ok(res) => reply = format!("MCP {tool} ok: {res}"),
+                    Err(e) => reply = format!("MCP {tool} err: {e}"),
                 }
-                Err(e) => {
-                    reply = format!("MCP {tool} err: {e}");
-                }
+            } else {
+                reply = format!("MCP {tool} permission declined");
             }
         }
     }
@@ -694,11 +741,17 @@ fn extract_tag_attr(text: &str, tag: &str, attr: &str) -> Option<String> {
 
 fn extract_tag_json(text: &str, tag: &str, attr: &str) -> Option<Value> {
     let start = text.find(tag)?;
-    let slice = &text[start..];
-    let end = slice.find(']')?;
-    let body = &slice[tag.len()..end];
+    let body = &text[start + tag.len()..];
     let key = format!("{attr}=");
     let k_pos = body.find(&key)?;
-    let rest = body[k_pos + key.len()..].trim();
-    serde_json::from_str(rest).ok()
+    if body[..k_pos].contains(']') {
+        return None;
+    }
+    let rest = body[k_pos + key.len()..].trim_start();
+    let mut values = serde_json::Deserializer::from_str(rest).into_iter::<Value>();
+    let value = values.next()?.ok()?;
+    rest[values.byte_offset()..]
+        .trim_start()
+        .starts_with(']')
+        .then_some(value)
 }

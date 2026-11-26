@@ -257,6 +257,12 @@ export function QuotaSnapshotSummary({
         />
       ))}
 
+      {quota.shared_profile_usage && (
+        <p className="text-[10px] leading-snug text-ink-muted">
+          Shared CLI usage may differ from this private profile.
+        </p>
+      )}
+
       {windows.length === 0 && !isCooldown && (
         <div className="text-[10px] text-ink-muted flex items-center justify-between gap-2 py-0.5">
           <span className="truncate">

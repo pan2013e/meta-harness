@@ -27,7 +27,7 @@ Every design decision must uphold these core specifications (finalized during de
      - **Peer Trajectory Inspection** (`trajectory_list` / `trajectory_read`).
    - **UI Visibility**: Peer messages and consults appear in main Group Chat (with `peer_consult` styled as compact collapsible threads), while `trajectory_read` calls appear as subtle inline activity pills (`@claude read @codex's trajectory`).
 4. **`@mention` Routing + Autonomous Quota-Aware Orchestrator**:
-   - Explicit `@<handle>` messages (outside code blocks/spans) route directly to those members.
+   - A leading `@<handle>` recipient list routes directly to those members. Keep body mentions in the instruction. Ambiguous inline references may use a short, hidden orchestrator pass constrained to the mentioned session members.
    - Unmentioned messages route to the available orchestrator, with a fallback to an available member. The orchestrator can answer directly or dispatch to available targets. Honor `confirm_before_dispatch` when set via the session API. The composer exposes `/plan` for planning requests and per-recipient model and effort choices.
    - Built-in adapters prefer live provider quota probes by default. Honor saved adapter preferences, shared quota pools, cooldowns, and manual calibration. Display unavailable quota windows when the provider supplies no usable data.
 5. **Orchestrator-Curated High-Level Episodic Memory**:
@@ -142,5 +142,7 @@ The Electron launcher lives in `desktop/`. Build and version scripts live in `sc
 
 ### Versions and releases
 
-- Use `node scripts/version.mjs` to keep Rust, web, and Electron at the same semantic version. Run `node scripts/version.mjs --check` before committing a version change. Record significant changes in `CHANGELOG.md` and use `vMAJOR.MINOR.PATCH` tags for release commits.
+- Include one SemVer bump in each change commit. Group related edits into a single bump and use `node scripts/version.mjs` to update the Rust, web, and Electron manifests and lockfiles together. Run `node scripts/version.mjs --check` before committing.
+- Bump **patch** for backward-compatible fixes, docs, and internal maintenance. Bump **minor** for compatible features and breaking changes during the `0.x` series. Bump **major** for breaking changes to a stable public contract starting at 1.0.0. Document breaking changes in the changelog.
+- Record noteworthy changes under **Unreleased** in `CHANGELOG.md` and move them to a versioned section for milestone releases. Tag published releases as `vMAJOR.MINOR.PATCH`.
 - CI runs the verification gates on Windows, macOS, and Linux. The **Release build** workflow builds Windows and macOS packages through `node scripts/build.mjs`, including a CLI-only option.

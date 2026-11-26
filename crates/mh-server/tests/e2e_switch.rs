@@ -1117,3 +1117,301 @@ async fn settings_backup_and_global_personas_preserve_session_choices() {
     switch.supervisor.shutdown_all().await;
     srv.abort();
 }
+#[tokio::test]
+async fn delegates_body_mentions_and_keeps_intent_routing_out_of_chat() {
+    let (base_url, switch, srv, _tmp, _paths) = start_test_server_with_paths().await;
+    let http = reqwest::Client::new();
+    let created: Value = http
+        .post(format!("{base_url}/api/sessions"))
+        .json(&json!({ "title": "Routing regression", "orchestrator_member": "antigravity" }))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let sid = created["session"]["id"].as_str().unwrap();
+    let endpoint = format!("{base_url}/api/sessions/{sid}/messages");
+
+    let ambiguous: Value = http.post(&endpoint)
+        .json(&json!({ "content": "Use @antigravity as background and ask @codex to review the task." }))
+        .send().await.unwrap().error_for_status().unwrap().json().await.unwrap();
+    assert_eq!(ambiguous["message"]["recipients"], json!(["codex"]));
+    let intent_chain = ambiguous["message"]["chain_id"].as_str().unwrap();
+
+    let direct: Value = http.post(&endpoint)
+        .json(&json!({ "content": "@codex say hello to @antigravity [MOCK:REPLY text=\"Hi, @antigravity!\"]" }))
+        .send().await.unwrap().error_for_status().unwrap().json().await.unwrap();
+    assert_eq!(direct["message"]["recipients"], json!(["codex"]));
+    let handoff_chain = direct["message"]["chain_id"].as_str().unwrap();
+
+    let messages = tokio::time::timeout(Duration::from_secs(25), async {
+        loop {
+            let messages = switch.store.list_messages(sid, None, 50).unwrap();
+            if messages.iter().any(|message| {
+                message.chain_id == handoff_chain
+                    && message.sender_id == "antigravity"
+                    && message.metadata["streaming"] == false
+            }) {
+                break messages;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .unwrap();
+
+    let intent_authors: Vec<_> = messages
+        .iter()
+        .filter(|message| message.chain_id == intent_chain)
+        .map(|message| message.sender_id.as_str())
+        .collect();
+    assert_eq!(intent_authors, ["user", "codex"]);
+    let handoff_authors: Vec<_> = messages
+        .iter()
+        .filter(|message| message.chain_id == handoff_chain)
+        .map(|message| message.sender_id.as_str())
+        .collect();
+    assert_eq!(handoff_authors, ["user", "codex", "antigravity"]);
+    assert_eq!(
+        switch
+            .store
+            .list_trajectories(sid, Some("antigravity"), 10)
+            .unwrap()
+            .len(),
+        1
+    );
+    switch.supervisor.shutdown_all().await;
+    srv.abort();
+}
+
+#[tokio::test]
+async fn orchestrator_reports_during_work_and_queues_feedback_with_separate_persona_contexts() {
+    let (base_url, switch, srv, tmp, _paths) = start_test_server_with_paths().await;
+    let http = reqwest::Client::new();
+    let created: Value = http.post(format!("{base_url}/api/sessions"))
+        .json(&json!({
+            "title": "Async monitoring fixture",
+            "orchestrator_member": "antigravity",
+            "members": [
+                {"handle": "codex", "adapter_id": "codex"},
+                {"handle": "antigravity", "adapter_id": "antigravity"},
+                {"handle": "agy-monitor", "adapter_id": "antigravity", "persona_prompt": "Monitor project progress."}
+            ],
+        }))
+        .send().await.unwrap().error_for_status().unwrap().json().await.unwrap();
+    let sid = created["session"]["id"].as_str().unwrap();
+    let endpoint = format!("{base_url}/api/sessions/{sid}/messages");
+    let release = tmp.path().join("release.flag");
+    let post = async |content: &str| -> mh_core::ChatMessage {
+        let body: Value = http
+            .post(&endpoint)
+            .json(&json!({ "content": content }))
+            .send()
+            .await
+            .unwrap()
+            .error_for_status()
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        serde_json::from_value(body["message"].clone()).unwrap()
+    };
+
+    let kickoff = post(&format!(
+        "@codex [MOCK:SLEEP ms=\"60000\" until=\"{}\"] [MOCK:REPLY text=\"Original complete: blue cache\"]",
+        release.to_string_lossy().replace('\\', "/")
+    )).await;
+    let running_turn = tokio::time::timeout(Duration::from_secs(15), async {
+        loop {
+            if let Some((mh_core::MemberStatus::Thinking, Some(turn_id))) =
+                switch.get_member_statuses(sid).await.get("codex")
+            {
+                break turn_id.clone();
+            }
+            tokio::time::sleep(Duration::from_millis(30)).await;
+        }
+    })
+    .await
+    .unwrap();
+
+    let monitor =
+        post("Report the current Codex task status. [MOCK:MCP tool=\"chat_list_peers\" permission=\"required\" args={}]")
+            .await;
+    assert_eq!(monitor.recipients, ["antigravity"]);
+    let report = tokio::time::timeout(Duration::from_secs(15), async {
+        loop {
+            let messages = switch.store.list_messages(sid, None, 50).unwrap();
+            if let Some(report) = messages.into_iter().find(|message| {
+                message.chain_id == monitor.chain_id
+                    && message.sender_id == "antigravity"
+                    && message.metadata["streaming"] == false
+            }) {
+                break report;
+            }
+            tokio::time::sleep(Duration::from_millis(30)).await;
+        }
+    })
+    .await
+    .unwrap();
+    assert!(report.content.contains("MCP chat_list_peers ok"));
+    assert!(report.content.contains(&running_turn));
+    let orchestrator = switch.store.get_member(sid, "antigravity").unwrap();
+    let feedback_args = json!({
+        "to": ["codex"],
+        "content": "Use green cache. [MOCK:REPLY text=\"Feedback received: green cache\"]"
+    });
+    let guidance = post(&format!(
+        "Forward my new report label to Codex. [MOCK:MCP tool=\"chat_send_message\" permission=\"required\" args={feedback_args}]"
+    )).await;
+    assert_eq!(guidance.recipients, ["antigravity"]);
+    let handoff = tokio::time::timeout(Duration::from_secs(15), async {
+        loop {
+            if let Some(handoff) = switch
+                .store
+                .list_messages(sid, None, 50)
+                .unwrap()
+                .into_iter()
+                .find(|message| {
+                    message.chain_id == guidance.chain_id
+                        && message.metadata["via"] == "mcp_chat_send_message"
+                })
+            {
+                break handoff;
+            }
+            tokio::time::sleep(Duration::from_millis(30)).await;
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(handoff.recipients, ["codex"]);
+    let before_release = switch
+        .store
+        .list_trajectories(sid, Some("codex"), 10)
+        .unwrap();
+    assert_eq!(before_release.len(), 1);
+    assert_eq!(before_release[0].turn_id, running_turn);
+    assert_eq!(before_release[0].status, mh_core::TurnStatus::Running);
+    std::fs::write(release, "").unwrap();
+
+    let messages = tokio::time::timeout(Duration::from_secs(15), async {
+        loop {
+            let messages = switch.store.list_messages(sid, None, 50).unwrap();
+            if messages.iter().any(|message| {
+                message.content == "Feedback received: green cache"
+                    && message.sender_id == "codex"
+                    && message.chain_id == guidance.chain_id
+            }) {
+                break messages;
+            }
+            tokio::time::sleep(Duration::from_millis(30)).await;
+        }
+    })
+    .await
+    .unwrap();
+    let order: Vec<_> = messages
+        .iter()
+        .map(|message| message.sender_id.as_str())
+        .collect();
+    assert_eq!(
+        order,
+        [
+            "user",
+            "codex",
+            "user",
+            "antigravity",
+            "user",
+            "antigravity",
+            "antigravity",
+            "codex"
+        ]
+    );
+    assert_eq!(messages[1].content, "Original complete: blue cache");
+    assert_eq!(messages[1].chain_id, kickoff.chain_id);
+    let after_release = switch
+        .store
+        .list_trajectories(sid, Some("codex"), 10)
+        .unwrap();
+    assert_eq!(after_release.len(), 2);
+    let original = after_release
+        .iter()
+        .find(|turn| turn.turn_id == running_turn)
+        .unwrap();
+    let followup = after_release
+        .iter()
+        .find(|turn| turn.turn_id != running_turn)
+        .unwrap();
+    assert!(handoff.created_at <= original.finished_at.unwrap());
+    assert!(original.finished_at.unwrap() <= followup.started_at);
+
+    let second_persona =
+        post("@agy-monitor [MOCK:MCP tool=\"chat_list_peers\" permission=\"required\" args={}]")
+            .await;
+    assert_eq!(second_persona.recipients, ["agy-monitor"]);
+    let permission = tokio::time::timeout(Duration::from_secs(15), async {
+        loop {
+            if let Some(card) = switch
+                .store
+                .list_messages(sid, None, 50)
+                .unwrap()
+                .into_iter()
+                .find(|message| {
+                    message.chain_id == second_persona.chain_id
+                        && message.kind == MessageKind::PermissionCard
+                })
+            {
+                break card;
+            }
+            tokio::time::sleep(Duration::from_millis(30)).await;
+        }
+    })
+    .await
+    .expect("the executor persona should still request approval");
+    assert_eq!(permission.sender_id, "agy-monitor");
+    let request = permission.metadata["request_id"].as_str().unwrap();
+    http.post(format!(
+        "{base_url}/api/sessions/{sid}/permissions/{request}"
+    ))
+    .json(&json!({ "option_id": "once" }))
+    .send()
+    .await
+    .unwrap()
+    .error_for_status()
+    .unwrap();
+    tokio::time::timeout(Duration::from_secs(15), async {
+        loop {
+            if switch
+                .store
+                .list_messages(sid, None, 50)
+                .unwrap()
+                .iter()
+                .any(|message| {
+                    message.sender_id == "agy-monitor"
+                        && message.content.starts_with("MCP chat_list_peers ok")
+                })
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(30)).await;
+        }
+    })
+    .await
+    .unwrap();
+    let monitor = switch.store.get_member(sid, "agy-monitor").unwrap();
+    let current_orchestrator = switch.store.get_member(sid, "antigravity").unwrap();
+    assert_eq!(monitor.adapter_id, current_orchestrator.adapter_id);
+    assert!(monitor.acp_session_id.is_some());
+    assert!(orchestrator.acp_session_id.is_some());
+    assert_ne!(monitor.acp_session_id, current_orchestrator.acp_session_id);
+    assert_eq!(
+        orchestrator.acp_session_id,
+        current_orchestrator.acp_session_id
+    );
+    assert_ne!(monitor.worktree_path, current_orchestrator.worktree_path);
+    assert!(monitor.last_seen_msg_seq > current_orchestrator.last_seen_msg_seq);
+
+    switch.supervisor.shutdown_all().await;
+    srv.abort();
+}

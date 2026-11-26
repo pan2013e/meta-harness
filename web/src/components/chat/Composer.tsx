@@ -7,7 +7,6 @@ import {
   Cpu,
   Gauge,
   Send,
-  Shield,
   Square,
 } from "lucide-react";
 import { api } from "../../api/client";
@@ -21,6 +20,7 @@ import type {
   SessionMember,
 } from "../../types/api";
 import { HarnessAvatar, QuotaSnapshotSummary } from "../common/Badges";
+import { APPROVAL_MODES } from "../common/approvalModes";
 import {
   DEFAULT_SLASH_COMMANDS,
   MentionEditor,
@@ -45,12 +45,6 @@ const SLASH_ITEMS: Array<{
   { command: "archive", kind: "action", desc: "Archive current session" },
 ];
 
-const PERMISSION_LABELS: Record<PermissionPolicy, string> = {
-  worktree_smart: "Worktree",
-  strict: "Strict",
-  autonomous_sandbox: "Auto",
-};
-
 const EFFORT_LABELS: Record<string, string> = {
   none: "None",
   minimal: "Minimal",
@@ -71,7 +65,7 @@ function recipientKey(member: SessionMember): string {
   return member.adapter_id + "/" + member.handle;
 }
 
-function routingMentions(markdown: string): Set<string> {
+function routingMentions(markdown: string, handles: ReadonlySet<string>) {
   // Match the router's mention boundaries and ignore fenced and inline code.
   let fence: string | undefined;
   const withoutFences = markdown.split("\n").map((line) => {
@@ -88,12 +82,40 @@ function routingMentions(markdown: string): Set<string> {
     return line;
   }).join("\n");
   const withoutCode = withoutFences.replace(/(?<!`)(`+)(?!`)[\s\S]*?(?<!`)\1(?!`)/g, " ");
-  return new Set(
-    Array.from(
-      withoutCode.matchAll(/(?:^|[\s([{"',:;>*])@([a-z0-9_-]+)(?![a-z0-9_/-]|\.[a-z0-9])(?:\[[^\s\]]+\])?/gi),
-      (match) => match[1].toLowerCase()
-    )
-  );
+  const token = /@([a-z0-9_-]+)(?![a-z0-9_/-]|\.[a-z0-9])(?:\[[^\s\]]+\])?/.source;
+  const known = (handle: string) => handles.has(handle) || handle === "all" || handle === "orchestrator";
+  let remaining = withoutCode.trimStart();
+  const workflow = /^\/(?:plan|review|test|fix|compact)[,.;:!?]*(?:\s+|$)/i;
+  while (workflow.test(remaining)) remaining = remaining.replace(workflow, "");
+
+  const leading = new Set<string>();
+  const address = new RegExp("^" + token, "i");
+  for (let match = address.exec(remaining); match; match = address.exec(remaining)) {
+    const handle = match[1].toLowerCase();
+    if (known(handle)) leading.add(handle);
+    const tail = remaining.slice(match[0].length);
+    remaining = tail.replace(/^[\s,]+/, "");
+    if (remaining === tail) break;
+    remaining = remaining.replace(/^(?:and|&)(?:\s+|$)/i, "");
+  }
+  if (leading.size) return { mentions: leading, needsIntent: false };
+
+  const mentions = new Set<string>();
+  let previousEnd: number | undefined;
+  let separated = false;
+  for (const match of withoutCode.matchAll(new RegExp("(?:^|[\\s([{\\\"',:;>*])" + token, "gi"))) {
+    const handle = match[1].toLowerCase();
+    if (!known(handle) || mentions.has(handle)) continue;
+    mentions.add(handle);
+    if (handle === "all" || handle === "orchestrator") continue;
+    const start = match.index + match[0].indexOf("@");
+    if (previousEnd !== undefined) {
+      const gap = withoutCode.slice(previousEnd, start).replace(/^[\s,()]+|[\s,()]+$/g, "");
+      separated ||= !!gap && !/^(?:and|&)$/i.test(gap);
+    }
+    previousEnd = match.index + match[0].length;
+  }
+  return { mentions, needsIntent: separated && !mentions.has("all") && !mentions.has("orchestrator") };
 }
 
 function effortRank(value: string): number {
@@ -337,13 +359,17 @@ export function Composer({
   }, [raw]);
   const compactMatch = raw.match(COMPACT_COMMAND);
   const routingText = compactMatch ? compactMatch[1]?.trim() ?? "" : raw;
-  const explicitMentions = useMemo(() => routingMentions(routingText), [routingText]);
-  const mentionedMembers = (activeSession ? members : availableMembers).filter((member) =>
+  const roster = activeSession ? members : availableMembers;
+  const routingHandles = useMemo(() => new Set(roster.map((member) => member.handle.toLowerCase())), [roster]);
+  const { mentions: explicitMentions, needsIntent } = useMemo(
+    () => routingMentions(routingText, routingHandles), [routingText, routingHandles]
+  );
+  const mentionedMembers = roster.filter((member) =>
     explicitMentions.has(member.handle.toLowerCase())
   );
   const toOrchestrator = explicitMentions.has("orchestrator");
   const automaticRecipient = orchestrator ?? availableMembers[0];
-  const recipients = toOrchestrator
+  const recipients = needsIntent ? [] : toOrchestrator
     ? orchestrator ? [orchestrator] : []
     : explicitMentions.has("all")
       ? availableMembers.filter((member) => member.handle !== activeSession?.orchestrator_member || member.role !== "orchestrator")
@@ -464,6 +490,7 @@ export function Composer({
 
   const currentPolicy: PermissionPolicy =
     activeSession?.permission_policy ?? pendingPermissionPolicy;
+  const approval = APPROVAL_MODES.find((mode) => mode.value === currentPolicy) ?? APPROVAL_MODES[0];
 
   // Compute displayed Context Breakdown + live Draft tokens
   const draftTokens = draftEstimate?.text === raw
@@ -774,7 +801,9 @@ export function Composer({
                     aria-expanded={Boolean(openMenu)}
                     aria-controls={openMenu ? modelMenuId : undefined}
                     title={
-                      recipients.length > 1
+                      needsIntent
+                        ? "The orchestrator will resolve the recipients on send"
+                        : recipients.length > 1
                         ? "Choose a model and effort for each recipient"
                         : targetMember
                         ? [modelLabel, selectedEffortLabel, "@" + targetMember.handle].filter(Boolean).join(" · ")
@@ -791,7 +820,7 @@ export function Composer({
                   >
                     <Cpu className="h-3.5 w-3.5 shrink-0 text-brand-ink" />
                     <span className="max-w-40 truncate font-medium">
-                      {recipients.length > 1 ? `${recipients.length} recipients` : modelLabel}
+                      {needsIntent ? "Auto route" : recipients.length > 1 ? `${recipients.length} recipients` : modelLabel}
                     </span>
                     {recipients.length === 1 && selectedEffortLabel && (
                       <span className="hidden shrink-0 text-ink-muted @[30rem]:inline">
@@ -948,6 +977,7 @@ export function Composer({
                 <button
                   type="button"
                   aria-label="Permission policy"
+                  title={approval.label + " approval"}
                   onClick={() => {
                     const next = !permOpen;
                     closeAllMenus();
@@ -955,8 +985,8 @@ export function Composer({
                   }}
                   className="inline-flex items-center gap-1 px-2 py-1 rounded-lg bg-elevated hover:bg-hover border border-line text-ink-soft hover:text-ink transition-colors"
                 >
-                  <Shield className="w-3 h-3 text-pos shrink-0" />
-                  <span className="hidden sm:inline">{PERMISSION_LABELS[currentPolicy]}</span>
+                  <approval.Icon aria-hidden="true" className={`w-3 h-3 shrink-0 ${approval.color}`} />
+                  <span className="hidden sm:inline">{approval.label}</span>
                   <ChevronDown className="w-3 h-3 text-ink-muted shrink-0" />
                 </button>
 
@@ -970,38 +1000,27 @@ export function Composer({
                       <div className="px-2.5 py-1 text-[10px] uppercase tracking-wider font-semibold text-ink-muted">
                         Approval Mode
                       </div>
-                      {(
-                        [
-                          [
-                            "worktree_smart",
-                            "Worktree",
-                            "Auto-allow worktree edits; prompt shell",
-                          ],
-                          ["strict", "Strict", "Prompt all file edits & shell"],
-                          [
-                            "autonomous_sandbox",
-                            "Auto",
-                            "Auto-allow inside isolated worktree",
-                          ],
-                        ] as const
-                      ).map(([val, label, desc]) => (
+                      {APPROVAL_MODES.map(({ value, label, description, Icon, color }) => (
                         <button
-                          key={val}
+                          key={value}
                           type="button"
-                          onClick={() => void handlePolicyChange(val)}
+                          onClick={() => void handlePolicyChange(value)}
                           className={`w-full px-2.5 py-1.5 rounded-lg text-left transition-colors ${
-                            currentPolicy === val
+                            currentPolicy === value
                               ? "bg-brand-soft text-ink"
                               : "hover:bg-hover text-ink-soft"
                           }`}
                         >
                           <div className="flex items-center justify-between font-medium">
-                            <span>{label}</span>
-                            {currentPolicy === val && (
+                            <span className="flex items-center gap-1.5">
+                              <Icon aria-hidden="true" className={`h-3.5 w-3.5 ${color}`} />
+                              {label}
+                            </span>
+                            {currentPolicy === value && (
                               <Check className="w-3 h-3 text-brand-ink" />
                             )}
                           </div>
-                          <div className="text-[10.5px] text-ink-muted">{desc}</div>
+                          <div className="text-[10.5px] text-ink-muted">{description}</div>
                         </button>
                       ))}
                     </div>

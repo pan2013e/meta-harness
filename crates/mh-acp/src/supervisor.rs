@@ -20,7 +20,7 @@ use crate::AcpError;
 use crate::broker::{BrokerCallbacks, MemberBrokerContext, PermissionResolution};
 use crate::client::{AcpClient, TurnStreamListener};
 use crate::platform::{ProcessTreeGuard, find_cli_binary, prepare_isolated_command};
-use crate::protocol::{McpEnvVar, McpServerSpec};
+use crate::protocol::{McpEnvVar, McpServerSpec, SWITCH_MCP_SERVER_NAME};
 
 #[derive(Debug, Clone)]
 pub struct MemberSpawnSpec {
@@ -1031,7 +1031,7 @@ pub fn build_mcp_bridge_spec(
     bridge_token: &str,
 ) -> McpServerSpec {
     McpServerSpec {
-        name: "meta-harness-switch".into(),
+        name: SWITCH_MCP_SERVER_NAME.into(),
         command: dunce::simplified(self_exe).to_string_lossy().into_owned(),
         args: vec![
             "mcp-bridge".into(),

@@ -17,8 +17,8 @@ use mh_core::{
 use crate::AcpError;
 use crate::platform::{ProcessTreeGuard, prepare_isolated_command, shell_command_invocation};
 use crate::protocol::{
-    FsReadTextFileParams, FsWriteTextFileParams, RequestPermissionParams, TerminalCreateParams,
-    TerminalIdParams, parse_permission_options,
+    FsReadTextFileParams, FsWriteTextFileParams, RequestPermissionParams, SWITCH_MCP_SERVER_NAME,
+    TerminalCreateParams, TerminalIdParams, parse_permission_options,
 };
 
 #[derive(Debug, Clone)]
@@ -32,6 +32,10 @@ pub enum PermissionResolution {
 
 #[async_trait]
 pub trait BrokerCallbacks: Send + Sync {
+    fn may_auto_approve_switch_tool(&self, _tool: &str) -> bool {
+        false
+    }
+
     async fn request_user_permission(
         &self,
         prompt: PendingPermissionView,
@@ -418,6 +422,33 @@ impl WorkspaceBroker {
             .unwrap_or("Approve tool execution")
             .to_string();
 
+        if kind == "other"
+            && let Some(tool) = params
+                .tool_call
+                .get("name")
+                .and_then(Value::as_str)
+                .and_then(|name| name.strip_prefix("mcp_"))
+                .and_then(|name| name.strip_prefix(SWITCH_MCP_SERVER_NAME))
+                .and_then(|name| name.strip_prefix('_'))
+            && let Some(allow_once) = params
+                .options
+                .iter()
+                .filter(|option| option["kind"] == "allow_once")
+                .find_map(|option| {
+                    option
+                        .get("optionId")
+                        .or_else(|| option.get("id"))?
+                        .as_str()
+                        .filter(|id| !id.is_empty())
+                })
+            && self.ctx.active_turn_id.read().await.is_some()
+            && self.callbacks().await.may_auto_approve_switch_tool(tool)
+        {
+            return Ok(json!({
+                "outcome": { "outcome": "selected", "optionId": allow_once }
+            }));
+        }
+
         // Worktree-smart fast-path for edit/read tool calls strictly inside member worktree
         if matches!(
             self.ctx.permission_policy,
@@ -694,10 +725,15 @@ mod tests {
     struct TestCallbacks {
         decision: PermissionResolution,
         events: Mutex<Vec<(String, TrajectoryEventKind, Value)>>,
+        auto_approve_switch_tools: bool,
     }
 
     #[async_trait]
     impl BrokerCallbacks for TestCallbacks {
+        fn may_auto_approve_switch_tool(&self, tool: &str) -> bool {
+            self.auto_approve_switch_tools && tool == "chat_list_peers"
+        }
+
         async fn request_user_permission(
             &self,
             _prompt: PendingPermissionView,
@@ -734,6 +770,7 @@ mod tests {
                 allow_pattern: None,
             },
             events: Mutex::new(Vec::new()),
+            auto_approve_switch_tools: false,
         });
 
         let broker = WorkspaceBroker::new(
@@ -771,5 +808,74 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(err, AcpError::PermissionDenied(_)));
+    }
+
+    #[tokio::test]
+    async fn switch_tool_auto_approval_uses_the_registered_name_and_one_time_option() {
+        let tmp = tempfile::tempdir().unwrap();
+        let active_turn = Arc::new(RwLock::new(Some("t1".into())));
+        let broker = WorkspaceBroker::new(
+            MemberBrokerContext {
+                session_id: "s1".into(),
+                member_handle: "antigravity".into(),
+                project_root: tmp.path().into(),
+                member_worktree: tmp.path().into(),
+                permission_policy: PermissionPolicy::Strict,
+                active_turn_id: Arc::clone(&active_turn),
+                rules: Arc::new(RwLock::new(Vec::new())),
+            },
+            Arc::new(TestCallbacks {
+                decision: PermissionResolution::Selected {
+                    option_id: "reject".into(),
+                    allow_pattern: None,
+                },
+                events: Mutex::new(Vec::new()),
+                auto_approve_switch_tools: true,
+            }),
+        );
+
+        let request = |kind: &str, name: Option<&str>, include_once: bool| {
+            let mut options = vec![json!({ "optionId": "always", "kind": "allow_always" })];
+            if include_once {
+                options.push(json!({ "optionId": "once", "kind": "allow_once" }));
+            }
+            options.push(json!({ "optionId": "reject", "kind": "reject_once" }));
+            RequestPermissionParams {
+                session_id: "native_session".into(),
+                tool_call: json!({
+                    "kind": kind,
+                    "name": name,
+                    "title": "Run mcp_meta-harness-switch_chat_list_peers",
+                }),
+                options,
+            }
+        };
+        let recognized = Some("mcp_meta-harness-switch_chat_list_peers");
+        let allowed = broker
+            .handle_request_permission(request("other", recognized, true))
+            .await
+            .unwrap();
+        assert_eq!(allowed["outcome"]["optionId"], "once");
+
+        for (kind, name, include_once) in [
+            ("other", None, true),
+            ("other", Some("mcp_meta-harness-switch_unknown_tool"), true),
+            ("other", Some("mcp_other-server_chat_list_peers"), true),
+            ("execute", recognized, true),
+            ("other", recognized, false),
+        ] {
+            let denied = broker
+                .handle_request_permission(request(kind, name, include_once))
+                .await
+                .unwrap();
+            assert_eq!(denied["outcome"]["optionId"], "reject");
+        }
+
+        *active_turn.write().await = None;
+        let idle = broker
+            .handle_request_permission(request("other", recognized, true))
+            .await
+            .unwrap();
+        assert_eq!(idle["outcome"]["optionId"], "reject");
     }
 }

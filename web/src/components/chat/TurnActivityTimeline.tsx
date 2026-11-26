@@ -1,19 +1,32 @@
 import { useEffect, useMemo, useState } from "react";
-import { ChevronDown, ChevronRight, FileDiff, Loader2, Sparkles, Terminal } from "lucide-react";
+import { ChevronDown, ChevronRight, FileDiff, Loader2, ShieldAlert, Sparkles, Terminal } from "lucide-react";
 import { useAppStore } from "../../store/useAppStore";
 import { MarkdownBlock } from "../common/MarkdownBlock";
 import { TrajectoryRow } from "../drawer/TrajectoryRow";
 import { cleanWorktreePath, groupTrajectoryEvents } from "../drawer/trajectory";
 
+export function WaitingForTurn({ waitingForApproval = false }: { waitingForApproval?: boolean }) {
+  return (
+    <div role="status" className="flex w-fit items-center gap-2 rounded-lg bg-elevated/45 px-2.5 py-1.5 text-xs font-medium text-ink-muted">
+      {waitingForApproval
+        ? <ShieldAlert aria-hidden="true" className="h-3.5 w-3.5 text-warn" />
+        : <Loader2 aria-hidden="true" className="h-3.5 w-3.5 animate-spin text-brand-ink motion-reduce:animate-none" />}
+      {waitingForApproval ? "Waiting for approval" : "Working…"}
+    </div>
+  );
+}
+
 export function TurnActivityTimeline({
   turnId,
   sessionId,
   streaming,
+  waitingForApproval,
   intermediateNotes,
 }: {
   turnId: string;
   sessionId: string;
   streaming: boolean;
+  waitingForApproval: boolean;
   intermediateNotes: string[];
 }) {
   const [expanded, setExpanded] = useState(false);
@@ -68,7 +81,9 @@ export function TurnActivityTimeline({
   }, [entries, fallbackNotes]);
 
   const summaryLabel = streaming
-    ? `Working${latestTitle ? ` · ${latestTitle}` : ""}`
+    ? waitingForApproval
+      ? "Waiting for approval"
+      : `Working${latestTitle ? ` · ${latestTitle}` : ""}`
     : [
         `Worked`,
         totalSteps > 0 ? `${totalSteps} step${totalSteps === 1 ? "" : "s"}` : null,
@@ -76,6 +91,10 @@ export function TurnActivityTimeline({
       ]
         .filter(Boolean)
         .join(" · ");
+
+  if (streaming && !expanded && totalSteps === 0 && editsCount === 0) {
+    return <WaitingForTurn waitingForApproval={waitingForApproval} />;
+  }
 
   return (
     <div className="my-1 rounded-xl border border-line bg-elevated/45 overflow-hidden text-xs">
@@ -86,8 +105,10 @@ export function TurnActivityTimeline({
         className="w-full px-3 py-1.5 flex items-center justify-between gap-2 text-left text-ink-muted hover:text-ink hover:bg-hover/60 transition-colors"
       >
         <span className="flex items-center gap-2 min-w-0">
-          {streaming ? (
-            <Loader2 className="w-3.5 h-3.5 animate-spin text-brand-ink shrink-0" />
+          {waitingForApproval && streaming ? (
+            <ShieldAlert aria-hidden="true" className="h-3.5 w-3.5 shrink-0 text-warn" />
+          ) : streaming ? (
+            <Loader2 aria-hidden="true" className="w-3.5 h-3.5 animate-spin text-brand-ink shrink-0 motion-reduce:animate-none" />
           ) : expanded ? (
             <ChevronDown className="w-3.5 h-3.5 shrink-0" />
           ) : (

@@ -131,14 +131,17 @@ The ACP broker resolves file paths against the member worktree and checks canoni
 
 Permission cards use the adapter's ACP options. A saved command pattern is scoped to the session. Harness CLIs may also enforce their own approval and sandbox settings.
 
+During an orchestrator turn, the broker selects the one-time ACP approval option for registered tools from the embedded Meta-Harness switch. Dispatch confirmation and the switch's routing and authorization checks still apply.
+
 ---
 
 ## 4. Network Switch, Parallel Routing & Inter-Harness Tools (`mh-switch`)
 
 ### 4.1 Mention Routing & Delta Context Envelopes
 1. Strips fenced code blocks and inline code spans before matching `@<handle>` (plus optional `@<handle>[<model>:<effort>]`, `@all`, `@orchestrator`).
-2. `@orchestrator` takes precedence over the other mention targets. An unmentioned message goes to the available orchestrator, with an available-member fallback. `@all` addresses eligible available members. Multiple explicit members can work concurrently in isolated worktrees.
-3. A reused ACP session receives messages with `seq > member.last_seen_msg_seq` in `<group_chat_updates>`. A new ACP session receives a bounded recent transcript. The prompt can also include persona instructions, a compacted summary, and orchestrator telemetry.
+2. A leading address list, such as `@codex @claude review this`, identifies initial recipients. In `@codex say hello to @antigravity`, Antigravity remains a task reference until Codex hands off. Inline mentions separated by prose can use a bounded low-effort orchestrator pass. The pass uses a standalone ACP prompt, validates its output against the mentioned roster handles, and leaves the message list untouched. If it cannot resolve recipients, the first mentioned member is used.
+3. Within an addressed list, `@orchestrator` takes precedence over the other targets. An unmentioned message goes to the available orchestrator, with an available-member fallback. `@all` addresses eligible available members. Multiple explicit members can work concurrently in isolated worktrees.
+4. A reused ACP session receives messages with `seq > member.last_seen_msg_seq` in `<group_chat_updates>`. A new ACP session receives a bounded recent transcript. The prompt can also include persona instructions, a compacted summary, and orchestrator telemetry.
 
 ### 4.2 Synchronous `peer_consult` & Deadlock Detection
 In an isolated worktree session, an active harness can call `peer_consult(target, question, context_turn_id?)`. Shared-folder sessions use asynchronous `chat_send_message` handoffs.
@@ -174,7 +177,7 @@ Tracked per `HarnessAdapter` (so multiple personas of the same CLI share one quo
 1. **Default Live Provider Quota APIs (`exact_quota_probe_opt_in = true`)**:
    - **Codex (`codex_local`).** Queries `codex app-server` with `account/rateLimits/read` and can fall back to the provider usage endpoint with the selected profile's OAuth credentials. Counts, reset times, and plan labels depend on the provider response.
    - **Claude Code (`claude_local`).** Uses selected-profile OAuth credentials or the macOS Keychain for the ordinary profile to query the provider usage endpoint.
-   - **Antigravity / Gemini (`google_local`).** Antigravity can read shared-profile windows using its CLI usage command. Separate Antigravity profiles expose an explicit shared-usage check. Gemini and profiles without usage data expose account or availability status.
+   - **Antigravity / Gemini (`google_local`).** Antigravity reads shared-profile windows using its CLI usage command by default. While a private profile is active, the UI notes that the shared account's usage may differ. Gemini and profiles without usage data expose account or availability status.
    - **Caching and cooldowns.** Successful live results generally cache for five minutes. Provider probe rate limits back off. A rate-limited turn marks its adapter cooldown and can trigger a fallback executor.
 2. **Manual Calibration & Offline Mode**:
    - Users can disable live probes per adapter (`exact_probe_opt_in = false`). Saved preferences take precedence over adapter defaults. Meta-Harness reports its local turn usage and accepts manual calibration percentages. Offline integration tests use deterministic `quota_provider = "manual"` accounting.

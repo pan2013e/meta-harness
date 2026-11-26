@@ -21,7 +21,6 @@ import type {
   ProjectFact,
   PromoteMode,
   QuotaSnapshot,
-  QuotaWindow,
   Session,
   SessionContextReport,
   SessionDiffReport,
@@ -173,8 +172,6 @@ export const api = {
       method: "POST", body: JSON.stringify({ value }),
     }),
   listQuotas: () => apiFetch<{ quotas: QuotaSnapshot[] }>("/api/quotas"),
-  sharedAntigravityUsage: (adapterId: string) =>
-    apiFetch<{ windows: QuotaWindow[] }>(`/api/adapters/${encodeURIComponent(adapterId)}/shared-usage`, { method: "POST" }),
   refreshQuotasLive: () =>
     apiFetch<{ quotas: QuotaSnapshot[] }>("/api/quotas/refresh", {
       method: "POST",

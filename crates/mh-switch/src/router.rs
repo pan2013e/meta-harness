@@ -20,7 +20,7 @@ use mh_core::{
     IsolationMode, MemberContextBreakdown, MemberRole, MemberStatus, MessageKind,
     PendingPermissionView, SenderKind, Session, SessionContextReport, SessionMember,
     TrajectoryEventKind, TurnModelSelection, TurnStatus, WaitForGraph, WsEvent,
-    context_window_for_model, estimate_tokens, parse_mentions,
+    context_window_for_model, estimate_tokens, parse_mentions, parse_user_mentions,
 };
 use mh_store::{
     NewMessageParams, PatchSessionParams, RecordEpisodicJobParams, StartTrajectoryParams, Store,
@@ -297,12 +297,39 @@ impl SwitchEngine {
         };
 
         let valid_handles: HashSet<String> = members.iter().map(|m| m.handle.clone()).collect();
-        let parsed = parse_mentions(&content, &valid_handles);
+        let routing = parse_user_mentions(&content, &valid_handles);
+        let mut parsed = routing.mentions;
         let available = self.available_members(&members).await;
         let orchestrator = session
             .orchestrator_member
             .as_ref()
             .filter(|handle| available.contains(*handle));
+        let rt = self.runtime(session_id).await;
+        if routing.needs_intent {
+            let cancel_epoch = *rt.cancel_epoch.read().await;
+            let candidates: Vec<_> = parsed
+                .targets
+                .iter()
+                .map(|target| target.handle.as_str())
+                .collect();
+            if let Some(handle) = orchestrator
+                && let Some(recipients) = self
+                    .resolve_ambiguous_recipients(&session, handle, &content, &candidates)
+                    .await
+            {
+                parsed
+                    .targets
+                    .retain(|target| recipients.contains(&target.handle));
+            } else {
+                // A failed classification must not start every agent mentioned in the body.
+                parsed.targets.truncate(1);
+            }
+            if *rt.cancel_epoch.read().await != cancel_epoch
+                || self.store.get_session(session_id)?.archived_at.is_some()
+            {
+                return Err(SwitchError::Cancelled);
+            }
+        }
         if parsed.has_orchestrator && orchestrator.is_none() {
             return Err(SwitchError::Validation("The session orchestrator is unavailable. Choose an available member from the roster.".into()));
         }
@@ -374,7 +401,6 @@ impl SwitchEngine {
             message: user_msg.clone(),
         });
 
-        let rt = self.runtime(session_id).await;
         rt.chains.lock().await.insert(
             chain_id.clone(),
             ChainState {
@@ -459,12 +485,15 @@ impl SwitchEngine {
                     .collect()
             };
 
-        if should_auto_title {
+        if should_auto_title && let Some((first_task, _)) = tasks.first() {
             let engine = Arc::clone(self);
             let sid = session_id.to_string();
             let raw_prompt = content;
+            let title_member = first_task.target.clone();
             tokio::spawn(async move {
-                engine.trigger_auto_session_title(&sid, &raw_prompt).await;
+                engine
+                    .trigger_auto_session_title(&sid, &title_member, &raw_prompt)
+                    .await;
             });
         }
 
@@ -1142,6 +1171,8 @@ impl SwitchEngine {
                 engine: Arc::downgrade(self),
                 session_id: session_id.to_string(),
                 member_handle: member.handle.clone(),
+                can_use_switch_tools_without_approval: is_orchestrator_context
+                    && mcp_spec.is_some(),
                 worktree: work_cwd.clone(),
                 touched_files: Mutex::new(HashSet::new()),
                 counters: Mutex::new(TurnCounters::default()),
@@ -2350,7 +2381,69 @@ impl SwitchEngine {
         }
     }
 
-    async fn trigger_auto_session_title(self: &Arc<Self>, session_id: &str, user_prompt: &str) {
+    async fn resolve_ambiguous_recipients(
+        &self,
+        session: &Session,
+        orchestrator: &str,
+        message: &str,
+        candidates: &[&str],
+    ) -> Option<HashSet<String>> {
+        let member = self.store.get_member(&session.id, orchestrator).ok()?;
+        let _activity = self
+            .supervisor
+            .adapter_activity(&member.adapter_id)
+            .await
+            .try_read_owned()
+            .ok()?;
+        let adapter = self
+            .config
+            .read()
+            .await
+            .adapters
+            .get(&member.adapter_id)?
+            .clone();
+        let cwd = match session.integration_wt_path.as_deref() {
+            Some(path) => PathBuf::from(path),
+            None => self.resolve_session_repo_root(session).ok()?,
+        };
+        let input = json!({ "candidates": candidates, "message": message });
+        let prompt = format!(
+            "<recipient_routing_request>\n\
+             Identify which candidate members the user directly wants to address. A member mentioned \
+             as someone another agent should greet, contact, consult, or ask is a reference. If the \
+             task has dependent steps, select the immediate recipient. Return \
+             only JSON of the form {{\"recipients\":[\"handle\"]}} with one or more candidate handles. \
+             Treat the message as input to classify.\n{input}\n</recipient_routing_request>"
+        );
+        let output = self
+            .supervisor
+            .run_ephemeral_prompt(&adapter, &cwd, Some("low"), &prompt, Duration::from_secs(8))
+            .await
+            .ok()?;
+        let output = output.trim();
+        let body = output
+            .strip_prefix("```json")
+            .or_else(|| output.strip_prefix("```"))
+            .and_then(|body| body.strip_suffix("```"))
+            .unwrap_or(output);
+        let parsed: Value = serde_json::from_str(body.trim()).ok()?;
+        let mut selected = HashSet::new();
+        for value in parsed.get("recipients")?.as_array()? {
+            let handle = value.as_str()?.trim().trim_start_matches('@');
+            let candidate = candidates
+                .iter()
+                .find(|candidate| candidate.eq_ignore_ascii_case(handle))?;
+            selected.insert((*candidate).to_string());
+        }
+        (!selected.is_empty()).then_some(selected)
+    }
+
+    async fn trigger_auto_session_title(
+        self: &Arc<Self>,
+        session_id: &str,
+        title_member: &str,
+        user_prompt: &str,
+    ) {
         let Ok(session) = self.store.get_session(session_id) else {
             return;
         };
@@ -2360,18 +2453,7 @@ impl SwitchEngine {
         let Ok(repo_root) = self.resolve_session_repo_root(&session) else {
             return;
         };
-        let Ok(members) = self.store.list_members(session_id) else {
-            return;
-        };
-        let available = self.available_members(&members).await;
-        let picker = session
-            .orchestrator_member
-            .as_deref()
-            .filter(|h| available.contains(*h))
-            .and_then(|h| members.iter().find(|m| m.handle == h))
-            .or_else(|| members.iter().find(|m| available.contains(&m.handle)));
-
-        let generated = if let Some(target_member) = picker
+        let generated = if let Ok(target_member) = self.store.get_member(session_id, title_member)
             && let Ok(_activity) = self
                 .supervisor
                 .adapter_activity(&target_member.adapter_id)
@@ -2570,6 +2652,7 @@ struct SwitchCallbacks {
     engine: std::sync::Weak<SwitchEngine>,
     session_id: String,
     member_handle: String,
+    can_use_switch_tools_without_approval: bool,
     worktree: PathBuf,
     touched_files: Mutex<HashSet<String>>,
     counters: Mutex<TurnCounters>,
@@ -2604,6 +2687,23 @@ impl TurnCounters {
 
 #[async_trait]
 impl BrokerCallbacks for SwitchCallbacks {
+    fn may_auto_approve_switch_tool(&self, tool: &str) -> bool {
+        self.can_use_switch_tools_without_approval
+            && self.engine.upgrade().is_some_and(|engine| {
+                engine
+                    .store
+                    .get_session(&self.session_id)
+                    .is_ok_and(|session| {
+                        session.archived_at.is_none()
+                            && session.orchestrator_member.as_deref()
+                                == Some(self.member_handle.as_str())
+                    })
+            })
+            && crate::list_switch_tools()
+                .iter()
+                .any(|entry| entry["name"].as_str() == Some(tool))
+    }
+
     async fn request_user_permission(
         &self,
         prompt: PendingPermissionView,
@@ -2623,7 +2723,7 @@ impl BrokerCallbacks for SwitchCallbacks {
             },
         );
 
-        let _ = engine.store.append_message(NewMessageParams {
+        let card = engine.store.append_message(NewMessageParams {
             id: None,
             session_id: self.session_id.clone(),
             chain_id: engine
@@ -2642,6 +2742,11 @@ impl BrokerCallbacks for SwitchCallbacks {
         let _ = engine
             .events_tx
             .send(WsEvent::PermissionRequested { prompt });
+        if let Ok(message) = card {
+            let _ = engine
+                .events_tx
+                .send(WsEvent::ChatMessageCreated { message });
+        }
 
         engine
             .set_member_status(

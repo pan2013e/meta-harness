@@ -402,6 +402,8 @@ pub struct QuotaSnapshot {
     pub credits_label: Option<String>,
     #[serde(default)]
     pub status_note: Option<String>,
+    #[serde(default)]
+    pub shared_profile_usage: bool,
     pub updated_at: i64,
 }
 

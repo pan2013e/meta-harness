@@ -158,6 +158,7 @@ export interface QuotaSnapshot {
     | "unavailable";
   windows?: QuotaWindow[];
   credits_label?: string | null;
+  shared_profile_usage?: boolean;
   status_note?: string | null;
   updated_at: number;
 }

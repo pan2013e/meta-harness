@@ -29,7 +29,7 @@ In **Settings → Harnesses & Models**, choose **Create profile & sign in** for 
 
 For profiles created in the web app, **Use default CLI profile** returns to the CLI's ordinary sign-in. **Use saved separate profile** switches back using the saved credentials. The selection persists across restarts.
 
-Codex's primary sign-in button opens the provider's browser login on the machine running Meta-Harness. **Use device code** starts the alternative flow, where you enter the code on the provider's page. Separate Antigravity profiles can use **Check shared CLI usage** to view the shared account's quota for reference.
+Codex's primary sign-in button opens the provider's browser login on the machine running Meta-Harness. **Use device code** starts the alternative flow, where you enter the code on the provider's page. Antigravity usage comes from the shared CLI profile by default. When a private profile is active, the quota display notes that the shared account's usage may differ.
 
 Use **Check CLI version** and **Upgrade CLI** in the same card for supported launchers. Upgrades run the vendor updater or refresh the compatible npm bundle for the default Codex ACP launcher.
 
@@ -56,7 +56,9 @@ For Codex or Claude Code, sign in to the separate directory using the harness CL
 
 Create reusable personas under **Settings → Global Personas**. New sessions include saved personas whose harnesses are available. Use **Add to session** for an existing session. Each session keeps its own copy of the persona's instructions and defaults.
 
-Mention multiple agents in the composer to get a model and reasoning effort tab for each recipient. Selections in the composer apply to messages from that composer. Set a persona's persistent defaults in Settings.
+Address several agents at the start of a message to get a model and reasoning effort tab for each recipient. Selections in the composer apply to messages from that composer. Set a persona's persistent defaults in Settings.
+
+Put direct recipients at the start of a message. For example, `@codex say hello to @antigravity` starts Codex first and leaves the handoff to Codex. Ambiguous inline references can use a short orchestrator pass that stays out of the chat transcript.
 
 Use **Settings → Storage & Data → Settings backup** to export or import versioned JSON containing the theme, harness model defaults, quota preferences, and global personas. Import merges records by harness ID or persona handle. Keep machine-specific TOML, sign-in profiles, and session data in their original locations.
 
@@ -108,7 +110,7 @@ For a development build, run `npm --prefix web ci` and `npm --prefix web run bui
 
 Meta-Harness uses semantic versions across the Rust CLI, web UI, and Electron package. The initial release is `v0.1.0`.
 
-Use `node scripts/version.mjs patch` for fixes, `minor` for compatible features, or `major` for a breaking stable release. The script updates all three manifests and their lockfiles together. Include the bump with the next change commit. CI and the release build check that the versions agree.
+Include one version bump in each change commit. Use `node scripts/version.mjs patch` for fixes and maintenance, `minor` for compatible features or breaking changes during the `0.x` series, and `major` for breaking changes starting at 1.0.0. The script updates all three manifests and their lockfiles together. CI and the release build check that the versions agree.
 
 Record noteworthy changes in [CHANGELOG.md](CHANGELOG.md). When publishing a milestone, add a versioned heading for its notes and tag the release commit as `vMAJOR.MINOR.PATCH`.
 

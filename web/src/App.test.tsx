@@ -2,7 +2,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { App } from "./App";
 import { MarkdownBlock } from "./components/common/MarkdownBlock";
-import { formatCreditsDisplay, QuotaMeter } from "./components/common/Badges";
+import { formatCreditsDisplay, QuotaMeter, QuotaSnapshotSummary } from "./components/common/Badges";
 import { DiffViewer } from "./components/common/DiffViewer";
 import { ChatPane } from "./components/chat/ChatPane";
 import { Composer } from "./components/chat/Composer";
@@ -11,7 +11,6 @@ import { MessageRow } from "./components/chat/MessageRow";
 import { DiffReviewModal } from "./components/modals/DiffReviewModal";
 import { FilePreviewModal } from "./components/modals/FilePreviewModal";
 import { SettingsDialog } from "./components/modals/SettingsDialog";
-import { SharedAntigravityUsage } from "./components/modals/SharedAntigravityUsage";
 import { PersonaModelFields } from "./components/modals/PersonaModelFields";
 import { Sidebar } from "./components/sidebar/Sidebar";
 import { cleanWorktreePath, groupTrajectoryEvents } from "./components/drawer/trajectory";
@@ -19,7 +18,7 @@ import { TrajectoryRow } from "./components/drawer/TrajectoryRow";
 import { terminalDirectory } from "./components/chat/terminalPaths";
 import { api, WsHubClient } from "./api/client";
 import { useAppStore } from "./store/useAppStore";
-import type { TrajectoryEvent, TurnTrajectory } from "./types/api";
+import type { ChatMessage, TrajectoryEvent, TurnTrajectory } from "./types/api";
 
 afterEach(() => {
   cleanup();
@@ -247,17 +246,17 @@ describe("Session navigation", () => {
 });
 
 describe("UI primitives", () => {
-  it("labels shared Antigravity usage separately from the profile quota", async () => {
-    const profileQuotas = useAppStore.getState().quotas;
-    const check = vi.spyOn(api, "sharedAntigravityUsage").mockResolvedValue({ windows: [
-      { id: "gemini/300", label: "Gemini · 5h", remaining_pct: 83, resets_at: null, window_mins: 300 },
-    ] });
-    render(<SharedAntigravityUsage adapterId="antigravity" />);
-    fireEvent.click(screen.getByRole("button", { name: "Check shared CLI usage" }));
-    expect(await screen.findByRole("heading", { name: "Shared CLI account" })).toBeTruthy();
+  it("shows a shared usage note with private-profile quota windows in compact views", () => {
+    render(<QuotaSnapshotSummary compact quota={{
+      adapter_id: "antigravity", plan_label: "Google Account",
+      window_5h_remaining_pct: 83, window_5h_resets_at: null,
+      weekly_remaining_pct: null, weekly_resets_at: null,
+      local_5h_tokens_est: 0, rate_limited_until: null,
+      exact_probe_opt_in: true, source: "live_probe",
+      shared_profile_usage: true, updated_at: 0,
+    }} />);
+    expect(screen.getByText("Shared CLI usage may differ from this private profile.")).toBeTruthy();
     expect(screen.getByText("83%")).toBeTruthy();
-    expect(check).toHaveBeenCalledWith("antigravity");
-    expect(useAppStore.getState().quotas).toBe(profileQuotas);
   });
   it("clears an incompatible persona effort when that persona changes model", () => {
     const save = vi.fn();
@@ -374,29 +373,31 @@ describe("UI primitives", () => {
       screen.getByRole("article", { name: "Your message" }).classList.contains("justify-end")
     ).toBe(true);
 
-    render(
-      <MessageRow
-        consultReplies={[]}
-        message={{
-          id: "agent_msg",
-          seq: 2,
-          session_id: "session",
-          chain_id: "chain",
-          parent_msg_id: null,
-          sender_kind: "orchestrator",
-          sender_id: "codex",
-          recipients: [],
-          kind: "text",
-          content: "Final polished answer",
-          turn_id: "t_99",
-          metadata: {
-            streaming: false,
-            intermediate_notes: ["Checking repo structure..."],
-          },
-          created_at: 0,
-        }}
-      />
+    const complete: ChatMessage = {
+      id: "agent_msg",
+      seq: 2,
+      session_id: "session",
+      chain_id: "chain",
+      parent_msg_id: null,
+      sender_kind: "orchestrator",
+      sender_id: "codex",
+      recipients: [],
+      kind: "text",
+      content: "Final polished answer",
+      turn_id: "t_99",
+      metadata: {
+        streaming: false,
+        intermediate_notes: ["Checking repo structure..."],
+      },
+      created_at: 0,
+    };
+    const { rerender } = render(
+      <MessageRow consultReplies={[]} message={{ ...complete, content: "", metadata: { streaming: true } }} />
     );
+    expect(screen.getByRole("status").textContent?.trim()).toBe("Working…");
+    expect(screen.queryByText(/Thinking/)).toBeNull();
+    expect(screen.queryByRole("button", { name: /Steps/ })).toBeNull();
+    rerender(<MessageRow consultReplies={[]} message={complete} />);
     expect(screen.getByText("Final polished answer")).toBeTruthy();
     expect(screen.getByText(/Worked · 1 step/)).toBeTruthy();
   });
@@ -757,6 +758,12 @@ describe("UI primitives", () => {
     render(<Composer />);
 
     const trigger = screen.getByRole("button", { name: "Model and reasoning effort" });
+    const permission = screen.getByRole("button", { name: "Permission policy" });
+    fireEvent.click(permission);
+    expect(screen.getByRole("button", { name: /^Worktree Allow/ }).querySelector(".lucide-git-branch")).toBeTruthy();
+    expect(screen.getByRole("button", { name: /^Strict Prompt/ }).querySelector(".lucide-lock-keyhole")).toBeTruthy();
+    expect(screen.getByRole("button", { name: /^Auto Allow/ }).querySelector(".lucide-zap")).toBeTruthy();
+    fireEvent.click(permission);
     const editor = screen.getByRole("textbox", { name: "Message group chat" });
     const draft = (text: string) => {
       editor.textContent = text;
@@ -768,7 +775,11 @@ describe("UI primitives", () => {
     };
     const send = screen.getByRole("button", { name: /Send/i });
 
-    draft("Mention `@reviewer` in the documentation");
+    draft("Ask @codex to greet @reviewer");
+    expect((trigger as HTMLButtonElement).disabled).toBe(true);
+    expect(trigger.textContent).toContain("Auto route");
+
+    draft("@codex say hello to @reviewer");
     const codexMenu = openMenu("codex");
     fireEvent.click(codexMenu.getByRole("button", { name: "gpt-6-astra" }));
     const slider = codexMenu.getByRole("slider", { name: "Reasoning effort" });

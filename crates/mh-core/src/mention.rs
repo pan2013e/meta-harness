@@ -14,6 +14,11 @@ pub struct ParsedMentions {
     pub has_orchestrator: bool,
 }
 
+pub struct UserMentionRouting {
+    pub mentions: ParsedMentions,
+    pub needs_intent: bool,
+}
+
 impl ParsedMentions {
     pub fn is_unmentioned(&self) -> bool {
         self.targets.is_empty() && !self.has_all && !self.has_orchestrator
@@ -119,98 +124,152 @@ fn push_masked_line(out: &mut String, line: &str) {
     }
 }
 
-/// Extracts valid `@handle`, `@handle[model:effort]`, `@all`, and `@orchestrator` mentions
-/// outside fenced and inline code regions.
+/// Extracts all valid mentions outside fenced and inline code. Agents use this
+/// when handing off a completed reply or naming peers in an MCP message.
 pub fn parse_mentions(markdown: &str, valid_handles: &HashSet<String>) -> ParsedMentions {
+    parse_clean_mentions(&mask_code_regions(markdown), valid_handles)
+}
+
+/// A leading recipient list addresses the initial turn. Mentions in the
+/// following instruction are still passed to those recipients as prompt text.
+pub fn parse_user_mentions(markdown: &str, valid_handles: &HashSet<String>) -> UserMentionRouting {
     let cleaned = mask_code_regions(markdown);
-    let mut out = ParsedMentions::default();
-    let mut seen_handles: HashSet<String> = HashSet::new();
-
-    let chars: Vec<char> = cleaned.chars().collect();
-    let mut i = 0usize;
-
-    while i < chars.len() {
-        if chars[i] == '@' {
-            let prev_ok = i == 0 || is_mention_prefix_boundary(chars[i - 1]);
-            if prev_ok {
-                let start = i + 1;
-                let mut end = start;
-                while end < chars.len() && is_handle_char(chars[end]) {
-                    end += 1;
-                }
-                if end > start {
-                    // Ensure handle isn't a scoped npm package (`@scope/pkg`) or domain (`@foo.com`),
-                    // while allowing trailing sentence punctuation (`@all.`, `@codex,`).
-                    let after_ok = if end == chars.len() {
-                        true
-                    } else if chars[end] == '/' {
-                        false
-                    } else if chars[end] == '.' {
-                        !chars
-                            .get(end + 1)
-                            .is_some_and(|c| c.is_ascii_alphanumeric())
-                    } else {
-                        !is_handle_char(chars[end])
-                    };
-                    if after_ok {
-                        let raw_handle: String = chars[start..end].iter().collect();
-                        let handle_lc = raw_handle.to_ascii_lowercase();
-
-                        let mut model_override = None;
-                        let mut effort_override = None;
-                        let mut next_idx = end;
-
-                        // Optional `[model]` or `[model:effort]`
-                        if end < chars.len()
-                            && chars[end] == '['
-                            && let Some(close_rel) = chars[end + 1..].iter().position(|&c| c == ']')
-                        {
-                            let bracket_str: String =
-                                chars[end + 1..end + 1 + close_rel].iter().collect();
-                            if !bracket_str.is_empty() && !bracket_str.contains(char::is_whitespace)
-                            {
-                                if let Some((m, e)) = bracket_str.split_once(':') {
-                                    if !m.is_empty() {
-                                        model_override = Some(m.to_string());
-                                    }
-                                    if !e.is_empty() {
-                                        effort_override = Some(e.to_string());
-                                    }
-                                } else {
-                                    model_override = Some(bracket_str);
-                                }
-                                next_idx = end + 1 + close_rel + 1;
-                            }
-                        }
-
-                        if handle_lc == "all" {
-                            out.has_all = true;
-                        } else if handle_lc == "orchestrator" {
-                            out.has_orchestrator = true;
-                        } else if let Some(matched) = valid_handles
-                            .iter()
-                            .find(|h| h.eq_ignore_ascii_case(&raw_handle))
-                        {
-                            let key = matched.to_ascii_lowercase();
-                            if seen_handles.insert(key) {
-                                out.targets.push(ParsedMentionTarget {
-                                    handle: matched.clone(),
-                                    model_override,
-                                    effort_override,
-                                });
-                            }
-                        }
-
-                        i = next_idx;
-                        continue;
-                    }
-                }
-            }
+    let mut start = cleaned.trim_start();
+    while let Some(command) = start.split_whitespace().next() {
+        let name = command.trim_end_matches([',', '.', ';', ':', '!', '?']);
+        if !["/plan", "/review", "/test", "/fix", "/compact"]
+            .iter()
+            .any(|known| name.eq_ignore_ascii_case(known))
+        {
+            break;
         }
-        i += 1;
+        start = start[command.len()..].trim_start();
     }
 
+    let mut leading = ParsedMentions::default();
+    let mut seen = HashSet::new();
+    let mut remaining = start;
+    while let Some((mention, tail)) = mention_at_start(remaining) {
+        add_target(&mut leading, &mut seen, valid_handles, mention);
+        remaining = tail.trim_start_matches(|ch: char| ch.is_whitespace() || ch == ',');
+        if remaining.len() == tail.len() {
+            break;
+        }
+        if let Some(word) = remaining.split_whitespace().next()
+            && (word.eq_ignore_ascii_case("and") || word == "&")
+        {
+            remaining = remaining[word.len()..].trim_start();
+        }
+    }
+
+    if !leading.is_unmentioned() {
+        return UserMentionRouting {
+            mentions: leading,
+            needs_intent: false,
+        };
+    }
+
+    let mut mentions = ParsedMentions::default();
+    let mut previous_end = None;
+    let mut separated = false;
+    for (index, end, mention) in scan_mentions(&cleaned) {
+        let before = mentions.targets.len();
+        add_target(&mut mentions, &mut seen, valid_handles, mention);
+        if mentions.targets.len() != before {
+            separated |= previous_end.is_some_and(|start| {
+                let gap = cleaned[start..index]
+                    .trim_matches(|c: char| c.is_whitespace() || ",()".contains(c));
+                !gap.is_empty() && !gap.eq_ignore_ascii_case("and") && gap != "&"
+            });
+            previous_end = Some(end);
+        }
+    }
+    let needs_intent = separated && !mentions.has_all && !mentions.has_orchestrator;
+    UserMentionRouting {
+        mentions,
+        needs_intent,
+    }
+}
+
+fn parse_clean_mentions(cleaned: &str, valid_handles: &HashSet<String>) -> ParsedMentions {
+    let mut out = ParsedMentions::default();
+    let mut seen = HashSet::new();
+    for (_, _, mention) in scan_mentions(cleaned) {
+        add_target(&mut out, &mut seen, valid_handles, mention);
+    }
     out
+}
+
+fn scan_mentions(cleaned: &str) -> impl Iterator<Item = (usize, usize, ParsedMentionTarget)> + '_ {
+    let mut next_index = 0;
+    let mut previous = None;
+    cleaned.char_indices().filter_map(move |(index, ch)| {
+        let starts_mention =
+            index >= next_index && ch == '@' && previous.is_none_or(is_mention_prefix_boundary);
+        previous = Some(ch);
+        if starts_mention && let Some((mention, tail)) = mention_at_start(&cleaned[index..]) {
+            next_index = cleaned.len() - tail.len();
+            Some((index, next_index, mention))
+        } else {
+            None
+        }
+    })
+}
+
+fn mention_at_start(input: &str) -> Option<(ParsedMentionTarget, &str)> {
+    let input = input.strip_prefix('@')?;
+    let len = input
+        .bytes()
+        .take_while(|byte| byte.is_ascii_alphanumeric() || b"_-".contains(byte))
+        .count();
+    let (handle, mut tail) = input.split_at(len);
+    // Reject scoped packages and domain names while allowing sentence punctuation.
+    if handle.is_empty()
+        || tail.starts_with('/')
+        || tail
+            .strip_prefix('.')
+            .and_then(|rest| rest.as_bytes().first())
+            .is_some_and(u8::is_ascii_alphanumeric)
+    {
+        return None;
+    }
+
+    let mut target = ParsedMentionTarget {
+        handle: handle.to_string(),
+        model_override: None,
+        effort_override: None,
+    };
+    if let Some((qualifier, rest)) = tail.strip_prefix('[').and_then(|tail| tail.split_once(']'))
+        && !qualifier.is_empty()
+        && !qualifier.contains(char::is_whitespace)
+    {
+        let (model, effort) = qualifier.split_once(':').unwrap_or((qualifier, ""));
+        target.model_override = (!model.is_empty()).then(|| model.to_string());
+        target.effort_override = (!effort.is_empty()).then(|| effort.to_string());
+        tail = rest;
+    }
+
+    Some((target, tail))
+}
+
+fn add_target(
+    out: &mut ParsedMentions,
+    seen: &mut HashSet<String>,
+    valid_handles: &HashSet<String>,
+    mut target: ParsedMentionTarget,
+) {
+    if target.handle.eq_ignore_ascii_case("all") {
+        out.has_all = true;
+    } else if target.handle.eq_ignore_ascii_case("orchestrator") {
+        out.has_orchestrator = true;
+    } else if let Some(handle) = valid_handles
+        .iter()
+        .find(|handle| handle.eq_ignore_ascii_case(&target.handle))
+        && seen.insert(handle.to_ascii_lowercase())
+    {
+        target.handle.clone_from(handle);
+        out.targets.push(target);
+    }
 }
 
 fn is_mention_prefix_boundary(ch: char) -> bool {
@@ -219,10 +278,6 @@ fn is_mention_prefix_boundary(ch: char) -> bool {
             ch,
             '(' | '[' | '{' | '"' | '\'' | ',' | ':' | ';' | '>' | '*'
         )
-}
-
-fn is_handle_char(ch: char) -> bool {
-    ch.is_ascii_alphanumeric() || ch == '_' || ch == '-'
 }
 
 #[cfg(test)]
@@ -297,5 +352,45 @@ Real ping: @antigravity
         assert!(p.has_orchestrator);
         assert!(p.has_all);
         assert!(p.targets.is_empty());
+    }
+
+    #[test]
+    fn separates_leading_recipients_from_body_references() {
+        let routing = parse_user_mentions(
+            "/plan @codex[gpt-6.2-sol:high] say hello to @antigravity",
+            &handles(),
+        );
+        assert!(!routing.needs_intent);
+        assert_eq!(routing.mentions.targets.len(), 1);
+        assert_eq!(routing.mentions.targets[0].handle, "codex");
+        assert_eq!(
+            routing.mentions.targets[0].effort_override.as_deref(),
+            Some("high")
+        );
+        assert_eq!(
+            parse_mentions("Hi, @antigravity!", &handles()).targets[0].handle,
+            "antigravity"
+        );
+    }
+
+    #[test]
+    fn distinguishes_explicit_lists_from_ambiguous_inline_mentions() {
+        for text in [
+            "@codex and @antigravity review",
+            "Ask (@codex) and @antigravity to review",
+        ] {
+            let routing = parse_user_mentions(text, &handles());
+            assert_eq!(routing.mentions.targets.len(), 2);
+            assert!(!routing.needs_intent, "{text}");
+        }
+        let routing = parse_user_mentions("Ask @codex to greet @antigravity", &handles());
+        assert_eq!(routing.mentions.targets.len(), 2);
+        assert!(routing.needs_intent);
+        let routing = parse_user_mentions(
+            "@codex point out `@all` and ask about @antigravity",
+            &handles(),
+        );
+        assert_eq!(routing.mentions.targets.len(), 1);
+        assert!(!routing.mentions.has_all);
     }
 }

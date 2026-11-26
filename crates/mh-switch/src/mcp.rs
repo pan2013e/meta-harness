@@ -165,6 +165,7 @@ pub async fn execute_mcp_tool(
     match tool_name {
         "chat_list_peers" => {
             let members = engine.store.list_members(session_id)?;
+            let available = engine.available_members(&members).await;
             let statuses = engine.get_member_statuses(session_id).await;
             let list: Vec<Value> = members
                 .into_iter()
@@ -178,6 +179,7 @@ pub async fn execute_mcp_tool(
                         "adapter_id": m.adapter_id,
                         "display_name": m.display_name,
                         "role": m.role,
+                        "available": available.contains(&m.handle),
                         "status": st,
                         "current_turn_id": turn_id,
                         "active_model": m.active_model,
@@ -330,6 +332,7 @@ pub async fn execute_mcp_tool(
         "models_list_catalog" => {
             let cfg = engine.config.read().await.clone();
             let members = engine.store.list_members(session_id)?;
+            let available = engine.available_members(&members).await;
             let mut catalog = Vec::new();
             for m in members {
                 let opts = engine
@@ -341,6 +344,7 @@ pub async fn execute_mcp_tool(
                     "handle": m.handle,
                     "adapter_id": m.adapter_id,
                     "role": m.role,
+                    "available": available.contains(&m.handle),
                     "discovered_options": opts,
                     "characteristics": char_info,
                 }));

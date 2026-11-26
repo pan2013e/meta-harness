@@ -21,13 +21,13 @@ interface Props {
 }
 
 export const MessageRow = memo(function MessageRow({ message, consultReplies }: Props) {
-  const { inspectTurn, turnCounters, adapters, members } = useAppStore();
+  const inspectTurn = useAppStore((state) => state.inspectTurn);
+  const counters = useAppStore((state) => message.turn_id ? state.turnCounters[message.turn_id] : undefined);
+  const accent = useAppStore((state) => {
+    const member = state.members.find((m) => m.handle === message.sender_id);
+    return (member && state.adapters[member.adapter_id]?.accent_color) || "#6366f1";
+  });
   const [consultExpanded, setConsultExpanded] = useState(false);
-
-  const member = members.find((m) => m.handle === message.sender_id);
-  const accent = member
-    ? (adapters[member.adapter_id]?.accent_color ?? "#6366f1")
-    : "#6366f1";
 
   if (message.kind === "activity_pill") {
     return (
@@ -49,7 +49,7 @@ export const MessageRow = memo(function MessageRow({ message, consultReplies }: 
   if (message.kind === "merge_notice" || message.kind === "system_notice") {
     return (
       <div className="px-6 py-1 flex items-center justify-center">
-        <div className="inline-flex items-center gap-1.5 px-3 py-1 rounded-lg bg-pos-soft border border-pos/25 text-[11px] text-pos">
+        <div className={`inline-flex items-center gap-1.5 rounded-lg border px-3 py-1 text-xs ${message.metadata.error ? "border-neg/25 bg-neg-soft text-neg" : "border-line bg-elevated text-ink-soft"}`}>
           <GitCommitHorizontal className="w-3.5 h-3.5" />
           <span>{message.content}</span>
         </div>
@@ -67,7 +67,7 @@ export const MessageRow = memo(function MessageRow({ message, consultReplies }: 
 
     return (
       <div className="px-5 py-1.5">
-        <div className="rounded-xl border border-warn/30 bg-warn-soft/50 p-3.5 space-y-2 text-xs">
+        <div className="mx-auto max-w-[50rem] space-y-2 rounded-xl border border-line bg-elevated/60 p-3.5 text-xs">
           <div className="flex items-center justify-between gap-2">
             <div className="flex items-center gap-2 font-semibold text-warn">
               <Crown className="w-3.5 h-3.5" />
@@ -84,7 +84,7 @@ export const MessageRow = memo(function MessageRow({ message, consultReplies }: 
                 key={idx}
                 className="px-2 py-0.5 rounded-md bg-panel border border-line font-mono text-[11px] text-brand-ink"
               >
-                @{d.target} [{d.model ?? "auto"} · {d.effort ?? "auto"}]
+                @{d.target.replace(/^@+/, "")} · {d.model ?? "Auto"} / {d.effort ?? "auto"}
               </span>
             ))}
           </div>
@@ -161,42 +161,52 @@ export const MessageRow = memo(function MessageRow({ message, consultReplies }: 
     );
   }
 
-  // Developer Thread Row (Slack / Discord / Linear style)
   const isUser = message.sender_kind === "user";
   const model = typeof message.metadata.model === "string" ? message.metadata.model : null;
   const effort = typeof message.metadata.effort === "string" ? message.metadata.effort : null;
   const streaming = message.metadata.streaming === true;
-  const counters = message.turn_id ? turnCounters[message.turn_id] : undefined;
+  const time = new Date(message.created_at).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+
+  if (isUser) {
+    return (
+      <article aria-label="Your message" className="mx-auto flex max-w-[50rem] justify-end px-4 py-3 sm:px-6">
+        <div className="min-w-0 max-w-[88%] sm:max-w-[78%]">
+          <div className="mb-1.5 flex items-center justify-end gap-2 px-1 text-xs">
+            <span className="text-ink-muted">{time}</span>
+            <span className="font-medium text-ink-soft">You</span>
+          </div>
+          <div className="rounded-2xl rounded-tr-md border border-brand/25 bg-brand-soft px-4 py-2.5">
+            <MarkdownBlock content={message.content} />
+          </div>
+        </div>
+      </article>
+    );
+  }
 
   return (
-    <div
-      className={`px-5 py-3 border-b border-line/40 transition-colors hover:bg-hover/35 ${
-        isUser ? "bg-panel/40" : ""
-      }`}
-    >
-      <div className="max-w-4xl mx-auto flex items-start gap-3.5">
+    <article className="mx-auto max-w-[50rem] px-4 py-3 sm:px-6">
+      <div className="flex items-start gap-3">
         <HarnessAvatar
-          handle={isUser ? "You" : message.sender_id}
+          handle={message.sender_id}
           accentColor={accent}
-          isUser={isUser}
-          size="md"
+          size="sm"
         />
 
         <div className="flex-1 min-w-0 space-y-1.5">
           {/* Sender Metadata Row */}
-          <div className="flex items-center justify-between gap-3">
+          <div className="flex items-center gap-2">
             <div className="flex items-center gap-2 flex-wrap">
               <span className="text-[13px] font-semibold text-ink">
-                {isUser ? "You" : `@${message.sender_id}`}
+                @{message.sender_id}
               </span>
               {message.sender_kind === "orchestrator" && (
-                <span className="inline-flex items-center gap-1 text-[10px] px-1.5 py-0.5 rounded-md bg-warn-soft text-warn font-medium">
+                <span className="inline-flex items-center gap-1 text-[10px] px-1.5 py-0.5 rounded-md bg-elevated text-ink-soft font-medium">
                   <Sparkles className="w-2.5 h-2.5" />
                   <span>Orchestrator</span>
                 </span>
               )}
               {model && (
-                <span className="font-mono text-[10.5px] px-1.5 py-0.5 rounded-md bg-elevated border border-line text-ink-soft">
+                <span className="text-[11px] text-ink-muted">
                   {model}
                   {effort ? ` · ${effort}` : ""}
                 </span>
@@ -204,16 +214,11 @@ export const MessageRow = memo(function MessageRow({ message, consultReplies }: 
               {streaming && (
                 <span className="inline-flex items-center gap-1 text-[10px] font-mono text-brand-ink">
                   <span className="w-1.5 h-1.5 rounded-full bg-brand animate-ping" />
-                  <span>streaming</span>
+                  <span>Working</span>
                 </span>
               )}
             </div>
-            <span className="text-[10.5px] text-ink-muted font-mono shrink-0">
-              {new Date(message.created_at).toLocaleTimeString([], {
-                hour: "2-digit",
-                minute: "2-digit",
-              })}
-            </span>
+            <span className="shrink-0 text-[11px] text-ink-muted">{time}</span>
           </div>
 
           {/* Content */}
@@ -229,7 +234,7 @@ export const MessageRow = memo(function MessageRow({ message, consultReplies }: 
                 onClick={() => {
                   if (message.turn_id) void inspectTurn(message.turn_id);
                 }}
-                className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-lg bg-elevated hover:bg-hover border border-line text-ink-soft hover:text-brand-ink transition-colors"
+                className="inline-flex items-center gap-1.5 rounded-lg px-2 py-1 text-ink-muted transition-colors hover:bg-hover hover:text-brand-ink"
               >
                 <SearchCode className="w-3.5 h-3.5 text-brand-ink" />
                 <span>
@@ -244,7 +249,7 @@ export const MessageRow = memo(function MessageRow({ message, consultReplies }: 
           )}
         </div>
       </div>
-    </div>
+    </article>
   );
 });
 
@@ -255,10 +260,17 @@ function PermissionInlineCard({
   sessionId: string;
   prompt: PendingPermissionView;
 }) {
-  const { pendingPermissions } = useAppStore();
-  const isPending = pendingPermissions.some(
-    (p) => p.request_id === prompt.request_id
+  const isPending = useAppStore((state) =>
+    state.pendingPermissions.some((p) => p.request_id === prompt.request_id)
   );
+  const setError = useAppStore((state) => state.setError);
+  const allow = prompt.options.find((option) => option.kind === "allow_once");
+  const deny = prompt.options.find((option) => option.kind === "reject_once");
+  const patternOption = allow ?? prompt.options.find((option) => option.kind === "allow_always");
+  const resolve = (optionId: string, pattern?: string) => {
+    void api.resolvePermission(sessionId, prompt.request_id, optionId, pattern)
+      .catch((error: unknown) => setError(error instanceof Error ? error.message : String(error)));
+  };
 
   if (!prompt?.request_id) return null;
 
@@ -282,40 +294,31 @@ function PermissionInlineCard({
         )}
         {isPending ? (
           <div className="flex flex-wrap gap-2 pt-1">
-            <button
+            {allow && <button
               type="button"
-              onClick={() =>
-                void api.resolvePermission(sessionId, prompt.request_id, "allow_once")
-              }
+              onClick={() => resolve(allow.option_id)}
               className="px-3 py-1.5 rounded-lg bg-emerald-600 hover:bg-emerald-500 text-white font-medium"
             >
               Allow Once (Alt+A)
-            </button>
-            {prompt.suggested_pattern && (
+            </button>}
+            {patternOption && prompt.suggested_pattern && (
               <button
                 type="button"
                 onClick={() =>
-                  void api.resolvePermission(
-                    sessionId,
-                    prompt.request_id,
-                    "allow_always",
-                    prompt.suggested_pattern ?? undefined
-                  )
+                  resolve(patternOption.option_id, prompt.suggested_pattern ?? undefined)
                 }
                 className="px-3 py-1.5 rounded-lg bg-brand hover:bg-brand-hover text-white font-medium"
               >
                 Allow &ldquo;{prompt.suggested_pattern}&rdquo; for Session
               </button>
             )}
-            <button
+            {deny && <button
               type="button"
-              onClick={() =>
-                void api.resolvePermission(sessionId, prompt.request_id, "reject_once")
-              }
+              onClick={() => resolve(deny.option_id)}
               className="px-3 py-1.5 rounded-lg bg-elevated hover:bg-hover border border-line text-ink-soft"
             >
               Deny (Alt+R)
-            </button>
+            </button>}
           </div>
         ) : (
           <div className="text-[11px] text-ink-muted">Permission resolved.</div>

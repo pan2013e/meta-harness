@@ -6,6 +6,7 @@ pub mod platform;
 pub mod protocol;
 pub mod quota;
 pub mod supervisor;
+mod trajectory;
 pub mod worktree;
 
 pub use broker::{
@@ -20,7 +21,10 @@ pub use platform::{
 };
 pub use protocol::{McpEnvVar, McpServerSpec};
 pub use quota::{AdapterProbeStatus, QuotaTracker, probe_installed_adapters};
-pub use supervisor::{AcpSupervisor, ManagedMemberClient, MemberSpawnSpec, build_mcp_bridge_spec};
+pub use supervisor::{
+    AcpSupervisor, ManagedMemberClient, MemberSpawnSpec, build_mcp_bridge_spec,
+    resolve_adapter_command,
+};
 pub use worktree::{
     IntegrationWorktree, MemberWorktree, MergeOutcome, PromoteResult, RepoStatus,
     SessionDiffReport, ensure_member_worktree, ensure_session_integration_worktree, get_head_sha,

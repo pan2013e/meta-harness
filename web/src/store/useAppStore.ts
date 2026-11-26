@@ -73,6 +73,7 @@ interface AppState {
   theme: ThemeId;
   sidebarCollapsed: boolean;
   folderModalOpen: boolean;
+  settingsOpen: boolean;
   pickingFolder: boolean;
   quotasRefreshing: boolean;
 
@@ -112,6 +113,7 @@ interface AppState {
   setTheme: (theme: ThemeId) => void;
   toggleSidebar: () => void;
   setFolderModalOpen: (open: boolean) => void;
+  setSettingsOpen: (open: boolean) => void;
   openProjectWithNativeOrModal: () => Promise<void>;
 
   init: () => Promise<void>;
@@ -141,15 +143,54 @@ interface AppState {
   handleWsEvent: (ev: WsEvent) => void;
 }
 
-export const useAppStore = create<AppState>((set, get) => ({
+const emptySessionState = {
+  activeSession: null,
+  members: [],
+  memberStatuses: {},
+  permissionRules: [],
+  pendingPermissions: [],
+  sessionDiff: null,
+  hopPaused: null,
+  messages: [],
+  trajectories: [],
+  turnCounters: {},
+  inspectedTurnId: null,
+  inspectedTrajectory: null,
+  inspectedEvents: [],
+};
+
+export const useAppStore = create<AppState>((set, get) => {
+  let initializing = false;
+  let projectRequest = 0;
+  let sessionRequest = 0;
+  let diffRequest = 0;
+  let inspectionRequest = 0;
+  let memoryRequest = 0;
+  let trajectoryRequest = 0;
+  let sessionLoad: { id: string; events: WsEvent[] } | null = null;
+
+  const clearSession = () => {
+    sessionRequest++;
+    inspectionRequest++;
+    sessionLoad = null;
+    get().wsClient?.subscribeTrajectory(null);
+    get().wsClient?.setSession(null);
+    set(emptySessionState);
+  };
+
+  const reportError = (error: unknown) =>
+    set({ errorBanner: error instanceof Error ? error.message : String(error) });
+
+  return {
   authRequired: false,
   authenticated: true,
   bootstrapping: true,
   errorBanner: null,
 
   theme: getInitialTheme(),
-  sidebarCollapsed: false,
+  sidebarCollapsed: typeof window !== "undefined" && window.matchMedia?.("(max-width: 1023px)").matches === true,
   folderModalOpen: false,
+  settingsOpen: false,
   pickingFolder: false,
   quotasRefreshing: false,
 
@@ -188,6 +229,7 @@ export const useAppStore = create<AppState>((set, get) => ({
   },
   toggleSidebar: () => set((s) => ({ sidebarCollapsed: !s.sidebarCollapsed })),
   setFolderModalOpen: (open) => set({ folderModalOpen: open }),
+  setSettingsOpen: (open) => set({ settingsOpen: open }),
 
   openProjectWithNativeOrModal: async () => {
     if (get().pickingFolder) return;
@@ -215,18 +257,19 @@ export const useAppStore = create<AppState>((set, get) => ({
   setError: (msg) => set({ errorBanner: msg }),
 
   init: async () => {
+    if (initializing) return;
+    initializing = true;
     applyThemeToDom(get().theme);
     try {
       const urlParams = new URLSearchParams(window.location.search);
       const tokenParam = urlParams.get("token");
       if (tokenParam) {
-        setBearerToken(tokenParam);
-        await api.createAuthSession(tokenParam);
         urlParams.delete("token");
         const cleanUrl =
           window.location.pathname +
           (urlParams.toString() ? `?${urlParams.toString()}` : "");
-        window.history.replaceState({}, "", cleanUrl);
+        window.history.replaceState({}, "", cleanUrl + window.location.hash);
+        await api.createAuthSession(tokenParam);
       }
 
       const auth = await api.authStatus();
@@ -239,19 +282,17 @@ export const useAppStore = create<AppState>((set, get) => ({
         return;
       }
 
-      const [adaptersRes, probeRes, quotaRes, projRes] = await Promise.all([
+      const [adaptersRes, probeRes, projRes] = await Promise.all([
         api.listAdapters(),
         api.probeAdapters(),
-        api.listQuotas(),
         api.listProjects(),
       ]);
 
-      const quotaMap: Record<string, QuotaSnapshot> = {};
-      for (const q of quotaRes.quotas) {
-        quotaMap[q.adapter_id] = q;
-      }
-
-      const ws = new WsHubClient((ev) => get().handleWsEvent(ev));
+      get().wsClient?.disconnect();
+      const ws = new WsHubClient((ev) => get().handleWsEvent(ev), () => {
+        const sessionId = get().activeSession?.id;
+        if (sessionId && !sessionLoad) void get().selectSession(sessionId);
+      });
       ws.connect(null);
 
       set({
@@ -260,47 +301,58 @@ export const useAppStore = create<AppState>((set, get) => ({
         bootstrapping: false,
         adapters: adaptersRes.adapters,
         probes: probeRes.probes,
-        quotas: quotaMap,
         projects: projRes.projects,
         wsClient: ws,
       });
+
+      void get().refreshQuotas().catch((error: unknown) => reportError(error));
 
       if (projRes.projects.length > 0) {
         await get().selectProject(projRes.projects[0].id);
       }
     } catch (e) {
+      const auth = await api.authStatus().catch(() => null);
       set({
         bootstrapping: false,
+        ...(auth && { authRequired: auth.required, authenticated: auth.authenticated }),
         errorBanner: e instanceof Error ? e.message : String(e),
       });
+    } finally {
+      initializing = false;
     }
   },
 
   authenticateWithToken: async (token: string) => {
-    setBearerToken(token);
-    await api.createAuthSession(token);
-    set({ authenticated: true, bootstrapping: true });
-    await get().init();
+    if (get().bootstrapping || !token) return;
+    set({ bootstrapping: true, errorBanner: null });
+    try {
+      await api.createAuthSession(token);
+      setBearerToken(null);
+      await get().init();
+    } catch (error) {
+      set({ bootstrapping: false });
+      reportError(error);
+    }
   },
 
   selectProject: async (projectId: string) => {
-    const [{ sessions }, mem] = await Promise.all([
-      api.listSessions(projectId),
-      api.getMemory(projectId),
-    ]);
-    set({
-      activeProjectId: projectId,
-      sessions,
-      memoryJobs: mem.jobs,
-      memoryFacts: mem.facts,
-      activeSession: null,
-      members: [],
-      messages: [],
-      trajectories: [],
-      sessionDiff: null,
-    });
-    if (sessions.length > 0) {
-      await get().selectSession(sessions[0].id);
+    const request = ++projectRequest;
+    const memoryAtStart = ++memoryRequest;
+    clearSession();
+    set({ activeProjectId: projectId, sessions: [], memoryJobs: [], memoryFacts: [] });
+    try {
+      const [{ sessions }, mem] = await Promise.all([
+        api.listSessions(projectId),
+        api.getMemory(projectId),
+      ]);
+      if (request !== projectRequest) return;
+      set({
+        sessions,
+        ...(memoryAtStart === memoryRequest && { memoryJobs: mem.jobs, memoryFacts: mem.facts }),
+      });
+      if (sessions.length > 0) await get().selectSession(sessions[0].id);
+    } catch (error) {
+      if (request === projectRequest) reportError(error);
     }
   },
 
@@ -313,7 +365,7 @@ export const useAppStore = create<AppState>((set, get) => ({
     const { projects } = await api.listProjects();
     set({ projects, folderModalOpen: false, errorBanner: null });
     await get().selectProject(project.id);
-    if (get().sessions.length === 0) {
+    if (get().activeProjectId === project.id && project.is_git_repo && get().sessions.length === 0) {
       await get().createAndSelectSession("Main Group Chat");
     }
   },
@@ -328,57 +380,73 @@ export const useAppStore = create<AppState>((set, get) => ({
   },
 
   selectSession: async (sessionId: string) => {
-    const [detail, msgsRes, trajRes] = await Promise.all([
-      api.getSession(sessionId),
-      api.listMessages(sessionId),
-      api.listTrajectories(sessionId),
-    ]);
-
-    const statusMap: Record<string, { status: MemberStatus; turnId: string | null }> =
-      {};
-    for (const [h, pair] of Object.entries(detail.statuses)) {
-      statusMap[h] = { status: pair[0] as MemberStatus, turnId: pair[1] };
-    }
-
+    const current = get().activeSession?.id === sessionId;
+    if (!current) clearSession();
+    const request = ++sessionRequest;
+    const load = sessionLoad?.id === sessionId ? sessionLoad : { id: sessionId, events: [] as WsEvent[] };
+    sessionLoad = load;
     get().wsClient?.setSession(sessionId);
-
-    set({
-      activeSession: detail.session,
-      members: detail.members,
-      permissionRules: detail.permission_rules,
-      pendingPermissions: detail.pending_permissions,
-      memberStatuses: statusMap,
-      messages: msgsRes.messages,
-      trajectories: trajRes.trajectories,
-      hopPaused: null,
-    });
-
-    await get().refreshSessionDiff();
+    try {
+      const [detail, msgsRes, trajRes] = await Promise.all([
+        api.getSession(sessionId),
+        api.listMessages(sessionId),
+        api.listTrajectories(sessionId),
+      ]);
+      if (request !== sessionRequest) return;
+      const existing = new Map(get().messages.map((message) => [message.id, message]));
+      const statusMap = Object.fromEntries(
+        Object.entries(detail.statuses).map(([handle, [status, turnId]]) => [handle, { status, turnId }]),
+      );
+      set({
+        activeSession: detail.session,
+        members: detail.members,
+        permissionRules: detail.permission_rules,
+        pendingPermissions: detail.pending_permissions,
+        memberStatuses: statusMap,
+        messages: msgsRes.messages.map((message) =>
+          message.metadata.streaming === true ? existing.get(message.id) ?? message : message,
+        ),
+        trajectories: trajRes.trajectories,
+      });
+      sessionLoad = null;
+      for (const event of load.events) get().handleWsEvent(event);
+      await get().refreshSessionDiff();
+    } catch (error) {
+      if (request === sessionRequest) {
+        sessionLoad = null;
+        for (const event of load.events) get().handleWsEvent(event);
+        reportError(error);
+      }
+    }
   },
 
   createAndSelectSession: async (title: string, orchestrator?: string | null) => {
     const pid = get().activeProjectId;
     if (!pid) return;
+    const request = projectRequest;
     const { session } = await api.createSession(pid, {
       title,
       orchestrator_member: orchestrator,
     });
     const { sessions } = await api.listSessions(pid);
+    if (request !== projectRequest) return;
     set({ sessions });
     await get().selectSession(session.id);
   },
 
   deleteSessionById: async (sessionId: string) => {
     const pid = get().activeProjectId;
+    const request = projectRequest;
     await api.deleteSession(sessionId);
     if (pid) {
       const { sessions } = await api.listSessions(pid);
+      if (request !== projectRequest) return;
       set({ sessions });
-      if (get().activeSession?.id === sessionId) {
+      if (get().activeSession?.id === sessionId || sessionLoad?.id === sessionId) {
         if (sessions.length > 0) {
           await get().selectSession(sessions[0].id);
         } else {
-          set({ activeSession: null, members: [], messages: [], trajectories: [] });
+          clearSession();
         }
       }
     }
@@ -387,11 +455,13 @@ export const useAppStore = create<AppState>((set, get) => ({
   refreshSessionDiff: async () => {
     const sid = get().activeSession?.id;
     if (!sid) return;
+    const request = ++diffRequest;
+    const selected = sessionRequest;
     try {
       const { diff } = await api.getSessionDiff(sid);
-      set({ sessionDiff: diff });
+      if (request === diffRequest && selected === sessionRequest) set({ sessionDiff: diff });
     } catch {
-      set({ sessionDiff: null });
+      if (request === diffRequest && selected === sessionRequest) set({ sessionDiff: null });
     }
   },
 
@@ -399,7 +469,8 @@ export const useAppStore = create<AppState>((set, get) => ({
     const sid = get().activeSession?.id;
     if (!sid || !content.trim()) return;
     set({ hopPaused: null });
-    await api.postMessage(sid, content);
+    const { message } = await api.postMessage(sid, content);
+    get().handleWsEvent({ type: "chat.message_created", message });
   },
 
   stopAll: async () => {
@@ -416,22 +487,36 @@ export const useAppStore = create<AppState>((set, get) => ({
   },
 
   inspectTurn: async (turnId: string) => {
-    const res = await api.getTrajectory(turnId);
+    const request = ++inspectionRequest;
+    set({ drawerOpen: true, drawerTab: "trajectory", inspectedTurnId: turnId,
+      inspectedTrajectory: null, inspectedEvents: [] });
     get().wsClient?.subscribeTrajectory(turnId);
-    set({
-      drawerOpen: true,
-      drawerTab: "trajectory",
-      inspectedTurnId: turnId,
-      inspectedTrajectory: res.trajectory,
-      inspectedEvents: res.events,
-    });
+    try {
+      const res = await api.getTrajectory(turnId);
+      if (request !== inspectionRequest) return;
+      set((state) => {
+        const events = new Map(res.events.map((event) => [event.id, event]));
+        for (const event of state.inspectedEvents) events.set(event.id, event);
+        return { inspectedTrajectory: res.trajectory,
+          inspectedEvents: [...events.values()].sort((a, b) => a.id - b.id) };
+      });
+    } catch (error) {
+      if (request === inspectionRequest) reportError(error);
+    }
   },
 
   openDrawerTab: (tab: DrawerTab) => {
+    const wasOpen = get().drawerOpen;
     set({ drawerOpen: true, drawerTab: tab });
+    if (tab === "trajectory" && (!wasOpen || !get().inspectedTurnId)) {
+      const activeTurn = Object.values(get().memberStatuses).find(({ turnId }) => turnId)?.turnId;
+      const turn = get().inspectedTurnId ?? activeTurn ?? get().trajectories[0]?.turn_id;
+      if (turn) void get().inspectTurn(turn);
+    }
   },
 
   closeDrawer: () => {
+    inspectionRequest++;
     get().wsClient?.subscribeTrajectory(null);
     set({ drawerOpen: false });
   },
@@ -439,15 +524,14 @@ export const useAppStore = create<AppState>((set, get) => ({
   refreshMemory: async (query?: string) => {
     const pid = get().activeProjectId;
     if (!pid) return;
+    const request = ++memoryRequest;
     const mem = await api.getMemory(pid, query);
-    set({ memoryJobs: mem.jobs, memoryFacts: mem.facts });
+    if (request === memoryRequest) set({ memoryJobs: mem.jobs, memoryFacts: mem.facts });
   },
 
   refreshQuotas: async () => {
     const { quotas } = await api.listQuotas();
-    const map: Record<string, QuotaSnapshot> = {};
-    for (const q of quotas) map[q.adapter_id] = q;
-    set({ quotas: map });
+    for (const snapshot of quotas) get().handleWsEvent({ type: "quota.updated", snapshot });
   },
 
   refreshQuotasLive: async () => {
@@ -468,13 +552,20 @@ export const useAppStore = create<AppState>((set, get) => ({
   },
 
   handleWsEvent: (ev: WsEvent) => {
+    const eventSessionId = "message" in ev ? ev.message.session_id
+      : "session_id" in ev ? ev.session_id
+      : "prompt" in ev ? ev.prompt.session_id : null;
+    if (sessionLoad && eventSessionId === sessionLoad.id) {
+      sessionLoad.events.push(ev);
+      return;
+    }
     const activeSid = get().activeSession?.id;
     switch (ev.type) {
       case "chat.message_created": {
         if (ev.message.session_id !== activeSid) return;
         set((s) => {
           if (s.messages.some((m) => m.id === ev.message.id)) return s;
-          return { messages: [...s.messages, ev.message] };
+          return { messages: [...s.messages, ev.message].sort((a, b) => a.seq - b.seq) };
         });
         break;
       }
@@ -482,7 +573,8 @@ export const useAppStore = create<AppState>((set, get) => ({
         if (ev.session_id !== activeSid) return;
         set((s) => ({
           messages: s.messages.map((m) =>
-            m.id === ev.message_id ? { ...m, content: m.content + ev.delta } : m
+            m.id === ev.message_id && m.metadata.streaming === true
+              ? { ...m, content: m.content + ev.delta } : m
           ),
         }));
         break;
@@ -495,9 +587,13 @@ export const useAppStore = create<AppState>((set, get) => ({
             : [...s.messages, ev.message],
         }));
         if (ev.message.session_id) {
+          const selected = sessionRequest;
+          const request = ++trajectoryRequest;
           void api.listTrajectories(ev.message.session_id).then((res) => {
-            set({ trajectories: res.trajectories });
-          });
+            if (selected === sessionRequest && request === trajectoryRequest) {
+              set({ trajectories: res.trajectories });
+            }
+          }).catch(() => undefined);
         }
         break;
       }
@@ -542,8 +638,8 @@ export const useAppStore = create<AppState>((set, get) => ({
         break;
       }
       case "trajectory.event": {
-        if (ev.turn_id === get().inspectedTurnId) {
-          set((s) => ({
+        if (ev.session_id === activeSid && ev.turn_id === get().inspectedTurnId) {
+          set((s) => s.inspectedEvents.some((event) => event.id === ev.event.id) ? s : ({
             inspectedEvents: [...s.inspectedEvents, ev.event],
           }));
         }
@@ -571,7 +667,7 @@ export const useAppStore = create<AppState>((set, get) => ({
       }
       case "permission.requested": {
         if (ev.prompt.session_id !== activeSid) return;
-        set((s) => ({
+        set((s) => s.pendingPermissions.some((p) => p.request_id === ev.prompt.request_id) ? s : ({
           pendingPermissions: [...s.pendingPermissions, ev.prompt],
         }));
         break;
@@ -586,9 +682,8 @@ export const useAppStore = create<AppState>((set, get) => ({
         break;
       }
       case "quota.updated": {
-        set((s) => ({
-          quotas: { ...s.quotas, [ev.snapshot.adapter_id]: ev.snapshot },
-        }));
+        set((s) => (s.quotas[ev.snapshot.adapter_id]?.updated_at ?? 0) > ev.snapshot.updated_at
+          ? s : { quotas: { ...s.quotas, [ev.snapshot.adapter_id]: ev.snapshot } });
         break;
       }
       case "memory.job_curated": {
@@ -601,4 +696,5 @@ export const useAppStore = create<AppState>((set, get) => ({
       }
     }
   },
-}));
+  };
+});

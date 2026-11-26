@@ -9,11 +9,13 @@ export function Composer() {
     activeSession,
     members,
     adapters,
+    probes,
     quotas,
     memberStatuses,
     sendMessage,
     stopAll,
     selectSession,
+    setError,
   } = useAppStore();
 
   const [text, setText] = useState("");
@@ -21,13 +23,17 @@ export function Composer() {
   const [selectedIdx, setSelectedIdx] = useState(0);
   const [menuDismissed, setMenuDismissed] = useState(false);
   const textareaRef = useRef<HTMLTextAreaElement | null>(null);
+  const availableMembers = useMemo(() => members.filter((member) =>
+    probes.some((probe) => probe.adapter_id === member.adapter_id && probe.installed)), [members, probes]);
+  const orchestrator = availableMembers.find((member) => member.handle === activeSession?.orchestrator_member);
 
   const anyActive = Object.values(memberStatuses).some(
     (s) =>
       s.status === "thinking" ||
       s.status === "running_tool" ||
       s.status === "spawning" ||
-      s.status === "consulting"
+      s.status === "consulting" ||
+      s.status === "waiting_permission"
   );
 
   const mentionQuery = useMemo(() => {
@@ -51,10 +57,10 @@ export function Composer() {
   const candidates = useMemo(() => {
     if (mentionQuery === null || menuDismissed) return [];
     const base = [
-      ...members.map((m) => {
+      ...availableMembers.map((m) => {
         const q = quotas[m.adapter_id];
         const minPct =
-          q?.window_5h_remaining_pct !== null && q?.weekly_remaining_pct !== null
+          q && q.window_5h_remaining_pct !== null && q.weekly_remaining_pct !== null
             ? Math.min(q.window_5h_remaining_pct, q.weekly_remaining_pct)
             : (q?.window_5h_remaining_pct ?? q?.weekly_remaining_pct ?? null);
         return {
@@ -69,21 +75,21 @@ export function Composer() {
                 : null,
         };
       }),
-      {
+      ...(orchestrator ? [{
         handle: "orchestrator",
         desc: "Session Orchestrator",
         accent: "#f59e0b",
         pctLabel: null,
-      },
-      {
+      }] : []),
+      ...(availableMembers.length ? [{
         handle: "all",
-        desc: "Broadcast to all executors",
+        desc: "All available executors",
         accent: "#6366f1",
         pctLabel: null,
-      },
+      }] : []),
     ];
     return base.filter((c) => c.handle.toLowerCase().startsWith(mentionQuery));
-  }, [mentionQuery, menuDismissed, members, adapters, quotas]);
+  }, [mentionQuery, menuDismissed, availableMembers, orchestrator, adapters, quotas]);
 
   const routingPreview = useMemo(() => {
     if (!activeSession) return "";
@@ -91,13 +97,11 @@ export function Composer() {
       text.replace(/```[\s\S]*?```|`[^`]+`/g, " ").matchAll(/(?:^|\s)@([a-zA-Z0-9_-]+)/g)
     ).map((m) => m[1]);
     if (explicit.length > 0) {
-      return `Direct -> ${explicit.map((h) => `@${h}`).join(", ")}`;
+      return `To ${[...new Set(explicit)].map((h) => `@${h}`).join(", ")}`;
     }
-    if (activeSession.orchestrator_member) {
-      return `Auto -> Orchestrator (@${activeSession.orchestrator_member})`;
-    }
-    return `Default -> @${members[0]?.handle ?? "member"}`;
-  }, [text, activeSession, members]);
+    if (orchestrator) return `To @${orchestrator.handle} · Orchestrator`;
+    return availableMembers.length ? `To @${availableMembers[0].handle}` : "No harness available";
+  }, [text, activeSession, availableMembers, orchestrator]);
 
   const insertMention = (handle: string) => {
     setText((prev) =>
@@ -108,12 +112,15 @@ export function Composer() {
   };
 
   const handleSend = async () => {
-    if (!text.trim() || sending || !activeSession) return;
+    if (!text.trim() || sending || !activeSession || !availableMembers.length) return;
     const body = text.trim();
     setText("");
     setSending(true);
     try {
       await sendMessage(body);
+    } catch (error) {
+      setText((current) => current ? `${body}\n${current}` : body);
+      setError(error instanceof Error ? error.message : String(error));
     } finally {
       setSending(false);
     }
@@ -121,19 +128,25 @@ export function Composer() {
 
   const toggleConfirmFirst = async () => {
     if (!activeSession) return;
-    await api.patchSession(activeSession.id, {
-      confirm_before_dispatch: !activeSession.confirm_before_dispatch,
-    });
-    await selectSession(activeSession.id);
+    try {
+      await api.patchSession(activeSession.id, {
+        confirm_before_dispatch: !activeSession.confirm_before_dispatch,
+      });
+      if (useAppStore.getState().activeSession?.id === activeSession.id) {
+        await selectSession(activeSession.id);
+      }
+    } catch (error) {
+      setError(error instanceof Error ? error.message : String(error));
+    }
   };
 
   if (!activeSession) return null;
 
   return (
-    <div className="border-t border-line bg-panel/80 px-4 py-3 relative">
-      <div className="max-w-4xl mx-auto relative">
+    <div className="relative px-4 pb-4 pt-2 sm:px-6">
+      <div className="relative mx-auto max-w-[50rem]">
         {candidates.length > 0 && (
-          <div className="absolute bottom-full left-0 mb-2 w-80 rounded-xl border border-line-strong bg-panel shadow-2xl overflow-hidden z-30 p-1">
+          <div className="absolute bottom-full left-0 mb-2 w-80 max-w-full rounded-xl border border-line-strong bg-panel shadow-2xl overflow-hidden z-30 p-1">
             <div className="px-2.5 py-1 text-[10px] uppercase tracking-wider font-semibold text-ink-muted">
               Route target (Tab / Enter)
             </div>
@@ -167,9 +180,10 @@ export function Composer() {
           </div>
         )}
 
-        <div className="rounded-2xl border border-line-strong bg-inset focus-within:border-brand transition-colors p-3 space-y-2 shadow-sm">
+        <div className="space-y-1.5 rounded-2xl border border-line-strong bg-panel p-3 shadow-sm transition-colors focus-within:border-brand">
           <textarea
             ref={textareaRef}
+            aria-label="Message group chat"
             rows={2}
             value={text}
             onChange={(e) => setText(e.target.value)}
@@ -203,17 +217,18 @@ export function Composer() {
                 void handleSend();
               }
             }}
-            placeholder="Message group chat, type @codex / @claude, or send directly to Orchestrator..."
+            placeholder="Message the group… Type @ to choose a harness"
             className="w-full bg-transparent text-[13.5px] text-ink placeholder-ink-muted resize-none focus:outline-none leading-relaxed"
           />
 
           <div className="flex flex-wrap items-center justify-between gap-2 pt-2 border-t border-line">
             <div className="flex flex-wrap items-center gap-2 text-[11px]">
-              <span className="px-2 py-0.5 rounded-md bg-elevated border border-line font-mono text-ink-soft">
+              <span className="max-w-[36ch] truncate text-ink-muted" title={routingPreview}>
                 {routingPreview}
               </span>
               <button
                 type="button"
+                aria-pressed={activeSession.confirm_before_dispatch}
                 onClick={() => void toggleConfirmFirst()}
                 className={`inline-flex items-center gap-1.5 px-2.5 py-0.5 rounded-md border transition-colors ${
                   activeSession.confirm_before_dispatch
@@ -224,7 +239,7 @@ export function Composer() {
                 {activeSession.confirm_before_dispatch && (
                   <Check className="w-3 h-3" />
                 )}
-                <span>Confirm Plan First</span>
+                <span>Confirm plan first</span>
               </button>
             </div>
 
@@ -233,7 +248,7 @@ export function Composer() {
                 <button
                   type="button"
                   onClick={() => void stopAll()}
-                  className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-xl bg-rose-600 hover:bg-rose-500 text-xs font-medium text-white transition-colors"
+                  className="inline-flex items-center gap-1.5 rounded-lg bg-neg-soft px-3 py-1.5 text-xs font-medium text-neg transition-colors hover:bg-neg/20"
                 >
                   <Square className="w-3 h-3 fill-current" />
                   <span>Stop All</span>
@@ -241,7 +256,8 @@ export function Composer() {
               )}
               <button
                 type="button"
-                disabled={!text.trim() || sending}
+                title="Send (Ctrl+Enter / ⌘+Enter)"
+                disabled={!text.trim() || sending || !availableMembers.length}
                 onClick={() => void handleSend()}
                 className="inline-flex items-center gap-1.5 px-3.5 py-1.5 rounded-xl bg-brand hover:bg-brand-hover disabled:opacity-40 text-xs font-medium text-white transition-colors"
               >

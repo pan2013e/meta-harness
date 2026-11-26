@@ -4,14 +4,14 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use tokio::sync::{Mutex, RwLock};
-use tracing::info;
+use tracing::{debug, info};
 
 use mh_core::{AdapterConfig, DiscoveredConfigOption, PermissionPolicy, PermissionRule};
 
 use crate::AcpError;
 use crate::broker::{BrokerCallbacks, MemberBrokerContext};
 use crate::client::AcpClient;
-use crate::platform::probe_executable;
+use crate::platform::find_cli_binary;
 use crate::protocol::{McpEnvVar, McpServerSpec};
 
 #[derive(Debug, Clone)]
@@ -33,6 +33,9 @@ pub struct ManagedMemberClient {
     pub client: Arc<AcpClient>,
     pub active_turn_id: Arc<RwLock<Option<String>>>,
     pub last_used: Mutex<Instant>,
+    member_worktree: PathBuf,
+    permission_policy: PermissionPolicy,
+    adapter_id: String,
 }
 
 type ClientMap = HashMap<(String, String), Arc<ManagedMemberClient>>;
@@ -77,16 +80,28 @@ impl AcpSupervisor {
             return Err(AcpError::Cancelled);
         }
         let key = (spec.session_id.clone(), spec.member_handle.clone());
-        {
-            let guard = self.clients.lock().await;
-            if let Some(existing) = guard.get(&key)
+        let retired = {
+            let mut clients = self.clients.lock().await;
+            if let Some(existing) = clients.get(&key)
+                && existing.member_worktree == spec.member_worktree
+                && existing.permission_policy == spec.permission_policy
+                && existing.adapter_id == spec.adapter_id
                 && existing.client.is_alive().await
             {
                 *existing.last_used.lock().await = Instant::now();
+                existing
+                    .client
+                    .update_turn_context(callbacks, spec.rules.read().await.clone())
+                    .await;
                 return Ok(Arc::clone(existing));
             }
+            clients.remove(&key)
+        };
+        if let Some(retired) = retired {
+            retired.client.shutdown().await;
         }
 
+        let started = Instant::now();
         let (command, args) = resolve_adapter_command(&spec.adapter)?;
         let active_turn_id = Arc::new(RwLock::new(None));
         let broker_ctx = MemberBrokerContext {
@@ -109,29 +124,48 @@ impl AcpSupervisor {
         )
         .await?;
 
-        let init = client.initialize().await?;
         let mcp_servers = spec.mcp_bridge_spec.into_iter().collect::<Vec<_>>();
-
-        let mut loaded = false;
-        if init.agent_capabilities.load_session
-            && let Some(prev_sid) = spec.existing_acp_session_id.as_deref()
-            && client
-                .load_session(prev_sid, &spec.member_worktree, mcp_servers.clone())
-                .await
-                .is_ok()
-        {
-            loaded = true;
-        }
-        if !loaded {
-            client
-                .new_session(&spec.member_worktree, mcp_servers)
-                .await?;
+        let setup = async {
+            let init = client.initialize().await?;
+            let initialize_ms = started.elapsed().as_millis();
+            let resumed = if init.agent_capabilities.load_session
+                && let Some(prev_sid) = spec.existing_acp_session_id.as_deref()
+            {
+                client
+                    .load_session(prev_sid, &spec.member_worktree, mcp_servers.clone())
+                    .await
+                    .is_ok()
+            } else {
+                false
+            };
+            if !resumed {
+                client
+                    .new_session(&spec.member_worktree, mcp_servers)
+                    .await?;
+            }
+            debug!(adapter = %spec.adapter_id, initialize_ms, ready_ms = started.elapsed().as_millis(), "ACP session ready");
+            Ok::<_, AcpError>(())
+        };
+        let setup_result = tokio::time::timeout(Duration::from_secs(60), setup)
+            .await
+            .unwrap_or_else(|_| {
+                Err(AcpError::Timeout(format!(
+                    "{} did not initialize an ACP session within 60 seconds",
+                    spec.adapter.display_name
+                )))
+            });
+        if let Err(error) = setup_result {
+            client.shutdown().await;
+            return Err(error);
         }
 
         let managed = Arc::new(ManagedMemberClient {
             client,
             active_turn_id,
             last_used: Mutex::new(Instant::now()),
+            member_worktree: spec.member_worktree,
+            permission_policy: spec.permission_policy,
+            adapter_id: spec.adapter_id,
         });
 
         let inserted = {
@@ -237,18 +271,96 @@ impl AcpSupervisor {
 }
 
 pub fn resolve_adapter_command(adapter: &AdapterConfig) -> Result<(String, Vec<String>), AcpError> {
-    if !adapter.command.is_empty() && probe_executable(&adapter.command).is_some() {
-        return Ok((adapter.command.clone(), adapter.args.clone()));
+    if !adapter.enabled {
+        return Err(AcpError::CommandNotFound(format!(
+            "{} is disabled",
+            adapter.display_name
+        )));
+    }
+    let mut missing = if adapter.command.is_empty() {
+        adapter.display_name.clone()
+    } else {
+        adapter.command.clone()
+    };
+    if let Some((package, executable)) = default_npm_adapter(adapter) {
+        if let Some(bin) = find_cli_binary(executable) {
+            return Ok((bin.to_string_lossy().into_owned(), Vec::new()));
+        }
+        if executable == "claude-agent-acp" && find_cli_binary("claude").is_none() {
+            missing = "Claude Code CLI or claude-agent-acp".into();
+        } else {
+            if let Some(bin) =
+                npm_cache_dir().and_then(|cache| cached_npm_adapter(&cache, package, executable))
+            {
+                return Ok((bin.to_string_lossy().into_owned(), Vec::new()));
+            }
+            if let Some(npx) = find_cli_binary("npx") {
+                return Ok((
+                    npx.to_string_lossy().into_owned(),
+                    vec!["--prefer-offline".into(), "-y".into(), package.into()],
+                ));
+            }
+        }
+    } else if !adapter.command.is_empty()
+        && let Some(bin) = find_cli_binary(&adapter.command)
+    {
+        return Ok((bin.to_string_lossy().into_owned(), adapter.args.clone()));
     }
     for fb in &adapter.fallback_commands {
-        if probe_executable(&fb.command).is_some() {
-            return Ok((fb.command.clone(), fb.args.clone()));
+        if !fb.command.is_empty()
+            && let Some(bin) = find_cli_binary(&fb.command)
+        {
+            return Ok((bin.to_string_lossy().into_owned(), fb.args.clone()));
         }
     }
-    if adapter.command.is_empty() {
-        return Err(AcpError::CommandNotFound(adapter.display_name.clone()));
-    }
-    Ok((adapter.command.clone(), adapter.args.clone()))
+    Err(AcpError::CommandNotFound(missing))
+}
+
+fn default_npm_adapter(adapter: &AdapterConfig) -> Option<(&'static str, &'static str)> {
+    let (package, executable) = match adapter.quota_provider.as_str() {
+        "codex_local" => ("@agentclientprotocol/codex-acp", "codex-acp"),
+        "claude_local" => ("@agentclientprotocol/claude-agent-acp", "claude-agent-acp"),
+        _ => return None,
+    };
+    (adapter.command == "npx" && adapter.args == ["-y", package]).then_some((package, executable))
+}
+
+fn npm_cache_dir() -> Option<PathBuf> {
+    std::env::var_os("npm_config_cache")
+        .map(PathBuf::from)
+        .or_else(|| {
+            if cfg!(windows) {
+                dirs::cache_dir().map(|path| path.join("npm-cache"))
+            } else {
+                dirs::home_dir().map(|path| path.join(".npm"))
+            }
+        })
+}
+
+fn cached_npm_adapter(cache: &Path, package: &str, executable: &str) -> Option<PathBuf> {
+    let shim_name = if cfg!(windows) {
+        format!("{executable}.cmd")
+    } else {
+        executable.into()
+    };
+    std::fs::read_dir(cache.join("_npx"))
+        .ok()?
+        .flatten()
+        .filter_map(|entry| {
+            let manifest = entry.path().join("package.json");
+            let data: serde_json::Value =
+                serde_json::from_slice(&std::fs::read(&manifest).ok()?).ok()?;
+            let packages = data.pointer("/_npx/packages")?.as_array()?;
+            if packages.len() != 1 || packages[0].as_str() != Some(package) {
+                return None;
+            }
+            let modules = entry.path().join("node_modules");
+            let shim = modules.join(".bin").join(&shim_name);
+            (shim.is_file() && modules.join(package).join("package.json").is_file())
+                .then(|| (manifest.metadata().and_then(|m| m.modified()).ok(), shim))
+        })
+        .max()
+        .map(|(_, shim)| shim)
 }
 
 pub fn build_mcp_bridge_spec(
@@ -274,5 +386,42 @@ pub fn build_mcp_bridge_spec(
             name: "MH_BRIDGE_TOKEN".into(),
             value: bridge_token.into(),
         }],
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cached_codex_launch_uses_only_a_matching_npm_exec_installation() {
+        let root = tempfile::tempdir().unwrap();
+        let cache = root.path();
+        let package = "@agentclientprotocol/codex-acp";
+        let executable = "codex-acp";
+        let app = cache.join("_npx/sample");
+        let shims = app.join("node_modules/.bin");
+        std::fs::create_dir_all(&shims).unwrap();
+        let shim = shims.join(if cfg!(windows) {
+            "codex-acp.cmd"
+        } else {
+            "codex-acp"
+        });
+        std::fs::write(&shim, "cached shim").unwrap();
+        let installed = app.join("node_modules").join(package);
+        std::fs::create_dir_all(&installed).unwrap();
+        std::fs::write(installed.join("package.json"), "{}").unwrap();
+        std::fs::write(
+            app.join("package.json"),
+            r#"{"_npx":{"packages":["@agentclientprotocol/codex-acp@1.1.13"]}}"#,
+        )
+        .unwrap();
+        assert_eq!(cached_npm_adapter(cache, package, executable), None);
+        std::fs::write(
+            app.join("package.json"),
+            r#"{"_npx":{"packages":["@agentclientprotocol/codex-acp"]}}"#,
+        )
+        .unwrap();
+        assert_eq!(cached_npm_adapter(cache, package, executable), Some(shim));
     }
 }

@@ -80,14 +80,17 @@ pub fn sanitize_ref_component(raw: &str) -> String {
     }
 }
 
-async fn run_git(dir: &Path, args: &[&str]) -> Result<(bool, String, String), AcpError> {
-    let dir_clean = dunce::simplified(dir);
-    let output = Command::new("git")
+async fn git_output(dir: &Path, args: &[&str]) -> Result<std::process::Output, AcpError> {
+    Ok(Command::new("git")
         .arg("-C")
-        .arg(dir_clean)
+        .arg(dunce::simplified(dir))
         .args(args)
         .output()
-        .await?;
+        .await?)
+}
+
+async fn run_git(dir: &Path, args: &[&str]) -> Result<(bool, String, String), AcpError> {
+    let output = git_output(dir, args).await?;
     let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
     let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
     Ok((output.status.success(), stdout, stderr))
@@ -510,14 +513,20 @@ pub async fn get_session_diff(
 
     let (diff_stat, _) =
         compute_numstat_between(integration_wt, base_branch_or_sha, integration_branch).await;
-    let (_, raw_diff, _) = run_git(integration_wt, &["diff", &range]).await?;
+    let output = git_output(integration_wt, &["diff", &range, "--"]).await?;
+    if !output.status.success() {
+        return Err(AcpError::Git(
+            String::from_utf8_lossy(&output.stderr).into_owned(),
+        ));
+    }
+    let raw_diff = String::from_utf8_lossy(&output.stdout);
 
     const MAX_DIFF_BYTES: usize = 256 * 1024;
     let truncated = raw_diff.len() > MAX_DIFF_BYTES;
     let unified_diff = if truncated {
-        raw_diff.chars().take(MAX_DIFF_BYTES).collect()
+        raw_diff[..raw_diff.floor_char_boundary(MAX_DIFF_BYTES)].to_string()
     } else {
-        raw_diff
+        raw_diff.into_owned()
     };
 
     Ok(SessionDiffReport {
@@ -547,9 +556,13 @@ pub async fn promote_session(
         ));
     }
 
-    let target_branch = status
-        .head_branch
-        .unwrap_or_else(|| base_branch.to_string());
+    if status.head_branch.as_deref() != Some(base_branch) {
+        let current = status.head_branch.as_deref().unwrap_or("detached HEAD");
+        return Err(AcpError::Git(format!(
+            "check out the session base branch '{base_branch}' before promoting (currently on '{current}')"
+        )));
+    }
+    let target_branch = base_branch.to_string();
 
     match mode {
         PromoteMode::Merge => {
@@ -575,10 +588,20 @@ pub async fn promote_session(
                 let _ = run_git(project_root, &["reset", "--merge"]).await;
                 return Err(AcpError::Git(format!("squash merge failed: {err}")));
             }
+            let (unchanged, _, _) = run_git(project_root, &["diff", "--cached", "--quiet"]).await?;
+            if unchanged {
+                return Ok(PromoteResult {
+                    mode,
+                    target_branch,
+                    summary: "No changes to squash".into(),
+                    new_head_sha: get_head_sha(project_root).await,
+                });
+            }
             let msg = format!("feat(meta-harness): squash session {integration_branch}");
             let (c_ok, _, c_err) =
                 run_git_with_author(project_root, &["commit", "-m", &msg]).await?;
             if !c_ok {
+                let _ = run_git(project_root, &["reset", "--merge"]).await;
                 return Err(AcpError::Git(format!("squash commit failed: {c_err}")));
             }
             let sha = get_head_sha(project_root).await;
@@ -591,13 +614,7 @@ pub async fn promote_session(
         }
         PromoteMode::Patch => {
             let range = format!("{base_commit_sha}..{integration_branch}");
-            let dir_clean = dunce::simplified(project_root);
-            let diff_out = Command::new("git")
-                .arg("-C")
-                .arg(dir_clean)
-                .args(["diff", "--binary", &range])
-                .output()
-                .await?;
+            let diff_out = git_output(project_root, &["diff", "--binary", &range, "--"]).await?;
             if !diff_out.status.success() {
                 return Err(AcpError::Git(
                     String::from_utf8_lossy(&diff_out.stderr).into_owned(),
@@ -614,23 +631,31 @@ pub async fn promote_session(
 
             let mut apply = Command::new("git")
                 .arg("-C")
-                .arg(dir_clean)
-                .args(["apply", "--3way", "-"])
+                .arg(dunce::simplified(project_root))
+                .args(["apply", "-"])
                 .stdin(std::process::Stdio::piped())
                 .stdout(std::process::Stdio::piped())
                 .stderr(std::process::Stdio::piped())
                 .spawn()?;
-            if let Some(mut stdin) = apply.stdin.take() {
-                use tokio::io::AsyncWriteExt;
-                stdin.write_all(&diff_out.stdout).await?;
-            }
-            let apply_res = apply.wait_with_output().await?;
+            let mut stdin = apply
+                .stdin
+                .take()
+                .ok_or_else(|| AcpError::Git("git apply is missing stdin".into()))?;
+            let (written, apply_res) = tokio::join!(
+                async move {
+                    use tokio::io::AsyncWriteExt;
+                    stdin.write_all(&diff_out.stdout).await
+                },
+                apply.wait_with_output()
+            );
+            let apply_res = apply_res?;
             if !apply_res.status.success() {
                 return Err(AcpError::Git(format!(
                     "git apply failed: {}",
                     String::from_utf8_lossy(&apply_res.stderr)
                 )));
             }
+            written?;
             Ok(PromoteResult {
                 mode,
                 target_branch,
@@ -699,6 +724,76 @@ pub async fn prune_session_worktrees(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn promotion_checks_the_base_branch_and_patch_leaves_index_clean() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::write(root.join("source.txt"), "old value\n").unwrap();
+        init_git_repo(root).await.unwrap();
+        let int = ensure_session_integration_worktree(root, "promotion")
+            .await
+            .unwrap();
+        let base = int.base_branch.as_deref().unwrap();
+        std::fs::write(int.path.join("source.txt"), "new value \n").unwrap();
+        assert!(
+            run_git_with_author(&int.path, &["commit", "-am", "Edit source"])
+                .await
+                .unwrap()
+                .0
+        );
+
+        let diff = get_session_diff(&int.path, &int.base_commit_sha, &int.branch)
+            .await
+            .unwrap();
+        assert!(diff.unified_diff.ends_with("+new value \n"));
+
+        assert!(run_git(root, &["checkout", "-b", "other"]).await.unwrap().0);
+        let result = promote_session(
+            root,
+            base,
+            &int.base_commit_sha,
+            &int.branch,
+            PromoteMode::Merge,
+        )
+        .await;
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("currently on 'other'")
+        );
+        assert_eq!(
+            get_head_sha(root).await.as_deref(),
+            Some(int.base_commit_sha.as_str())
+        );
+
+        assert!(run_git(root, &["checkout", base]).await.unwrap().0);
+        promote_session(
+            root,
+            base,
+            &int.base_commit_sha,
+            &int.branch,
+            PromoteMode::Patch,
+        )
+        .await
+        .unwrap();
+        assert!(
+            run_git(root, &["diff", "--cached", "--quiet"])
+                .await
+                .unwrap()
+                .0
+        );
+        assert!(
+            run_git(root, &["diff", "--quiet"])
+                .await
+                .is_ok_and(|(ok, _, _)| !ok)
+        );
+        assert_eq!(
+            get_head_sha(root).await.as_deref(),
+            Some(int.base_commit_sha.as_str())
+        );
+    }
 
     #[tokio::test]
     async fn worktree_isolation_clean_merge_and_conflict_detection() {

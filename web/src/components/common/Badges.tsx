@@ -1,6 +1,4 @@
-import { useState } from "react";
-import { Check, Palette, User } from "lucide-react";
-import { useAppStore } from "../../store/useAppStore";
+import { User } from "lucide-react";
 import type { MemberStatus, QuotaSnapshot, ThemeId } from "../../types/api";
 
 export const THEMES: Array<{
@@ -34,77 +32,6 @@ export const THEMES: Array<{
     swatch: ["#f4f6f9", "#ffffff", "#4f46e5"],
   },
 ];
-
-export function ThemeSwitcher() {
-  const { theme, setTheme } = useAppStore();
-  const [open, setOpen] = useState(false);
-  const current = THEMES.find((t) => t.id === theme) ?? THEMES[0];
-
-  return (
-    <div className="relative">
-      <button
-        type="button"
-        onClick={() => setOpen((v) => !v)}
-        title="Switch color theme"
-        className="inline-flex items-center gap-1.5 px-2.5 py-1.5 rounded-lg bg-elevated hover:bg-hover border border-line text-xs text-ink-soft hover:text-ink transition-colors"
-      >
-        <Palette className="w-3.5 h-3.5 text-brand-ink" />
-        <span className="hidden sm:inline">{current.label.split(" ")[0]}</span>
-      </button>
-
-      {open && (
-        <>
-          <div
-            className="fixed inset-0 z-30"
-            onClick={() => setOpen(false)}
-          />
-          <div className="absolute right-0 mt-1.5 w-60 rounded-xl border border-line-strong bg-panel shadow-2xl p-1.5 z-40 space-y-0.5">
-            <div className="px-2.5 py-1 text-[10px] font-semibold uppercase tracking-wider text-ink-muted">
-              Color Theme
-            </div>
-            {THEMES.map((t) => {
-              const active = t.id === theme;
-              return (
-                <button
-                  key={t.id}
-                  type="button"
-                  onClick={() => {
-                    setTheme(t.id);
-                    setOpen(false);
-                  }}
-                  className={`w-full flex items-center justify-between gap-2 px-2.5 py-2 rounded-lg text-left transition-colors ${
-                    active ? "bg-brand-soft text-ink" : "hover:bg-hover text-ink-soft"
-                  }`}
-                >
-                  <div className="flex items-center gap-2.5 min-w-0">
-                    <div className="flex -space-x-1 shrink-0">
-                      {t.swatch.map((c, i) => (
-                        <span
-                          key={i}
-                          className="w-3 h-3 rounded-full ring-1 ring-black/30"
-                          style={{ backgroundColor: c }}
-                        />
-                      ))}
-                    </div>
-                    <div className="min-w-0">
-                      <div className="text-xs font-medium text-ink truncate">
-                        {t.label}
-                      </div>
-                      <div className="text-[10px] text-ink-muted truncate">
-                        {t.desc}
-                      </div>
-                    </div>
-                  </div>
-                  {active && <Check className="w-3.5 h-3.5 text-brand-ink shrink-0" />}
-                </button>
-              );
-            })}
-          </div>
-        </>
-      )}
-    </div>
-  );
-}
 
 export function HarnessAvatar({
   handle,

@@ -70,7 +70,7 @@ struct ManagedTerminal {
 /// with worktree-smart sandboxing, unified diff capture, and OS process-tree tracking.
 pub struct WorkspaceBroker {
     ctx: MemberBrokerContext,
-    callbacks: Arc<dyn BrokerCallbacks>,
+    callbacks: RwLock<Arc<dyn BrokerCallbacks>>,
     terminals: Mutex<HashMap<String, Arc<ManagedTerminal>>>,
 }
 
@@ -78,9 +78,22 @@ impl WorkspaceBroker {
     pub fn new(ctx: MemberBrokerContext, callbacks: Arc<dyn BrokerCallbacks>) -> Self {
         Self {
             ctx,
-            callbacks,
+            callbacks: RwLock::new(callbacks),
             terminals: Mutex::new(HashMap::new()),
         }
+    }
+
+    pub(crate) async fn update_turn_context(
+        &self,
+        callbacks: Arc<dyn BrokerCallbacks>,
+        rules: Vec<PermissionRule>,
+    ) {
+        *self.callbacks.write().await = callbacks;
+        *self.ctx.rules.write().await = rules;
+    }
+
+    async fn callbacks(&self) -> Arc<dyn BrokerCallbacks> {
+        Arc::clone(&*self.callbacks.read().await)
     }
 
     pub async fn handle_read_text_file(
@@ -172,10 +185,12 @@ impl WorkspaceBroker {
             .to_string();
 
         if let Some(turn_id) = self.ctx.active_turn_id.read().await.clone() {
-            self.callbacks
+            self.callbacks()
+                .await
                 .record_touched_file(&turn_id, rel_path.clone())
                 .await;
-            self.callbacks
+            self.callbacks()
+                .await
                 .record_trajectory_event(
                     &turn_id,
                     TrajectoryEventKind::Diff,
@@ -290,7 +305,8 @@ impl WorkspaceBroker {
             .insert(terminal_id.clone(), term);
 
         if let Some(turn_id) = self.ctx.active_turn_id.read().await.clone() {
-            self.callbacks
+            self.callbacks()
+                .await
                 .record_trajectory_event(
                     &turn_id,
                     TrajectoryEventKind::Terminal,
@@ -349,7 +365,8 @@ impl WorkspaceBroker {
                     .rev()
                     .collect::<String>()
             };
-            self.callbacks
+            self.callbacks()
+                .await
                 .record_trajectory_event(
                     &turn_id,
                     TrajectoryEventKind::Terminal,
@@ -456,7 +473,12 @@ impl WorkspaceBroker {
             created_at: chrono::Utc::now().timestamp_millis(),
         };
 
-        match self.callbacks.request_user_permission(prompt).await? {
+        match self
+            .callbacks()
+            .await
+            .request_user_permission(prompt)
+            .await?
+        {
             PermissionResolution::Selected {
                 option_id,
                 allow_pattern,
@@ -508,7 +530,12 @@ impl WorkspaceBroker {
             created_at: chrono::Utc::now().timestamp_millis(),
         };
 
-        match self.callbacks.request_user_permission(prompt).await? {
+        match self
+            .callbacks()
+            .await
+            .request_user_permission(prompt)
+            .await?
+        {
             PermissionResolution::Selected {
                 option_id,
                 allow_pattern,

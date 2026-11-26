@@ -47,7 +47,8 @@ export function Sidebar() {
     selectSession,
     createAndSelectSession,
     deleteSessionById,
-    openDrawerTab,
+    setSettingsOpen,
+    probes,
     setError,
   } = useAppStore();
 
@@ -60,20 +61,23 @@ export function Sidebar() {
   }
 
   const activeProject = projects.find((p) => p.id === activeProjectId) ?? null;
+  const availableAdapters = probes.filter((probe) => probe.installed).map((probe) => probe.adapter_id);
 
   const toggleOrchestrator = async (handle: string) => {
     if (!activeSession) return;
     const next = activeSession.orchestrator_member === handle ? null : handle;
     try {
       await api.patchSession(activeSession.id, { orchestrator_member: next });
-      await selectSession(activeSession.id);
+      if (useAppStore.getState().activeSession?.id === activeSession.id) {
+        await selectSession(activeSession.id);
+      }
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
     }
   };
 
   return (
-    <aside className="w-[296px] shrink-0 border-r border-line bg-panel flex flex-col h-full select-none">
+    <aside className="fixed inset-y-0 left-0 z-40 w-[260px] max-w-[calc(100vw-2.5rem)] shrink-0 border-r border-line bg-panel flex flex-col h-full select-none shadow-xl lg:static lg:shadow-none">
       {/* Brand Header */}
       <div className="px-4 py-3 border-b border-line flex items-center justify-between gap-2">
         <div className="flex items-center gap-2.5 min-w-0">
@@ -84,9 +88,6 @@ export function Sidebar() {
             <h1 className="text-[13px] font-semibold tracking-tight text-ink truncate">
               Meta-Harness
             </h1>
-            <p className="text-[10px] text-ink-muted truncate">
-              ACP Multi-Agent Switch
-            </p>
           </div>
         </div>
         <div className="flex items-center gap-1">
@@ -287,10 +288,10 @@ export function Sidebar() {
         <div className="flex items-center justify-between">
           <button
             type="button"
-            onClick={() => openDrawerTab("settings")}
+            onClick={() => setSettingsOpen(true)}
             className="text-[10.5px] uppercase tracking-wider font-semibold text-ink-muted hover:text-ink transition-colors"
           >
-            Group Roster & Quotas
+            Harnesses
           </button>
           {activeSession && (
             <button
@@ -310,12 +311,14 @@ export function Sidebar() {
             const adapter = adapters[m.adapter_id];
             const quota = quotas[m.adapter_id];
             const isOrch = activeSession?.orchestrator_member === m.handle;
+            const probe = probes.find((item) => item.adapter_id === m.adapter_id);
+            const available = probe?.installed === true;
             const accent = adapter?.accent_color ?? "#6366f1";
 
             return (
               <div
                 key={m.handle}
-                className="rounded-xl border border-line bg-elevated/70 p-2.5 space-y-2 transition-colors hover:border-line-strong"
+                className="space-y-2 rounded-xl border border-line bg-elevated/50 p-2.5"
               >
                 <div className="flex items-center justify-between gap-2">
                   <div className="flex items-center gap-2.5 min-w-0">
@@ -330,7 +333,7 @@ export function Sidebar() {
                         <span className="text-xs font-semibold text-ink truncate">
                           @{m.handle}
                         </span>
-                        {quota?.plan_label && (
+                        {available && quota?.plan_label && (
                           <span className="px-1.5 py-0.2 rounded bg-inset border border-line text-[9.5px] font-mono text-ink-muted">
                             {quota.plan_label}
                           </span>
@@ -343,6 +346,8 @@ export function Sidebar() {
                   </div>
                   <button
                     type="button"
+                    disabled={!available && !isOrch}
+                    aria-label={isOrch ? `Clear @${m.handle} as orchestrator` : `Set @${m.handle} as orchestrator`}
                     title={
                       isOrch
                         ? "Session Orchestrator (click to clear)"
@@ -360,8 +365,8 @@ export function Sidebar() {
                 </div>
 
                 <div className="flex items-center justify-between gap-2">
-                  <StatusDot status={st?.status} />
-                  {m.worktree_branch && (
+                  {available ? <StatusDot status={st?.status} /> : <span className="text-[11px] text-ink-muted" title={probe?.auth_hint}>Unavailable</span>}
+                  {available && m.worktree_branch && (
                     <span
                       className="text-[10px] font-mono text-ink-muted truncate max-w-[120px] px-1.5 py-0.5 rounded bg-inset"
                       title={m.worktree_branch}
@@ -371,7 +376,7 @@ export function Sidebar() {
                   )}
                 </div>
 
-                {quota && (
+                {available && quota && (
                   <div className="pt-1.5 border-t border-line">
                     <QuotaSnapshotSummary quota={quota} compact />
                   </div>
@@ -385,8 +390,8 @@ export function Sidebar() {
       {/* Modals */}
       {newSessionOpen && (
         <NewSessionModal
-          members={Object.keys(adapters)}
-          defaultOrch={members[0]?.handle ?? "antigravity"}
+          members={availableAdapters}
+          defaultOrch={availableAdapters.includes(activeSession?.orchestrator_member ?? "") ? activeSession?.orchestrator_member ?? "" : ""}
           onClose={() => setNewSessionOpen(false)}
           onCreate={async (title, orch) => {
             await createAndSelectSession(title, orch);
@@ -490,7 +495,7 @@ function NewSessionModal({
                     : "bg-inset border-line text-ink-soft hover:bg-hover"
                 }`}
               >
-                None
+                Automatic
               </button>
             </div>
           </div>

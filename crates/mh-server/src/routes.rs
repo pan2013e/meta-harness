@@ -273,6 +273,14 @@ pub async fn update_adapter_quota(
     AxumPath(adapter_id): AxumPath<String>,
     Json(body): Json<UpdateQuotaRequest>,
 ) -> ApiResult<Value> {
+    let config = state.switch.config.read().await;
+    let adapter = config
+        .adapters
+        .get(&adapter_id)
+        .ok_or_else(|| err_resp(StatusCode::NOT_FOUND, "unknown adapter"))?;
+    let provider = adapter.quota_provider.clone();
+    let default_opt_in = adapter.exact_quota_probe_opt_in;
+    drop(config);
     let prev = state
         .switch
         .store
@@ -282,9 +290,10 @@ pub async fn update_adapter_quota(
     let plan = body
         .plan_label
         .or_else(|| prev.as_ref().and_then(|p| p.plan_label.clone()));
-    let opt_in = body
-        .exact_probe_opt_in
-        .unwrap_or_else(|| prev.as_ref().map(|p| p.exact_probe_opt_in).unwrap_or(true));
+    let opt_in = body.exact_probe_opt_in.unwrap_or_else(|| {
+        prev.as_ref()
+            .map_or(default_opt_in, |p| p.exact_probe_opt_in)
+    });
     let m5 = body
         .manual_5h_pct
         .or_else(|| prev.as_ref().and_then(|p| p.manual_5h_pct));
@@ -292,28 +301,21 @@ pub async fn update_adapter_quota(
         .manual_weekly_pct
         .or_else(|| prev.as_ref().and_then(|p| p.manual_weekly_pct));
 
-    if body.clear_rate_limit.unwrap_or(false) {
-        state.switch.quota.clear_rate_limit(&adapter_id).await;
-    }
-
-    let _ =
-        state
-            .switch
-            .store
-            .upsert_adapter_quota_pref(&adapter_id, plan.as_deref(), opt_in, m5, mw);
+    state
+        .switch
+        .store
+        .upsert_adapter_quota_pref(&adapter_id, plan.as_deref(), opt_in, m5, mw)
+        .map_err(|e| err_resp(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
     state
         .switch
         .quota
         .configure_adapter(&adapter_id, plan, opt_in, m5, mw)
         .await;
 
-    let cfg = state.switch.config.read().await.clone();
-    let provider = cfg
-        .adapters
-        .get(&adapter_id)
-        .map(|a| a.quota_provider.as_str())
-        .unwrap_or("manual");
-    let snap = state.switch.quota.snapshot(&adapter_id, provider).await;
+    if body.clear_rate_limit.unwrap_or(false) {
+        state.switch.quota.clear_rate_limit(&adapter_id).await;
+    }
+    let snap = state.switch.quota.snapshot(&adapter_id, &provider).await;
     let _ = state.switch.events_tx.send(mh_core::WsEvent::QuotaUpdated {
         snapshot: snap.clone(),
     });
@@ -496,11 +498,16 @@ pub async fn create_session(
     });
 
     let orch = body.orchestrator_member.or_else(|| {
-        if member_inputs.iter().any(|m| m.handle == "antigravity") {
-            Some("antigravity".into())
-        } else {
-            member_inputs.first().map(|m| m.handle.clone())
-        }
+        let probes = probe_installed_adapters(&cfg);
+        member_inputs
+            .iter()
+            .filter(|m| {
+                probes
+                    .iter()
+                    .any(|p| p.adapter_id == m.adapter_id && p.installed)
+            })
+            .min_by_key(|m| m.handle != "antigravity")
+            .map(|m| m.handle.clone())
     });
 
     let sess = state
@@ -590,10 +597,38 @@ pub async fn get_session(
 #[derive(Debug, Deserialize)]
 pub struct PatchSessionRequest {
     pub title: Option<String>,
+    #[serde(default, deserialize_with = "deserialize_orchestrator_patch")]
     pub orchestrator_member: Option<Option<String>>,
     pub confirm_before_dispatch: Option<bool>,
     pub max_hops: Option<u32>,
     pub permission_policy: Option<PermissionPolicy>,
+}
+
+fn deserialize_orchestrator_patch<'de, D>(value: D) -> Result<Option<Option<String>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Option::deserialize(value).map(Some)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn orchestrator_patch_can_leave_set_or_clear_the_member() {
+        for (body, expected) in [
+            (json!({}), None),
+            (json!({"orchestrator_member": null}), Some(None)),
+            (
+                json!({"orchestrator_member": "codex"}),
+                Some(Some("codex".into())),
+            ),
+        ] {
+            let patch: PatchSessionRequest = serde_json::from_value(body).unwrap();
+            assert_eq!(patch.orchestrator_member, expected);
+        }
+    }
 }
 
 pub async fn patch_session(
@@ -601,6 +636,13 @@ pub async fn patch_session(
     AxumPath(session_id): AxumPath<String>,
     Json(body): Json<PatchSessionRequest>,
 ) -> ApiResult<Value> {
+    if let Some(Some(handle)) = body.orchestrator_member.as_ref() {
+        state
+            .switch
+            .store
+            .get_member(&session_id, handle)
+            .map_err(|e| err_resp(StatusCode::BAD_REQUEST, e.to_string()))?;
+    }
     let sess = state
         .switch
         .store

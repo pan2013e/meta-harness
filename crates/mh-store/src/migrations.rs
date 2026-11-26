@@ -169,19 +169,5 @@ pub fn apply_migrations(conn: &Connection) -> Result<(), StoreError> {
         "INSERT OR IGNORE INTO schema_migrations (version) VALUES (1)",
         [],
     )?;
-    let has_v2: bool = conn
-        .query_row(
-            "SELECT EXISTS(SELECT 1 FROM schema_migrations WHERE version = 2)",
-            [],
-            |row| row.get(0),
-        )
-        .unwrap_or(false);
-    if !has_v2 {
-        let _ = conn.execute("UPDATE adapter_quota_prefs SET exact_probe_opt_in = 1", []);
-        conn.execute(
-            "INSERT OR IGNORE INTO schema_migrations (version) VALUES (2)",
-            [],
-        )?;
-    }
     Ok(())
 }

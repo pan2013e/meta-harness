@@ -74,6 +74,7 @@ pub struct PendingDispatch {
 
 pub struct SessionRuntime {
     pub git_merge_lock: Mutex<()>,
+    shared_cwd_lock: Mutex<()>,
     pub member_locks: Mutex<HashMap<String, Arc<Mutex<()>>>>,
     pub wait_for_graph: Mutex<WaitForGraph>,
     pub chains: Mutex<HashMap<String, ChainState>>,
@@ -90,6 +91,7 @@ impl Default for SessionRuntime {
     fn default() -> Self {
         Self {
             git_merge_lock: Mutex::new(()),
+            shared_cwd_lock: Mutex::new(()),
             member_locks: Mutex::new(HashMap::new()),
             wait_for_graph: Mutex::new(WaitForGraph::new()),
             chains: Mutex::new(HashMap::new()),
@@ -178,6 +180,30 @@ impl SwitchEngine {
             .unwrap_or_else(|| "chain_mcp".into())
     }
 
+    pub(crate) async fn available_members(&self, members: &[SessionMember]) -> HashSet<String> {
+        let config = self.config.read().await;
+        let probes = probe_installed_adapters(&config);
+        members
+            .iter()
+            .filter(|member| {
+                probes
+                    .iter()
+                    .any(|probe| probe.installed && probe.adapter_id == member.adapter_id)
+            })
+            .map(|member| member.handle.clone())
+            .collect()
+    }
+
+    async fn validate_dispatch_targets(
+        &self,
+        session_id: &str,
+        tasks: &[DispatchTaskSpec],
+    ) -> Result<(), SwitchError> {
+        let members = self.store.list_members(session_id)?;
+        let available = self.available_members(&members).await;
+        validate_available_targets(tasks.iter().map(|task| task.target.as_str()), &available)
+    }
+
     /// Posts a user message and initiates routing (either explicit `@mentions` in parallel
     /// or the configured Orchestrator).
     pub async fn handle_user_message(
@@ -195,19 +221,28 @@ impl SwitchEngine {
 
         let valid_handles: HashSet<String> = members.iter().map(|m| m.handle.clone()).collect();
         let parsed = parse_mentions(&content, &valid_handles);
+        let available = self.available_members(&members).await;
+        let orchestrator = session
+            .orchestrator_member
+            .as_ref()
+            .filter(|handle| available.contains(*handle));
+        if parsed.has_orchestrator && orchestrator.is_none() {
+            return Err(SwitchError::Validation("The session orchestrator is unavailable. Choose an available member from the roster.".into()));
+        }
         let chain_id = format!("ch_{}", &uuid::Uuid::new_v4().simple().to_string()[..10]);
 
         let mut recipients: Vec<String> = Vec::new();
         if parsed.has_orchestrator || parsed.is_unmentioned() {
-            if let Some(orch) = session.orchestrator_member.clone() {
-                recipients.push(orch);
-            } else if let Some(first) = members.first() {
+            if let Some(orch) = orchestrator {
+                recipients.push(orch.clone());
+            } else if let Some(first) = members.iter().find(|m| available.contains(&m.handle)) {
                 recipients.push(first.handle.clone());
             }
         } else if parsed.has_all {
             for m in &members {
-                if session.orchestrator_member.as_deref() != Some(&m.handle)
-                    || m.role != MemberRole::Orchestrator
+                if available.contains(&m.handle)
+                    && (session.orchestrator_member.as_deref() != Some(&m.handle)
+                        || m.role != MemberRole::Orchestrator)
                 {
                     recipients.push(m.handle.clone());
                 }
@@ -217,6 +252,12 @@ impl SwitchEngine {
                 recipients.push(t.handle.clone());
             }
         }
+        if recipients.is_empty() {
+            return Err(SwitchError::Validation(
+                "No harness is available in this session. Check Settings → Harnesses.".into(),
+            ));
+        }
+        validate_available_targets(recipients.iter().map(String::as_str), &available)?;
 
         let user_msg = self.store.append_message(NewMessageParams {
             id: None,
@@ -249,10 +290,10 @@ impl SwitchEngine {
 
         let tasks: Vec<(DispatchTaskSpec, TurnPurpose)> =
             if parsed.has_orchestrator || parsed.is_unmentioned() {
-                if let Some(orch) = session.orchestrator_member.clone() {
+                if let Some(orch) = orchestrator {
                     vec![(
                         DispatchTaskSpec {
-                            target: orch,
+                            target: orch.clone(),
                             model: None,
                             effort: None,
                             task_brief: content,
@@ -343,6 +384,10 @@ impl SwitchEngine {
                 target_handles.push(t.handle);
             }
         }
+        if !target_handles.is_empty() {
+            let available = self.available_members(&members).await;
+            validate_available_targets(target_handles.iter().map(String::as_str), &available)?;
+        }
 
         let sender_kind = if session.orchestrator_member.as_deref() == Some(caller) {
             SenderKind::Orchestrator
@@ -394,7 +439,14 @@ impl SwitchEngine {
         question: &str,
         context_turn_id: Option<String>,
     ) -> Result<Value, SwitchError> {
-        let _ = self.store.get_member(session_id, target)?;
+        if self.store.get_session(session_id)?.isolation_mode == IsolationMode::SharedCwd {
+            return Err(SwitchError::Validation(
+                "Synchronous consultations require isolated worktrees. Use chat_send_message in shared folder sessions.".into(),
+            ));
+        }
+        let member = self.store.get_member(session_id, target)?;
+        let available = self.available_members(&[member]).await;
+        validate_available_targets([target], &available)?;
         let chain_id = self.active_chain_for_member(session_id, caller).await;
         self.try_consume_hop(session_id, &chain_id, vec![]).await?;
 
@@ -522,9 +574,14 @@ impl SwitchEngine {
         session_id: &str,
         caller: &str,
         rationale: String,
-        dispatches: Vec<DispatchTaskSpec>,
+        mut dispatches: Vec<DispatchTaskSpec>,
     ) -> Result<String, SwitchError> {
         let session = self.store.get_session(session_id)?;
+        for dispatch in &mut dispatches {
+            dispatch.target = dispatch.target.trim().trim_start_matches('@').to_string();
+        }
+        self.validate_dispatch_targets(session_id, &dispatches)
+            .await?;
         let chain_id = self.active_chain_for_member(session_id, caller).await;
         let rt = self.runtime(session_id).await;
         rt.orchestrator_dispatched_turn
@@ -596,12 +653,16 @@ impl SwitchEngine {
         dispatch_id: &str,
     ) -> Result<(), SwitchError> {
         let rt = self.runtime(session_id).await;
-        let pending = rt
-            .pending_dispatches
-            .lock()
-            .await
+        let mut dispatches = rt.pending_dispatches.lock().await;
+        let pending = dispatches
+            .get(dispatch_id)
+            .ok_or_else(|| SwitchError::NotFound(format!("dispatch {dispatch_id}")))?;
+        self.validate_dispatch_targets(session_id, &pending.dispatches)
+            .await?;
+        let pending = dispatches
             .remove(dispatch_id)
             .ok_or_else(|| SwitchError::NotFound(format!("dispatch {dispatch_id}")))?;
+        drop(dispatches);
 
         let updated = self.store.update_message(
             &pending.message_id,
@@ -669,6 +730,7 @@ impl SwitchEngine {
         chain_id: &str,
         specs: Vec<DispatchTaskSpec>,
     ) -> Result<(), SwitchError> {
+        self.validate_dispatch_targets(session_id, &specs).await?;
         self.try_consume_hop(session_id, chain_id, specs.clone())
             .await?;
 
@@ -778,24 +840,29 @@ impl SwitchEngine {
         allow_pattern: Option<String>,
     ) -> Result<(), SwitchError> {
         let rt = self.runtime(session_id).await;
-        let entry = rt
-            .pending_permissions
-            .lock()
-            .await
+        let mut pending = rt.pending_permissions.lock().await;
+        let view = &pending
+            .get(request_id)
+            .ok_or_else(|| SwitchError::NotFound(format!("permission {request_id}")))?
+            .view;
+        let option = view
+            .options
+            .iter()
+            .find(|option| option.option_id == option_id)
+            .ok_or_else(|| SwitchError::Validation("unknown permission option".into()))?;
+        let allowed = option.kind.starts_with("allow");
+        if let Some(ref pat) = allow_pattern {
+            if !allowed || view.suggested_pattern.is_none() || pat.trim().is_empty() {
+                return Err(SwitchError::Validation("invalid permission pattern".into()));
+            }
+            self.store
+                .add_permission_rule(session_id, "terminal", pat, "allow")?;
+        }
+        let entry = pending
             .remove(request_id)
             .ok_or_else(|| SwitchError::NotFound(format!("permission {request_id}")))?;
-
-        if let Some(ref pat) = allow_pattern {
-            let _ = self
-                .store
-                .add_permission_rule(session_id, &entry.view.tool_kind, pat, "allow");
-        }
-
-        let decision = if option_id.starts_with("reject") {
-            "rejected"
-        } else {
-            "allowed"
-        };
+        drop(pending);
+        let decision = if allowed { "allowed" } else { "rejected" };
 
         let _ = entry.tx.send(PermissionResolution::Selected {
             option_id,
@@ -857,14 +924,26 @@ impl SwitchEngine {
                 )
             };
             let _member_guard = member_lock.lock().await;
-
-            if *rt.cancel_epoch.read().await != epoch_at_start {
+            let session = self.store.get_session(session_id)?;
+            let _shared_cwd_guard = if session.isolation_mode == IsolationMode::SharedCwd {
+                Some(rt.shared_cwd_lock.lock().await)
+            } else {
+                None
+            };
+            if *rt.cancel_epoch.read().await != epoch_at_start
+                || rt
+                    .chains
+                    .lock()
+                    .await
+                    .get(chain_id)
+                    .is_some_and(|chain| chain.cancelled)
+            {
                 return Err(SwitchError::Cancelled);
             }
 
-            let session = self.store.get_session(session_id)?;
             let project = self.store.get_project(&session.project_id)?;
             let mut member = self.store.get_member(session_id, &task.target)?;
+            let previous_cwd = member.worktree_path.clone();
             let cfg = self.config.read().await.clone();
             let adapter_cfg = cfg
                 .adapters
@@ -931,10 +1010,9 @@ impl SwitchEngine {
                 engine: Arc::downgrade(self),
                 session_id: session_id.to_string(),
                 member_handle: member.handle.clone(),
+                worktree: work_cwd.clone(),
                 touched_files: Mutex::new(HashSet::new()),
-                tool_count: Mutex::new(0),
-                edit_count: Mutex::new(0),
-                thought_count: Mutex::new(0),
+                counters: Mutex::new(TurnCounters::default()),
             });
 
             let spawn_spec = MemberSpawnSpec {
@@ -945,7 +1023,9 @@ impl SwitchEngine {
                 project_root: project_root.clone(),
                 member_worktree: work_cwd.clone(),
                 permission_policy: session.permission_policy,
-                existing_acp_session_id: member.acp_session_id.clone(),
+                existing_acp_session_id: member.acp_session_id.clone().filter(|_| {
+                    previous_cwd.as_deref().map(Path::new) == Some(dunce::simplified(&work_cwd))
+                }),
                 extra_env: Vec::new(),
                 mcp_bridge_spec: mcp_spec,
                 rules,
@@ -968,6 +1048,24 @@ impl SwitchEngine {
                         &DiffStat::default(),
                         None,
                     );
+                    if !matches!(
+                        purpose,
+                        TurnPurpose::MemoryCuration | TurnPurpose::PeerConsult { .. }
+                    ) && let Ok(message) = self.store.append_message(NewMessageParams {
+                        id: None,
+                        session_id: session_id.into(),
+                        chain_id: chain_id.into(),
+                        parent_msg_id: None,
+                        sender_kind: SenderKind::System,
+                        sender_id: member.handle.clone(),
+                        recipients: Vec::new(),
+                        kind: MessageKind::SystemNotice,
+                        content: format!("Could not start @{}: {e}", member.handle),
+                        turn_id: Some(turn_id.clone()),
+                        metadata: json!({"error": true}),
+                    }) {
+                        let _ = self.events_tx.send(WsEvent::ChatMessageCreated { message });
+                    }
                     return Err(e.into());
                 }
             };
@@ -1005,10 +1103,13 @@ impl SwitchEngine {
             .await;
 
             // Build token-conscious delta prompt
-            let unseen = self
-                .store
-                .list_unseen_deltas(session_id, member.last_seen_msg_seq, 50)
-                .unwrap_or_default();
+            let unseen = if new_acp_sid != member.acp_session_id {
+                self.store.list_messages(session_id, None, 50)
+            } else {
+                self.store
+                    .list_unseen_deltas(session_id, member.last_seen_msg_seq, 50)
+            }
+            .unwrap_or_default();
             let max_seen_seq = unseen
                 .last()
                 .map(|m| m.seq)
@@ -1078,18 +1179,17 @@ impl SwitchEngine {
                         .record_turn_tokens(&member.adapter_id, approx_tokens)
                         .await;
                     if let Some(acfg) = cfg.adapters.get(&member.adapter_id) {
-                        if acfg.quota_provider != "manual" {
-                            self.quota
-                                .invalidate_if_stale(&member.adapter_id, 45_000)
-                                .await;
-                        }
-                        let snap = self
-                            .quota
-                            .snapshot(&member.adapter_id, &acfg.quota_provider)
-                            .await;
-                        let _ = self
-                            .events_tx
-                            .send(WsEvent::QuotaUpdated { snapshot: snap });
+                        let quota = Arc::clone(&self.quota);
+                        let events = self.events_tx.clone();
+                        let adapter_id = member.adapter_id.clone();
+                        let provider = acfg.quota_provider.clone();
+                        tokio::spawn(async move {
+                            if provider != "manual" {
+                                quota.invalidate_if_stale(&adapter_id, 45_000).await;
+                            }
+                            let snapshot = quota.snapshot(&adapter_id, &provider).await;
+                            let _ = events.send(WsEvent::QuotaUpdated { snapshot });
+                        });
                     }
 
                     let touched: Vec<String> = callbacks
@@ -1171,7 +1271,8 @@ impl SwitchEngine {
                     if !is_orchestrator_context {
                         self.attempt_429_failover(&session, chain_id, &member, &task, &msg)
                             .await;
-                    } else if let Some(vmsg) = visible_msg {
+                    }
+                    if let Some(vmsg) = visible_msg {
                         let updated = self.store.update_message(
                             &vmsg.id,
                             &format!("Rate limit hit on @{}: {msg}", member.handle),
@@ -1472,8 +1573,15 @@ impl SwitchEngine {
                         for peer in all_members {
                             if peer.handle != member.handle
                                 && let Some(p_wt) = peer.worktree_path
+                                && Path::new(&p_wt) != int_wt
                             {
-                                let _ = sync_member_worktree(Path::new(&p_wt), int_br).await;
+                                let peer_lock = {
+                                    let mut locks = rt.member_locks.lock().await;
+                                    Arc::clone(locks.entry(peer.handle).or_default())
+                                };
+                                if let Ok(_idle) = peer_lock.try_lock() {
+                                    let _ = sync_member_worktree(Path::new(&p_wt), int_br).await;
+                                }
                             }
                         }
                     }
@@ -1695,7 +1803,7 @@ impl SwitchEngine {
     ) {
         let cfg = self.config.read().await.clone();
         let members = self.store.list_members(&session.id).unwrap_or_default();
-        let quotas = self.quota.all_snapshots(&cfg).await;
+        let quotas = self.quota.cached_snapshots(&cfg).await;
         let probes = probe_installed_adapters(&cfg);
 
         if let Some(alt) =
@@ -1766,14 +1874,68 @@ impl SwitchEngine {
     }
 }
 
+fn validate_available_targets<'a>(
+    targets: impl IntoIterator<Item = &'a str>,
+    available: &HashSet<String>,
+) -> Result<(), SwitchError> {
+    let unavailable: Vec<_> = targets
+        .into_iter()
+        .filter(|target| !available.contains(*target))
+        .map(|target| format!("@{target}"))
+        .collect();
+    if unavailable.is_empty() {
+        return Ok(());
+    }
+    let mut alternatives: Vec<_> = available
+        .iter()
+        .map(|target| format!("@{target}"))
+        .collect();
+    alternatives.sort();
+    Err(SwitchError::Validation(format!(
+        "Unavailable harnesses: {}. Available members: {}.",
+        unavailable.join(", "),
+        if alternatives.is_empty() {
+            "none".into()
+        } else {
+            alternatives.join(", ")
+        }
+    )))
+}
+
 struct SwitchCallbacks {
     engine: std::sync::Weak<SwitchEngine>,
     session_id: String,
     member_handle: String,
+    worktree: PathBuf,
     touched_files: Mutex<HashSet<String>>,
-    tool_count: Mutex<u32>,
-    edit_count: Mutex<u32>,
-    thought_count: Mutex<u32>,
+    counters: Mutex<TurnCounters>,
+}
+
+#[derive(Default)]
+struct TurnCounters {
+    tool_ids: HashSet<String>,
+    tool_calls: u32,
+    file_edits: u32,
+    thoughts: u32,
+}
+
+impl TurnCounters {
+    fn record(&mut self, kind: TrajectoryEventKind, payload: &Value) -> bool {
+        match kind {
+            TrajectoryEventKind::ToolCall => {
+                if let Some(id) = payload.get("toolCallId").and_then(Value::as_str)
+                    && !self.tool_ids.insert(id.to_string())
+                {
+                    return false;
+                }
+                self.tool_calls += 1;
+            }
+            TrajectoryEventKind::Diff => self.file_edits += 1,
+            TrajectoryEventKind::Thought => self.thoughts += 1,
+            _ => return false,
+        }
+        true
+    }
 }
 
 #[async_trait]
@@ -1849,6 +2011,20 @@ impl BrokerCallbacks for SwitchCallbacks {
         let Some(engine) = self.engine.upgrade() else {
             return;
         };
+        if kind == TrajectoryEventKind::Diff
+            && let Some(path) = payload.get("path").and_then(Value::as_str)
+        {
+            let path = Path::new(path);
+            if let Ok(relative) = path.strip_prefix(&self.worktree) {
+                self.record_touched_file(turn_id, relative.to_string_lossy().into_owned())
+                    .await;
+            } else if path.is_relative() {
+                self.record_touched_file(turn_id, path.to_string_lossy().into_owned())
+                    .await;
+            }
+        }
+        let mut counters = self.counters.lock().await;
+        let changed = counters.record(kind, &payload);
         if let Ok(inserted) = engine
             .store
             .append_trajectory_events(turn_id, &[(kind, payload)])
@@ -1862,22 +2038,15 @@ impl BrokerCallbacks for SwitchCallbacks {
             }
         }
 
-        let mut tc = self.tool_count.lock().await;
-        let mut ec = self.edit_count.lock().await;
-        let mut thc = self.thought_count.lock().await;
-        match kind {
-            TrajectoryEventKind::ToolCall | TrajectoryEventKind::Terminal => *tc += 1,
-            TrajectoryEventKind::Diff => *ec += 1,
-            TrajectoryEventKind::Thought => *thc += 1,
-            _ => {}
+        if changed {
+            let _ = engine.events_tx.send(WsEvent::TrajectoryCounters {
+                session_id: self.session_id.clone(),
+                turn_id: turn_id.to_string(),
+                tool_calls: counters.tool_calls,
+                file_edits: counters.file_edits,
+                thoughts: counters.thoughts,
+            });
         }
-        let _ = engine.events_tx.send(WsEvent::TrajectoryCounters {
-            session_id: self.session_id.clone(),
-            turn_id: turn_id.to_string(),
-            tool_calls: *tc,
-            file_edits: *ec,
-            thoughts: *thc,
-        });
     }
 
     async fn record_touched_file(&self, _turn_id: &str, rel_path: String) {

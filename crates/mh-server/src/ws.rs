@@ -66,7 +66,7 @@ async fn handle_socket(mut socket: WebSocket, state: AppState, mut active_sessio
                     Some(Ok(Message::Ping(p))) => {
                         let _ = socket.send(Message::Pong(p)).await;
                     }
-                    Some(Ok(Message::Close(_))) | None => break,
+                    Some(Ok(Message::Close(_)) | Err(_)) | None => break,
                     _ => {}
                 }
             }
@@ -111,8 +111,5 @@ fn should_forward(
         WsEvent::QuotaUpdated { .. } | WsEvent::MemoryJobCurated { .. } => None,
     };
 
-    match (active_session, ev_session) {
-        (Some(wanted), Some(actual)) => wanted == actual,
-        _ => true,
-    }
+    ev_session.is_none_or(|actual| active_session == Some(actual))
 }

@@ -3,6 +3,7 @@ import { KeyRound, Loader2, X } from "lucide-react";
 import { ChatPane } from "./components/chat/ChatPane";
 import { InspectorDrawer } from "./components/drawer/InspectorDrawer";
 import { FolderPickerModal } from "./components/modals/FolderPickerModal";
+import { SettingsDialog } from "./components/modals/SettingsDialog";
 import { Sidebar } from "./components/sidebar/Sidebar";
 import { useAppStore } from "./store/useAppStore";
 
@@ -13,6 +14,8 @@ export function App() {
     bootstrapping,
     errorBanner,
     folderModalOpen,
+    settingsOpen,
+    setSettingsOpen,
     setFolderModalOpen,
     createAndSelectProject,
     toggleSidebar,
@@ -59,6 +62,7 @@ export function App() {
           <p className="text-xs text-ink-muted leading-relaxed">
             Enter the pairing bearer token printed in the Meta-Harness server terminal.
           </p>
+          {errorBanner && <p role="alert" className="text-xs text-neg">{errorBanner}</p>}
           <input
             type="password"
             value={tokenInput}
@@ -79,7 +83,7 @@ export function App() {
   }
 
   return (
-    <div className="h-screen w-screen overflow-hidden flex flex-col bg-app text-ink">
+    <div className="flex h-dvh w-full flex-col overflow-hidden bg-app text-ink">
       {errorBanner && (
         <div className="bg-neg-soft border-b border-neg/35 px-4 py-1.5 text-xs text-neg flex items-center justify-between">
           <span>{errorBanner}</span>
@@ -107,6 +111,7 @@ export function App() {
           }}
         />
       )}
+      {settingsOpen && <SettingsDialog onClose={() => setSettingsOpen(false)} />}
     </div>
   );
 }

@@ -99,6 +99,7 @@ sequenceDiagram
 
 ### 3.1 Lazy Spawning, Hibernation & Cross-Platform Process Supervision
 1. Subprocesses spawn lazily on first turn in a session, inheriting OS user environment (`USERPROFILE`/`HOME`, `APPDATA`/`XDG_CONFIG_HOME`, `LOCALAPPDATA`/`XDG_DATA_HOME`, `PATH`) to reuse existing CLI subscriptions on Windows, macOS, and Linux.
+   - The default Codex launcher prefers an installed `codex-acp` or a matching entry in the local npm exec cache. A fresh setup falls back to `npx --prefer-offline`. Custom launch commands and version pins follow their configured path.
 2. Process tree cleanup is enforced natively on every OS: Win32 Job Objects (`JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`) on Windows, dedicated process groups (`process_group(0)` + `killpg(SIGTERM -> SIGKILL)`) on macOS & Linux, and `prctl(PR_SET_PDEATHSIG, SIGTERM)` on Linux.
 3. Config and data directories follow native platform conventions (`%APPDATA%`/`%LOCALAPPDATA%` on Windows, `~/Library/Application Support` on macOS, `$XDG_CONFIG_HOME`/`$XDG_DATA_HOME` on Linux, overridable via `MH_CONFIG_DIR`/`MH_DATA_DIR`).
 4. Processes idle beyond `idle_process_ttl_secs` (`900s`) hibernate and transparently resume via ACP `session/load` (if advertised) or `session/new` seeded with the session's compact working summary + last worktree state.
@@ -174,17 +175,18 @@ Tracked per `HarnessAdapter` (so multiple personas of the same CLI share one quo
    - **Google / Antigravity (`google_local`)**: Verifies API keys via Generative Language API or reports local account connection status honestly (`QuotaSource::Unavailable` rather than fabricating `100%` when no public OAuth percentage API exists).
    - **Reactive `429` Circuit Breaker**: Immediately marks `rate_limited_until` upon rate-limit errors and triggers automatic Orchestrator failover.
 2. **Manual Calibration & Offline Mode**:
-   - Users can disable live probes (`exact_probe_opt_in = false`) or supply manual calibration percentages; offline integration tests use deterministic `quota_provider = "manual"` accounting.
+   - Users can disable live probes per adapter (`exact_probe_opt_in = false`). Saved preferences take precedence over adapter defaults. Meta-Harness reports its local turn usage and accepts manual calibration percentages. Offline integration tests use deterministic `quota_provider = "manual"` accounting.
 
 ### 5.2 Orchestrator Decision Modes & Self-Brand Dispatch
 When an unmentioned user prompt arrives:
-1. `mh-switch` injects `<orchestrator_telemetry>` (~200 tokens: adapter quota percentages, available `(model, effort)` options, and top 5 FTS5 episodic memories).
+1. `mh-switch` injects `<orchestrator_telemetry>` with executable availability, cached quota data, discovered model and effort options, and up to five FTS5 memory matches. Live quota refreshes run independently of prompt setup.
 2. **Pragmatic Execution Rules**:
    - **Trivial Question / Quick Repo Inspection / Branch Merge**: Orchestrator answers directly from `_integration` without wasting an extra hop.
    - **Single or Decomposable Coding Work**: Calls `orchestrator_dispatch(...)` to assign work to one or more executor members (including an executor worktree of its own adapter brand if best suited!), selecting:
      - `low` effort + fast model for simple edits/boilerplate.
      - `medium` effort + domain-matched model for standard features/UI/tests.
      - `high` / `xhigh` effort + flagship model for hard systems/architecture/concurrency tasks—automatically shifting to a peer adapter when remaining 5h quota drops below threshold (`<15%`).
+   - Dispatch validates every target against the launcher's availability before creating a card. An unavailable target returns an error with the available member handles.
    - **Confirm-Plan Mode (Optional Session Toggle)**: Posts the proposed Dispatch Card in `"awaiting_confirmation"` state until the user clicks **Proceed** (or edits model/target inline).
 
 ---
@@ -368,9 +370,10 @@ Supports four selectable themes (`Obsidian Studio`, `Tokyo Night`, `Catppuccin M
    - **Welcome Studio Dashboard**: Primary Open Project Folder CTA, recent projects grid, and live connected harness quota cards.
    - **Top Session Changes Bar**: Shows `mh/<sid>/integration` ahead of `main` (`+142 / -31 · 5 files`), **[Diff]** (`DiffViewer` per-file +/- view), **[Preview / Shell]**, and **[Promote ▾]** (`Fast-Forward / Merge`, `Squash Merge`, `Apply Uncommitted Patch`).
    - **Developer Thread Group Chat Stream**:
-     - Full-width aligned message rows with harness avatars, rich Markdown rendering (headings, lists, pipe tables, copyable code/diff blocks), **Orchestrator Dispatch Cards**, **Collapsible `peer_consult` Threads**, subtle **Trajectory Read Pills**, **Git Clean-Merge / Conflict Notices**, and **Worktree-Smart Permission Cards**.
+     - Right-aligned user bubbles and left-aligned harness replies with rich Markdown rendering, **Orchestrator Dispatch Cards**, **Collapsible `peer_consult` Threads**, **Trajectory Read Pills**, **Git Clean-Merge / Conflict Notices**, and **Worktree-Smart Permission Cards**.
    - **Keyboard-Navigable `@mention` Composer**: Auto-resizing input autocompleting `@member` with live quota % badges, `@all`, `@orchestrator`, and `Confirm Plan First` pill toggle.
 3. **Right Inspector Drawer**:
-   - **Trajectory**: Step-by-step thoughts, tool calls, terminal logs, and `DiffViewer` file patches for any selected turn.
+   - **Trajectory**: Thoughts and plans, plus collapsible tool calls with status, terminal output, and file diffs. Codex terminal chunks attach to their parent call, so the tool count reflects distinct calls.
    - **Memory Ledger**: Orchestrator-curated job history & pinned architectural/affinity facts.
-   - **Switch & Quotas**: Live API quota refresh, plan tier selection, `Live API` probe toggles, segmented permission mode cards, and session rules.
+   - **Session**: Permission mode, agent hop limit, and session command rules.
+4. **Global Settings**: Appearance, harness availability, quota refresh, plan tier selection, and per-adapter live quota preferences.

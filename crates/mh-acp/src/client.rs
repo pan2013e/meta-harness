@@ -11,7 +11,7 @@ use tokio::process::{Child, ChildStdin, Command};
 use tokio::sync::{Mutex, RwLock, oneshot};
 use tracing::{debug, warn};
 
-use mh_core::{DiscoveredConfigOption, TrajectoryEventKind};
+use mh_core::{DiscoveredConfigOption, PermissionRule, TrajectoryEventKind};
 
 use crate::AcpError;
 use crate::broker::{BrokerCallbacks, MemberBrokerContext, WorkspaceBroker};
@@ -22,6 +22,7 @@ use crate::protocol::{
     McpServerSpec, NewSessionParams, NewSessionResult, PromptParams, PromptResult,
     SetConfigOptionParams, extract_update_text, parse_config_options,
 };
+use crate::trajectory::{TrajectoryUpdate, parse_tool_update, push_update};
 
 #[async_trait]
 pub trait TurnStreamListener: Send + Sync {
@@ -36,6 +37,7 @@ struct TurnStreamAccumulator {
     listener: Arc<dyn TurnStreamListener>,
     text_buf: String,
     thought_buf: String,
+    trajectory_buf: Vec<TrajectoryUpdate>,
     full_reply: String,
 }
 
@@ -48,6 +50,7 @@ pub struct AcpClient {
     broker: Arc<WorkspaceBroker>,
     stderr_tail: Arc<Mutex<VecDeque<String>>>,
     active_stream: Arc<Mutex<Option<TurnStreamAccumulator>>>,
+    stream_flush: Arc<Mutex<()>>,
     pub agent_capabilities: RwLock<InitializeResult>,
     pub acp_session_id: RwLock<Option<String>>,
     pub config_options: RwLock<Vec<DiscoveredConfigOption>>,
@@ -56,6 +59,14 @@ pub struct AcpClient {
 }
 
 impl AcpClient {
+    pub(crate) async fn update_turn_context(
+        &self,
+        callbacks: Arc<dyn BrokerCallbacks>,
+        rules: Vec<PermissionRule>,
+    ) {
+        self.broker.update_turn_context(callbacks, rules).await;
+    }
+
     pub async fn spawn(
         command: &str,
         args: &[String],
@@ -93,6 +104,7 @@ impl AcpClient {
         ));
         let stderr_tail = Arc::new(Mutex::new(VecDeque::<String>::with_capacity(100)));
         let active_stream = Arc::new(Mutex::new(None::<TurnStreamAccumulator>));
+        let stream_flush = Arc::new(Mutex::new(()));
         let broker = Arc::new(WorkspaceBroker::new(broker_ctx, callbacks));
 
         if let Some(err_stream) = stderr {
@@ -111,16 +123,21 @@ impl AcpClient {
 
         // 25ms stream coalescer flushing text/thought chunks smoothly
         let stream_for_flush = Arc::clone(&active_stream);
+        let flush_guard = Arc::clone(&stream_flush);
         let coalescer_task = tokio::spawn(async move {
             let mut interval = tokio::time::interval(Duration::from_millis(25));
             loop {
                 interval.tick().await;
-                let (turn_id, listener, text_delta, thought_delta) = {
+                let _flush = flush_guard.lock().await;
+                let (turn_id, listener, text_delta, thought_delta, trajectory) = {
                     let mut guard = stream_for_flush.lock().await;
                     let Some(acc) = guard.as_mut() else {
                         continue;
                     };
-                    if acc.text_buf.is_empty() && acc.thought_buf.is_empty() {
+                    if acc.text_buf.is_empty()
+                        && acc.thought_buf.is_empty()
+                        && acc.trajectory_buf.is_empty()
+                    {
                         continue;
                     }
                     (
@@ -128,6 +145,7 @@ impl AcpClient {
                         Arc::clone(&acc.listener),
                         std::mem::take(&mut acc.text_buf),
                         std::mem::take(&mut acc.thought_buf),
+                        std::mem::take(&mut acc.trajectory_buf),
                     )
                 };
                 if !thought_delta.is_empty() {
@@ -135,6 +153,9 @@ impl AcpClient {
                 }
                 if !text_delta.is_empty() {
                     listener.on_text_delta(&turn_id, text_delta).await;
+                }
+                for (kind, payload) in trajectory {
+                    listener.on_trajectory_event(&turn_id, kind, payload).await;
                 }
             }
         });
@@ -200,6 +221,7 @@ impl AcpClient {
                 broker,
                 stderr_tail,
                 active_stream,
+                stream_flush,
                 agent_capabilities: RwLock::new(InitializeResult::default()),
                 acp_session_id: RwLock::new(None),
                 config_options: RwLock::new(Vec::new()),
@@ -358,6 +380,7 @@ impl AcpClient {
                 listener: Arc::clone(&listener),
                 text_buf: String::new(),
                 thought_buf: String::new(),
+                trajectory_buf: Vec::new(),
                 full_reply: String::new(),
             });
         }
@@ -374,16 +397,18 @@ impl AcpClient {
             .await;
 
         // Flush any remaining buffered deltas before returning
-        let (final_text_tail, final_thought_tail, full_reply) = {
+        let _flush = self.stream_flush.lock().await;
+        let (final_text_tail, final_thought_tail, full_reply, trajectory) = {
             let mut guard = self.active_stream.lock().await;
             if let Some(mut acc) = guard.take() {
                 (
                     std::mem::take(&mut acc.text_buf),
                     std::mem::take(&mut acc.thought_buf),
                     acc.full_reply,
+                    acc.trajectory_buf,
                 )
             } else {
-                (String::new(), String::new(), String::new())
+                (String::new(), String::new(), String::new(), Vec::new())
             }
         };
         if !final_thought_tail.is_empty() {
@@ -391,6 +416,9 @@ impl AcpClient {
         }
         if !final_text_tail.is_empty() {
             listener.on_text_delta(turn_id, final_text_tail).await;
+        }
+        for (kind, payload) in trajectory {
+            listener.on_trajectory_event(turn_id, kind, payload).await;
         }
 
         match rpc_res {
@@ -617,16 +645,11 @@ impl AcpClient {
                     .await;
             }
             "tool_call" | "tool_call_update" => {
-                let (turn_id, listener) = {
-                    let guard = self.active_stream.lock().await;
-                    let Some(acc) = guard.as_ref() else {
-                        return;
-                    };
-                    (acc.turn_id.clone(), Arc::clone(&acc.listener))
-                };
-                listener
-                    .on_trajectory_event(&turn_id, TrajectoryEventKind::ToolCall, update.clone())
-                    .await;
+                if let Some(acc) = self.active_stream.lock().await.as_mut() {
+                    for event in parse_tool_update(update, kind == "tool_call") {
+                        push_update(&mut acc.trajectory_buf, event);
+                    }
+                }
             }
             "config_option_update" => {
                 if let Some(arr) = update.get("configOptions").and_then(|v| v.as_array()) {

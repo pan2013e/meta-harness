@@ -133,6 +133,25 @@ body {
   color: var(--mh-ink);
 }
 
+@layer base {
+  :where(button, summary, a[href], select, input[type="checkbox"], input[type="radio"], input[type="range"], [role="button"]):not(:disabled, [aria-disabled="true"]) {
+    cursor: pointer;
+  }
+
+  :where(button, summary, a[href], select, [role="button"]):focus-visible {
+    outline: 2px solid var(--mh-brand-ink);
+    outline-offset: 3px;
+  }
+
+  :where(button, input, select):disabled {
+    cursor: not-allowed;
+  }
+
+  dialog::backdrop {
+    background: rgb(3 6 14 / 68%);
+  }
+}
+
 ::-webkit-scrollbar {
   width: 6px;
   height: 6px;

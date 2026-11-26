@@ -6,6 +6,7 @@ import type {
   FsEntry,
   IsolationMode,
   MemberRole,
+  MemberStatus,
   PendingPermissionView,
   PermissionPolicy,
   PermissionRule,
@@ -134,7 +135,7 @@ export const api = {
       session: Session;
       members: SessionMember[];
       permission_rules: PermissionRule[];
-      statuses: Record<string, [string, string | null]>;
+      statuses: Record<string, [MemberStatus, string | null]>;
       pending_permissions: PendingPermissionView[];
     }>(`/api/sessions/${encodeURIComponent(sessionId)}`),
   patchSession: (
@@ -292,11 +293,12 @@ export class WsHubClient {
   private sessionId: string | null = null;
   private subscribedTurn: string | null = null;
   private closed = false;
-  private onEvent: (ev: WsEvent) => void;
+  private hasOpened = false;
 
-  constructor(onEvent: (ev: WsEvent) => void) {
-    this.onEvent = onEvent;
-  }
+  constructor(
+    private readonly onEvent: (ev: WsEvent) => void,
+    private readonly onReconnect?: () => void,
+  ) {}
 
   connect(sessionId: string | null) {
     this.sessionId = sessionId;
@@ -332,6 +334,7 @@ export class WsHubClient {
 
   private openSocket() {
     if (this.closed) return;
+    this.reconnectTimer = null;
     if (this.ws && this.ws.readyState <= WebSocket.OPEN) {
       this.ws.close();
     }
@@ -341,19 +344,18 @@ export class WsHubClient {
     if (bearerToken) params.set("token", bearerToken);
     const url = `${proto}//${window.location.host}/api/ws?${params.toString()}`;
     const socket = new WebSocket(url);
+    this.ws = socket;
 
     socket.onopen = () => {
-      if (this.subscribedTurn) {
-        socket.send(
-          JSON.stringify({
-            type: "subscribe_trajectory",
-            turn_id: this.subscribedTurn,
-          })
-        );
-      }
+      if (this.ws !== socket) return;
+      this.setSession(this.sessionId);
+      this.subscribeTrajectory(this.subscribedTurn);
+      if (this.hasOpened) this.onReconnect?.();
+      this.hasOpened = true;
     };
 
     socket.onmessage = (msg) => {
+      if (this.ws !== socket) return;
       try {
         const ev = JSON.parse(String(msg.data)) as WsEvent;
         this.onEvent(ev);
@@ -363,7 +365,8 @@ export class WsHubClient {
     };
 
     socket.onclose = () => {
-      if (!this.closed) {
+      if (this.ws === socket && !this.closed) {
+        this.ws = null;
         this.reconnectTimer = window.setTimeout(() => this.openSocket(), 1500);
       }
     };

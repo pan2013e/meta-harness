@@ -6,7 +6,7 @@ use serde_json::{Value, json};
 use tokio::net::TcpListener;
 
 use mh_acp::{AcpSupervisor, QuotaTracker, init_git_repo};
-use mh_core::{AdapterConfig, AppConfig, MessageKind, PromoteMode};
+use mh_core::{AdapterConfig, AppConfig, DispatchTaskSpec, MessageKind, PromoteMode};
 use mh_server::auth::AuthConfig;
 use mh_server::{AppState, build_router};
 use mh_store::Store;
@@ -155,6 +155,57 @@ async fn e2e_parallel_worktrees_consult_cycle_trajectory_orchestrator_and_promot
         .as_str()
         .unwrap()
         .to_string();
+
+    let original_claude = {
+        let mut config = switch.config.write().await;
+        let adapter = config.adapters.get_mut("claude").unwrap();
+        std::mem::replace(
+            &mut adapter.command,
+            repo_root.join("missing-claude").display().to_string(),
+        )
+    };
+    let missing = switch
+        .submit_orchestrator_dispatch(
+            &session_id,
+            "antigravity",
+            "Use Claude".into(),
+            vec![DispatchTaskSpec {
+                target: "@claude".into(),
+                model: None,
+                effort: None,
+                task_brief: "Test".into(),
+                mode: "parallel".into(),
+            }],
+        )
+        .await
+        .unwrap_err();
+    assert!(
+        missing
+            .to_string()
+            .contains("Unavailable harnesses: @claude")
+    );
+    assert!(missing.to_string().contains("@codex"));
+    assert!(
+        switch
+            .handle_user_message(&session_id, "@claude test".into())
+            .await
+            .is_err()
+    );
+    assert!(
+        switch
+            .store
+            .list_messages(&session_id, None, 10)
+            .unwrap()
+            .is_empty()
+    );
+    switch
+        .config
+        .write()
+        .await
+        .adapters
+        .get_mut("claude")
+        .unwrap()
+        .command = original_claude;
 
     // 2. Parallel @codex + @claude disjoint edits -> clean zero-token auto-merge
     let req_a = http

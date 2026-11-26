@@ -12,10 +12,12 @@ function parseUnifiedDiff(diffText: string): DiffSection[] {
   const rawLines = diffText.split(/\r?\n/);
   const sections: DiffSection[] = [];
   let current: DiffSection | null = null;
+  let inHunk = false;
 
   for (const line of rawLines) {
     if (line.startsWith("diff --git ")) {
       if (current) sections.push(current);
+      inHunk = false;
       const m = line.match(/^diff --git a\/.+ b\/(.+)$/);
       current = {
         filename: m ? m[1] : line.slice(11),
@@ -36,22 +38,23 @@ function parseUnifiedDiff(diffText: string): DiffSection[] {
       };
     }
 
-    if (line.startsWith("+++ b/")) {
+    if (line.startsWith("@@")) inHunk = true;
+
+    if (!inHunk && line.startsWith("+++ b/")) {
       current.filename = line.slice(6);
       continue;
     }
     if (
-      line.startsWith("index ") ||
-      line.startsWith("--- ") ||
-      line.startsWith("new file mode") ||
-      line.startsWith("deleted file mode")
+      !inHunk && (line.startsWith("index ") ||
+      line.startsWith("--- ") || line.startsWith("+++ ") ||
+      line.startsWith("new file mode") || line.startsWith("deleted file mode"))
     ) {
       continue;
     }
 
-    if (line.startsWith("+") && !line.startsWith("+++")) {
+    if (inHunk && line.startsWith("+")) {
       current.additions += 1;
-    } else if (line.startsWith("-") && !line.startsWith("---")) {
+    } else if (inHunk && line.startsWith("-")) {
       current.deletions += 1;
     }
     current.lines.push(line);

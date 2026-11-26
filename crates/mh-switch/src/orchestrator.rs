@@ -1,4 +1,4 @@
-use mh_acp::{AdapterProbeStatus, QuotaTracker};
+use mh_acp::{AdapterProbeStatus, QuotaTracker, probe_installed_adapters};
 use mh_core::{AppConfig, DiscoveredConfigOption, SessionMember};
 use mh_store::Store;
 
@@ -13,7 +13,8 @@ pub async fn build_orchestrator_telemetry_block(
     discovered_options: &[(String, Vec<DiscoveredConfigOption>)],
     user_query: &str,
 ) -> String {
-    let snapshots = quota.all_snapshots(config).await;
+    let snapshots = quota.cached_snapshots(config).await;
+    let probes = probe_installed_adapters(config);
     let jobs = store
         .recall_jobs(project_id, Some(user_query), 5)
         .unwrap_or_default();
@@ -24,9 +25,12 @@ pub async fn build_orchestrator_telemetry_block(
     out.push_str("  <members>\n");
     for m in members {
         out.push_str(&format!(
-            "    - handle=@{} adapter={} role={:?} model={} effort={}\n",
+            "    - handle=@{} adapter={} available={} role={:?} model={} effort={}\n",
             m.handle,
             m.adapter_id,
+            probes
+                .iter()
+                .any(|p| p.adapter_id == m.adapter_id && p.installed),
             m.role,
             m.active_model.as_deref().unwrap_or("default"),
             m.active_effort.as_deref().unwrap_or("default"),
@@ -60,7 +64,7 @@ pub async fn build_orchestrator_telemetry_block(
 
     out.push_str("  <adapter_profiles>\n");
     for (id, cfg) in &config.adapters {
-        if !cfg.enabled {
+        if !probes.iter().any(|p| p.adapter_id == *id && p.installed) {
             continue;
         }
         let live_models = discovered_options
@@ -103,7 +107,7 @@ pub async fn build_orchestrator_telemetry_block(
     out.push_str(
         "  <instructions>\n\
          For trivial questions or repo lookups, answer directly. \
-         For coding work, call `orchestrator_dispatch` choosing the best member(s), `model`, and `effort` \
+         For coding work, call `orchestrator_dispatch` choosing only members with available=true, with `model` and `effort` \
          (`low` for simple edits, `medium` for features/tests, `high` for complex architecture/debugging; \
          avoid adapters with exhausted=true or remaining quota < 15%). \
          Use your own harness brand's executor member if it is the strongest fit.\n\
@@ -183,9 +187,7 @@ pub fn pick_fallback_executor(
         }
         let installed = probes
             .iter()
-            .find(|p| p.adapter_id == m.adapter_id)
-            .map(|p| p.installed)
-            .unwrap_or(true);
+            .any(|p| p.adapter_id == m.adapter_id && p.installed);
         if !installed {
             continue;
         }

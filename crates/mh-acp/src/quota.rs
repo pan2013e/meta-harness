@@ -12,12 +12,18 @@ use tokio::task::JoinSet;
 
 use mh_core::{AppConfig, QuotaSnapshot, QuotaSource, QuotaWindow};
 
-use crate::platform::{
-    ProcessTreeGuard, find_cli_binary, prepare_isolated_command, probe_executable,
-};
+use crate::platform::{ProcessTreeGuard, find_cli_binary, prepare_isolated_command};
+use crate::supervisor::resolve_adapter_command;
 
 const LIVE_QUOTA_CACHE_TTL_MS: i64 = 5 * 60 * 1000;
 const RATE_LIMIT_CACHE_TTL_MS: i64 = 10 * 60 * 1000;
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum QuotaLookup {
+    Cached,
+    Live,
+    Refresh,
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AdapterProbeStatus {
@@ -37,7 +43,7 @@ struct TurnUsageEntry {
     approx_tokens: u64,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 struct AdapterQuotaPrefs {
     plan_label: Option<String>,
     exact_probe_opt_in: bool,
@@ -128,14 +134,12 @@ impl QuotaTracker {
 
     pub async fn invalidate_if_stale(&self, adapter_id: &str, max_age_ms: i64) {
         let now = chrono::Utc::now().timestamp_millis();
-        let should_remove = {
-            let cache = self.live_cache.read().await;
-            cache
-                .get(adapter_id)
-                .is_some_and(|c| now - c.fetched_at_ms >= max_age_ms)
-        };
-        if should_remove {
-            self.live_cache.write().await.remove(adapter_id);
+        let mut cache = self.live_cache.write().await;
+        if cache
+            .get(adapter_id)
+            .is_some_and(|c| now - c.fetched_at_ms >= max_age_ms)
+        {
+            cache.remove(adapter_id);
         }
     }
 
@@ -166,36 +170,43 @@ impl QuotaTracker {
     }
 
     pub async fn snapshot(&self, adapter_id: &str, quota_provider: &str) -> QuotaSnapshot {
-        self.snapshot_inner(adapter_id, quota_provider, false).await
+        self.snapshot_inner(adapter_id, quota_provider, QuotaLookup::Live)
+            .await
     }
 
     pub async fn refresh_all(
         self: &std::sync::Arc<Self>,
         config: &AppConfig,
     ) -> Vec<QuotaSnapshot> {
-        self.collect_snapshots(config, true).await
+        self.collect_snapshots(config, QuotaLookup::Refresh).await
     }
 
-    pub async fn all_snapshots(&self, config: &AppConfig) -> Vec<QuotaSnapshot> {
-        let items: Vec<(String, String)> = config
+    pub async fn all_snapshots(
+        self: &std::sync::Arc<Self>,
+        config: &AppConfig,
+    ) -> Vec<QuotaSnapshot> {
+        self.collect_snapshots(config, QuotaLookup::Live).await
+    }
+
+    pub async fn cached_snapshots(&self, config: &AppConfig) -> Vec<QuotaSnapshot> {
+        let mut snapshots = Vec::new();
+        for (id, adapter) in config
             .adapters
             .iter()
-            .filter(|(_, cfg)| cfg.enabled)
-            .map(|(id, cfg)| (id.clone(), cfg.quota_provider.clone()))
-            .collect();
-
-        // Preserve config key order while querying live providers promptly
-        let mut out = Vec::with_capacity(items.len());
-        for (id, provider) in items {
-            out.push(self.snapshot_inner(&id, &provider, false).await);
+            .filter(|(_, adapter)| adapter.enabled)
+        {
+            snapshots.push(
+                self.snapshot_inner(id, &adapter.quota_provider, QuotaLookup::Cached)
+                    .await,
+            );
         }
-        out
+        snapshots
     }
 
     async fn collect_snapshots(
         self: &std::sync::Arc<Self>,
         config: &AppConfig,
-        force_refresh: bool,
+        lookup: QuotaLookup,
     ) -> Vec<QuotaSnapshot> {
         let items: Vec<(String, String)> = config
             .adapters
@@ -208,7 +219,7 @@ impl QuotaTracker {
         for (idx, (id, provider)) in items.iter().cloned().enumerate() {
             let tracker = std::sync::Arc::clone(self);
             set.spawn(async move {
-                let snap = tracker.snapshot_inner(&id, &provider, force_refresh).await;
+                let snap = tracker.snapshot_inner(&id, &provider, lookup).await;
                 (idx, snap)
             });
         }
@@ -227,7 +238,7 @@ impl QuotaTracker {
         &self,
         adapter_id: &str,
         quota_provider: &str,
-        force_refresh: bool,
+        lookup: QuotaLookup,
     ) -> QuotaSnapshot {
         let now = chrono::Utc::now().timestamp_millis();
         let pref = self
@@ -288,8 +299,7 @@ impl QuotaTracker {
                 .await;
         }
 
-        // Live provider API lookup with cache
-        let cached = if !force_refresh {
+        let cached = if pref.exact_probe_opt_in && lookup != QuotaLookup::Refresh {
             let guard = self.live_cache.read().await;
             guard
                 .get(adapter_id)
@@ -299,47 +309,54 @@ impl QuotaTracker {
             None
         };
 
-        let outcome = if let Some(hit) = cached {
+        let outcome = if !pref.exact_probe_opt_in {
+            LiveProbeOutcome {
+                status_note: Some("Live API probes are off".into()),
+                ..Default::default()
+            }
+        } else if let Some(hit) = cached {
             hit
+        } else if lookup == QuotaLookup::Cached {
+            LiveProbeOutcome::default()
         } else {
-            let (fresh, ttl_ms) = if !pref.exact_probe_opt_in {
-                (
+            let (fresh, ttl_ms) = match quota_provider {
+                "codex_local" => probe_codex_live(&self.http, now).await,
+                "claude_local" => probe_claude_live(&self.http, now).await,
+                "google_local" => probe_google_live(&self.http, now).await,
+                _ => (
                     LiveProbeOutcome {
-                        plan_label: pref.plan_label.clone(),
-                        status_note: Some("Live API probe paused".into()),
-                        source: Some(QuotaSource::Unavailable),
+                        status_note: Some("Custom adapter (no quota API)".into()),
                         ..Default::default()
                     },
                     LIVE_QUOTA_CACHE_TTL_MS,
-                )
-            } else {
-                match quota_provider {
-                    "codex_local" => probe_codex_live(&self.http, now).await,
-                    "claude_local" => probe_claude_live(&self.http, now).await,
-                    "google_local" => probe_google_live(&self.http, now).await,
-                    _ => (
-                        LiveProbeOutcome {
-                            status_note: Some("Custom adapter (no quota API)".into()),
-                            source: Some(QuotaSource::Unavailable),
-                            ..Default::default()
-                        },
-                        LIVE_QUOTA_CACHE_TTL_MS,
-                    ),
-                }
+                ),
             };
-            self.live_cache.write().await.insert(
-                adapter_id.to_string(),
-                CachedLiveQuota {
-                    fetched_at_ms: now,
-                    ttl_ms,
-                    outcome: fresh.clone(),
-                },
-            );
+            {
+                let current_prefs = self.prefs.read().await;
+                if current_prefs
+                    .get(adapter_id)
+                    .map_or(pref == AdapterQuotaPrefs::default(), |current| {
+                        *current == pref
+                    })
+                {
+                    self.live_cache.write().await.insert(
+                        adapter_id.to_string(),
+                        CachedLiveQuota {
+                            fetched_at_ms: now,
+                            ttl_ms,
+                            outcome: fresh.clone(),
+                        },
+                    );
+                }
+            }
             fresh
         };
 
         // If user entered manual calibration percentages and live API isn't returning percentages, honor them
-        if outcome.source != Some(QuotaSource::LiveProbe) && pref.manual_5h_pct.is_some() {
+        if outcome.source != Some(QuotaSource::LiveProbe)
+            && outcome.rate_limited_until.is_none_or(|until| until <= now)
+            && (pref.manual_5h_pct.is_some() || pref.manual_weekly_pct.is_some())
+        {
             return self
                 .manual_snapshot(adapter_id, &pref, mh_5h_tokens, mh_7d_tokens, now)
                 .await;
@@ -373,11 +390,13 @@ impl QuotaTracker {
         now: i64,
     ) -> QuotaSnapshot {
         let (budget_5h, budget_7d) = plan_token_budgets(pref.plan_label.as_deref());
-        let (w5, ww, source) = if let Some(manual5) = pref.manual_5h_pct {
-            let decay = ((mh_5h_tokens as f32 / budget_5h as f32) * 100.0).min(manual5);
-            let w5_val = (manual5 - decay).clamp(0.0, 100.0);
+        let (w5, ww, source) = if pref.manual_5h_pct.is_some() || pref.manual_weekly_pct.is_some() {
+            let used_5h_pct = (mh_5h_tokens as f32 / budget_5h as f32) * 100.0;
+            let w5_val = pref
+                .manual_5h_pct
+                .map(|m| (m - used_5h_pct).clamp(0.0, 100.0));
             let ww_val = pref.manual_weekly_pct.map(|m| m.clamp(0.0, 100.0));
-            (Some(w5_val), ww_val, QuotaSource::UserCalibrated)
+            (w5_val, ww_val, QuotaSource::UserCalibrated)
         } else {
             let used_5h_pct = ((mh_5h_tokens as f32 / budget_5h as f32) * 100.0).min(100.0);
             let used_7d_pct = ((mh_7d_tokens as f32 / budget_7d as f32) * 100.0).min(100.0);
@@ -394,7 +413,7 @@ impl QuotaTracker {
                 id: "5h".into(),
                 label: "5h Window".into(),
                 remaining_pct: p5,
-                resets_at: Some(now + 5 * 3600 * 1000),
+                resets_at: None,
                 window_mins: Some(300),
             });
         }
@@ -403,7 +422,7 @@ impl QuotaTracker {
                 id: "7d".into(),
                 label: "Weekly".into(),
                 remaining_pct: pw,
-                resets_at: Some(now + 7 * 24 * 3600 * 1000),
+                resets_at: None,
                 window_mins: Some(10080),
             });
         }
@@ -412,9 +431,9 @@ impl QuotaTracker {
             adapter_id: adapter_id.to_string(),
             plan_label: pref.plan_label.clone(),
             window_5h_remaining_pct: w5,
-            window_5h_resets_at: Some(now + 5 * 3600 * 1000),
+            window_5h_resets_at: None,
             weekly_remaining_pct: ww,
-            weekly_resets_at: Some(now + 7 * 24 * 3600 * 1000),
+            weekly_resets_at: None,
             local_5h_tokens_est: mh_5h_tokens,
             rate_limited_until: None,
             exact_probe_opt_in: pref.exact_probe_opt_in,
@@ -1059,132 +1078,65 @@ pub fn probe_installed_adapters(config: &AppConfig) -> Vec<AdapterProbeStatus> {
     let mut results = Vec::new();
 
     for (id, cfg) in &config.adapters {
-        let (installed, resolved, auth_detected, auth_hint) = match cfg.quota_provider.as_str() {
+        let (auth_detected, auth_hint) = match cfg.quota_provider.as_str() {
             "codex_local" => {
                 let codex_dir = std::env::var_os("CODEX_HOME")
                     .map(PathBuf::from)
                     .or_else(|| home.as_ref().map(|h| h.join(".codex")));
                 let has_oauth = codex_dir
                     .as_ref()
-                    .is_some_and(|d| d.join("auth.json").exists());
+                    .is_some_and(|d| d.join("auth.json").is_file());
                 let has_key = std::env::var_os("OPENAI_API_KEY").is_some_and(|v| !v.is_empty());
-                let auth_ok = has_oauth || has_key;
-
-                let bin = if cfg.command != "npx" && !cfg.command.is_empty() {
-                    find_cli_binary(&cfg.command)
-                } else {
-                    find_cli_binary("codex")
-                };
-                let (inst, res) = match bin {
-                    Some(p) => (true, Some(p.to_string_lossy().into_owned())),
-                    None if auth_ok => {
-                        if let Some(npx) = probe_executable("npx") {
-                            (true, Some(format!("{} (codex-acp)", npx.to_string_lossy())))
-                        } else {
-                            (false, None)
-                        }
-                    }
-                    None => (false, None),
-                };
-
-                let hint = if has_oauth {
-                    "Codex credentials detected (~/.codex/auth.json)".into()
-                } else if has_key {
-                    "OPENAI_API_KEY environment variable detected".into()
-                } else {
-                    "Install Codex CLI and run `codex login`".into()
-                };
-                (inst, res, auth_ok, hint)
+                (
+                    has_oauth || has_key,
+                    if has_oauth || has_key {
+                        "Codex credentials detected"
+                    } else {
+                        "Sign in with Codex CLI"
+                    },
+                )
             }
             "claude_local" => {
-                let claude_dir = std::env::var_os("CLAUDE_CONFIG_DIR")
+                let dir = std::env::var_os("CLAUDE_CONFIG_DIR")
                     .map(PathBuf::from)
                     .or_else(|| home.as_ref().map(|h| h.join(".claude")));
-                let has_creds = claude_dir
+                let has_creds = dir
                     .as_ref()
-                    .is_some_and(|d| d.join(".credentials.json").exists());
+                    .is_some_and(|d| d.join(".credentials.json").is_file());
                 let has_key = std::env::var_os("ANTHROPIC_API_KEY").is_some_and(|v| !v.is_empty());
-                let auth_ok = has_creds || has_key;
-
-                let bin = if cfg.command != "npx" && !cfg.command.is_empty() {
-                    find_cli_binary(&cfg.command)
-                } else {
-                    find_cli_binary("claude")
-                };
-                let (inst, res) = match bin {
-                    Some(p) => (true, Some(p.to_string_lossy().into_owned())),
-                    None if auth_ok => {
-                        if let Some(npx) = probe_executable("npx") {
-                            (
-                                true,
-                                Some(format!("{} (claude-agent-acp)", npx.to_string_lossy())),
-                            )
-                        } else {
-                            (false, None)
-                        }
-                    }
-                    None => (false, None),
-                };
-
-                let hint = if has_creds {
-                    "Claude credentials detected (~/.claude/.credentials.json)".into()
-                } else if has_key {
-                    "ANTHROPIC_API_KEY environment variable detected".into()
-                } else {
-                    "Install Claude Code CLI and run `claude login`".into()
-                };
-                (inst, res, auth_ok, hint)
+                (
+                    has_creds || has_key,
+                    if has_creds || has_key {
+                        "Claude credentials detected"
+                    } else {
+                        "Sign in with Claude Code"
+                    },
+                )
             }
             "google_local" => {
-                let mut res = if !cfg.command.is_empty() {
-                    find_cli_binary(&cfg.command).map(|p| p.to_string_lossy().into_owned())
-                } else {
-                    None
-                };
-                if res.is_none() {
-                    for fb in &cfg.fallback_commands {
-                        if let Some(p) = find_cli_binary(&fb.command) {
-                            res = Some(p.to_string_lossy().into_owned());
-                            break;
-                        }
-                    }
-                }
-                let has_gem_auth = has_google_cli_auth();
-                let has_key = std::env::var_os("GEMINI_API_KEY").is_some_and(|v| !v.is_empty())
+                let auth_ok = has_google_cli_auth()
+                    || std::env::var_os("GEMINI_API_KEY").is_some_and(|v| !v.is_empty())
                     || std::env::var_os("GOOGLE_API_KEY").is_some_and(|v| !v.is_empty());
-                let auth_ok = has_gem_auth || has_key;
-                let hint = if has_gem_auth {
-                    "Google/Gemini credentials detected (~/.gemini)".into()
-                } else if has_key {
-                    "Gemini API key environment variable detected".into()
-                } else {
-                    "Install `agy` or `gemini` CLI and sign in".into()
-                };
-                (res.is_some(), res, auth_ok, hint)
+                (
+                    auth_ok,
+                    if auth_ok {
+                        "Google/Gemini credentials detected"
+                    } else {
+                        "Sign in with Antigravity or Gemini CLI"
+                    },
+                )
             }
-            _ => {
-                let mut res = if !cfg.command.is_empty() {
-                    find_cli_binary(&cfg.command).map(|p| p.to_string_lossy().into_owned())
-                } else {
-                    None
-                };
-                if res.is_none() {
-                    for fb in &cfg.fallback_commands {
-                        if let Some(p) = find_cli_binary(&fb.command) {
-                            res = Some(p.to_string_lossy().into_owned());
-                            break;
-                        }
-                    }
-                }
-                (res.is_some(), res, true, "Custom ACP adapter".into())
-            }
+            _ => (true, "Custom ACP adapter"),
         };
-
+        let (resolved, auth_hint) = match resolve_adapter_command(cfg) {
+            Ok((command, _)) => (Some(command), auth_hint.into()),
+            Err(error) => (None, error.to_string()),
+        };
         results.push(AdapterProbeStatus {
             adapter_id: id.clone(),
             display_name: cfg.display_name.clone(),
             accent_color: cfg.accent_color.clone(),
-            installed,
+            installed: resolved.is_some(),
             resolved_command: resolved,
             auth_detected,
             auth_hint,
@@ -1251,5 +1203,33 @@ mod tests {
         assert_eq!(snap.source, QuotaSource::LocalLogEstimate);
         assert_eq!(snap.window_5h_remaining_pct, Some(100.0));
         assert_eq!(snap.windows.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn saved_opt_out_ignores_cached_live_data_and_keeps_weekly_calibration() {
+        let tracker = QuotaTracker::new();
+        let adapter = "codex";
+        tracker
+            .configure_adapter(adapter, None, false, None, Some(64.0))
+            .await;
+        tracker.live_cache.write().await.insert(
+            adapter.into(),
+            CachedLiveQuota {
+                fetched_at_ms: chrono::Utc::now().timestamp_millis(),
+                ttl_ms: LIVE_QUOTA_CACHE_TTL_MS,
+                outcome: LiveProbeOutcome {
+                    source: Some(QuotaSource::LiveProbe),
+                    window_5h_remaining_pct: Some(90.0),
+                    ..Default::default()
+                },
+            },
+        );
+
+        let snapshot = tracker.snapshot(adapter, "codex_local").await;
+        assert!(!snapshot.exact_probe_opt_in);
+        assert_eq!(snapshot.source, QuotaSource::UserCalibrated);
+        assert_eq!(snapshot.window_5h_remaining_pct, None);
+        assert_eq!(snapshot.weekly_remaining_pct, Some(64.0));
+        assert_eq!(snapshot.weekly_resets_at, None);
     }
 }

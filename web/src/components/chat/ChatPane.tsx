@@ -9,6 +9,7 @@ import {
   History,
   Layers,
   Loader2,
+  MessageSquare,
   MessageSquarePlus,
   PanelLeftOpen,
   RefreshCw,
@@ -20,11 +21,12 @@ import type { ChatMessage } from "../../types/api";
 import {
   HarnessAvatar,
   QuotaSnapshotSummary,
-  ThemeSwitcher,
 } from "../common/Badges";
 import { SessionChangesBar } from "../gitbar/SessionChangesBar";
 import { Composer } from "./Composer";
 import { MessageRow } from "./MessageRow";
+
+const NO_CONSULT_REPLIES: ChatMessage[] = [];
 
 export function ChatPane() {
   const {
@@ -50,10 +52,17 @@ export function ChatPane() {
     quotas,
     quotasRefreshing,
     refreshQuotasLive,
+    setSettingsOpen,
+    memberStatuses,
   } = useAppStore();
 
   const parentRef = useRef<HTMLDivElement | null>(null);
+  const followTail = useRef(true);
   const activeProject = projects.find((p) => p.id === activeProjectId) ?? null;
+  const activeOrchestrator = useAppStore((state) => state.members.find((member) =>
+    member.handle === state.activeSession?.orchestrator_member));
+  const orchestratorAvailable = probes.some((probe) => probe.installed && probe.adapter_id === activeOrchestrator?.adapter_id);
+  const startingMembers = Object.entries(memberStatuses).filter(([, member]) => member.status === "spawning");
 
   const { visibleMessages, repliesByParent } = useMemo(() => {
     const replies = new Map<string, ChatMessage[]>();
@@ -72,28 +81,36 @@ export function ChatPane() {
 
   const virtualizer = useVirtualizer({
     count: visibleMessages.length,
+    getItemKey: (index) => visibleMessages[index].id,
     getScrollElement: () => parentRef.current,
     estimateSize: () => 118,
     overscan: 8,
   });
 
   useEffect(() => {
-    if (visibleMessages.length > 0) {
+    followTail.current = true;
+  }, [activeSession?.id]);
+
+  useEffect(() => {
+    if (followTail.current && visibleMessages.length > 0) {
       virtualizer.scrollToIndex(visibleMessages.length - 1, { align: "end" });
     }
-  }, [visibleMessages.length, virtualizer]);
+  }, [visibleMessages.length, visibleMessages.at(-1)?.content, virtualizer]);
 
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
       if (!activeSession || pendingPermissions.length === 0) return;
       const top = pendingPermissions[0];
-      if (e.altKey && e.key.toLowerCase() === "a") {
-        e.preventDefault();
-        void api.resolvePermission(activeSession.id, top.request_id, "allow_once");
-      } else if (e.altKey && e.key.toLowerCase() === "r") {
-        e.preventDefault();
-        void api.resolvePermission(activeSession.id, top.request_id, "reject_once");
-      }
+      const key = e.key.toLowerCase();
+      if (!e.altKey || (key !== "a" && key !== "r")) return;
+      const kind = key === "a" ? "allow_once" : "reject_once";
+      const option = top.options.find((item) => item.kind === kind);
+      if (!option) return;
+      e.preventDefault();
+      void api.resolvePermission(activeSession.id, top.request_id, option.option_id)
+        .catch((error: unknown) => useAppStore.getState().setError(
+          error instanceof Error ? error.message : String(error),
+        ));
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
@@ -102,27 +119,28 @@ export function ChatPane() {
   return (
     <main className="flex-1 flex flex-col min-w-0 bg-app h-full">
       {/* Top Workspace Header */}
-      <header className="px-4 py-2.5 border-b border-line bg-panel/70 backdrop-blur-xs flex items-center justify-between gap-3">
+      <header className="flex min-h-14 items-center justify-between gap-2 border-b border-line bg-panel/70 px-3 sm:px-5">
         <div className="flex items-center gap-2.5 min-w-0">
-          {sidebarCollapsed && (
+          <div className={sidebarCollapsed ? "" : "lg:hidden"}>
             <button
               type="button"
-              title="Expand sidebar (Ctrl+B)"
+              title="Toggle sidebar (Ctrl+B)"
+              aria-label="Toggle sidebar"
               onClick={toggleSidebar}
               className="p-1.5 rounded-lg bg-elevated hover:bg-hover border border-line text-ink-soft hover:text-ink transition-colors"
             >
               <PanelLeftOpen className="w-3.5 h-3.5" />
             </button>
-          )}
+          </div>
           {activeSession ? (
             <div className="flex items-center gap-2.5 min-w-0">
-              <h2 className="text-[13.5px] font-semibold text-ink truncate">
+              <h2 className="truncate text-[15px] font-semibold tracking-tight text-ink">
                 {activeSession.title}
               </h2>
-              {activeSession.orchestrator_member && (
-                <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full bg-warn-soft border border-warn/30 text-[11px] text-warn font-medium shrink-0">
+              {activeOrchestrator && orchestratorAvailable && (
+                <span className="hidden sm:inline-flex items-center gap-1 px-2 py-0.5 rounded-full bg-warn-soft border border-warn/30 text-[11px] text-warn font-medium shrink-0">
                   <Crown className="w-3 h-3" />
-                  <span>@{activeSession.orchestrator_member}</span>
+                  <span>@{activeOrchestrator.handle}</span>
                 </span>
               )}
             </div>
@@ -133,28 +151,21 @@ export function ChatPane() {
           )}
         </div>
 
-        <div className="flex items-center gap-1.5 shrink-0">
-          <ThemeSwitcher />
-
-          {(["trajectory", "memory", "settings"] as const).map((tab) => {
+        <div className="flex shrink-0 items-center gap-1">
+          {(["trajectory", "memory"] as const).map((tab) => {
             const isActive = drawerOpen && drawerTab === tab;
-            const label =
-              tab === "trajectory"
-                ? "Trajectories"
-                : tab === "memory"
-                  ? "Memory"
-                  : "Switch & Quotas";
-            const Icon =
-              tab === "trajectory" ? History : tab === "memory" ? Brain : Settings2;
+            const label = tab === "trajectory" ? "Trajectory" : "Memory";
+            const Icon = tab === "trajectory" ? History : Brain;
             return (
               <button
                 key={tab}
                 type="button"
+                aria-label={label}
                 onClick={() => openDrawerTab(tab)}
-                className={`inline-flex items-center gap-1.5 px-2.5 py-1.5 rounded-lg border text-xs transition-colors ${
+                className={`inline-flex items-center gap-1.5 rounded-lg px-2.5 py-2 text-xs transition-colors ${
                   isActive
-                    ? "bg-brand-soft border-brand/40 text-brand-ink font-medium"
-                    : "bg-elevated hover:bg-hover border-line text-ink-soft hover:text-ink"
+                    ? "bg-brand-soft text-brand-ink font-medium"
+                    : "text-ink-soft hover:bg-hover hover:text-ink"
                 }`}
               >
                 <Icon className="w-3.5 h-3.5" />
@@ -162,6 +173,10 @@ export function ChatPane() {
               </button>
             );
           })}
+          <button type="button" aria-label="Settings" title="Settings" onClick={() => setSettingsOpen(true)}
+            className="ml-1 rounded-lg p-2 text-ink-soft hover:bg-hover hover:text-ink">
+            <Settings2 className="h-4 w-4" />
+          </button>
         </div>
       </header>
 
@@ -318,7 +333,7 @@ export function ChatPane() {
                         </span>
                       </div>
 
-                      {q && <QuotaSnapshotSummary quota={q} />}
+                      {q && p.installed && <QuotaSnapshotSummary quota={q} />}
                     </div>
                   );
                 })}
@@ -328,10 +343,21 @@ export function ChatPane() {
         </div>
       ) : (
         <>
-          <SessionChangesBar />
+          <SessionChangesBar key={activeSession.id} />
 
           {/* Virtualized Developer Thread Stream */}
-          <div ref={parentRef} className="flex-1 overflow-y-auto py-2">
+          <div ref={parentRef} className="min-h-0 flex-1 overflow-y-auto py-3"
+            onScroll={(event) => {
+              const { scrollHeight, scrollTop, clientHeight } = event.currentTarget;
+              followTail.current = scrollHeight - scrollTop - clientHeight < 80;
+            }}>
+            {visibleMessages.length === 0 && (
+              <div className="flex h-full flex-col items-center justify-center gap-2 px-6 text-center">
+                <MessageSquare className="mb-1 h-6 w-6 text-brand-ink" />
+                <h3 className="text-base font-semibold">Start a conversation</h3>
+                <p className="text-sm text-ink-muted">Send a message to the group or use @ to choose a harness.</p>
+              </div>
+            )}
             <div
               style={{
                 height: `${virtualizer.getTotalSize()}px`,
@@ -356,7 +382,7 @@ export function ChatPane() {
                   >
                     <MessageRow
                       message={msg}
-                      consultReplies={repliesByParent.get(msg.id) ?? []}
+                      consultReplies={repliesByParent.get(msg.id) ?? NO_CONSULT_REPLIES}
                     />
                   </div>
                 );
@@ -400,7 +426,13 @@ export function ChatPane() {
             </div>
           )}
 
-          <Composer />
+          {startingMembers.length > 0 && (
+            <div role="status" className="mx-auto flex w-full max-w-[50rem] items-center gap-2 px-5 py-1.5 text-xs text-ink-muted">
+              <Loader2 className="h-3.5 w-3.5 animate-spin text-brand-ink" />
+              Starting {startingMembers.map(([handle]) => `@${handle}`).join(", ")}…
+            </div>
+          )}
+          <Composer key={activeSession.id} />
         </>
       )}
     </main>

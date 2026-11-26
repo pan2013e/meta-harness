@@ -18,13 +18,13 @@ enum TrayEvent {
 }
 
 pub(super) fn run(cli: Cli, runtime: Runtime) -> anyhow::Result<()> {
-    let mut builder = EventLoopBuilder::<TrayEvent>::with_user_event();
+    let mut event_loop = EventLoopBuilder::<TrayEvent>::with_user_event().build();
     #[cfg(target_os = "macos")]
     {
-        use tao::platform::macos::{ActivationPolicy, EventLoopBuilderExtMacOS};
-        builder.set_activation_policy(ActivationPolicy::Accessory);
+        use tao::platform::macos::{ActivationPolicy, EventLoopExtMacOS};
+        event_loop.set_activation_policy(ActivationPolicy::Accessory);
+        event_loop.set_activate_ignoring_other_apps(false);
     }
-    let mut event_loop = builder.build();
     let proxy = event_loop.create_proxy();
     let menu_proxy = proxy.clone();
     MenuEvent::set_event_handler(Some(std::sync::Arc::new(move |event| {

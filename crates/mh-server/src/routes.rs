@@ -1585,6 +1585,8 @@ pub async fn promote_session_handler(
     AxumPath(session_id): AxumPath<String>,
     Json(body): Json<PromoteRequest>,
 ) -> ApiResult<Value> {
+    let runtime = state.switch.runtime(&session_id).await;
+    let _merge = runtime.git_merge_lock.lock().await;
     let sess = state
         .switch
         .store
@@ -1623,21 +1625,35 @@ pub async fn promote_session_handler(
         .map_err(|e| err_resp(StatusCode::BAD_REQUEST, e.to_string()))?;
 
     if let Some(new_sha) = res.new_head_sha.as_deref() {
-        let _ = state.switch.store.update_session_git_state(
-            &session_id,
-            Some(base_br),
-            Some(new_sha),
-            Some(int_br),
-            sess.integration_wt_path.as_deref(),
-            sess.isolation_mode,
-        );
         if let Some(wt) = sess.integration_wt_path.as_deref() {
-            let _ = reset_worktree_to_sha(Path::new(wt), new_sha).await;
+            reset_worktree_to_sha(Path::new(wt), new_sha).await.map_err(|error| {
+                err_resp(StatusCode::CONFLICT, format!(
+                    "Promoted changes to {base_br}, but could not update the session worktree: {error}",
+                ))
+            })?;
         }
+        state
+            .switch
+            .store
+            .update_session_git_state(
+                &session_id,
+                Some(base_br),
+                Some(new_sha),
+                Some(int_br),
+                sess.integration_wt_path.as_deref(),
+                sess.isolation_mode,
+            )
+            .map_err(|error| err_resp(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
         if let Ok(members) = state.switch.store.list_members(&session_id) {
             for m in members {
                 if let Some(p_wt) = m.worktree_path.as_deref() {
-                    let _ = sync_member_worktree(Path::new(p_wt), int_br).await;
+                    let member_lock = {
+                        let mut locks = runtime.member_locks.lock().await;
+                        std::sync::Arc::clone(locks.entry(m.handle).or_default())
+                    };
+                    if let Ok(_idle) = member_lock.try_lock() {
+                        let _ = sync_member_worktree(Path::new(p_wt), int_br).await;
+                    }
                 }
             }
         }

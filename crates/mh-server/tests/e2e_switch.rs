@@ -359,7 +359,11 @@ async fn e2e_parallel_worktrees_consult_cycle_trajectory_orchestrator_and_promot
             .store
             .recall_jobs(&project_id, Some("claude"), 10)
             .unwrap();
-        if dispatched_claude && claude_completed >= 2 && jobs.len() >= 2 {
+        let claude_jobs = jobs
+            .iter()
+            .filter(|job| job.member_handle == "claude")
+            .count();
+        if dispatched_claude && claude_completed >= 2 && claude_jobs >= 2 {
             break;
         }
         assert!(

@@ -1035,8 +1035,8 @@ async fn read_claude_oauth_credentials(profile: Option<&Path>) -> Option<(String
     }
 
     #[cfg(target_os = "macos")]
-    if profile.is_none() {
-        if let Ok(output) = tokio::time::timeout(
+    if profile.is_none()
+        && let Ok(Ok(out)) = tokio::time::timeout(
             Duration::from_secs(2),
             Command::new("security")
                 .args([
@@ -1048,13 +1048,11 @@ async fn read_claude_oauth_credentials(profile: Option<&Path>) -> Option<(String
                 .output(),
         )
         .await
-            && let Ok(out) = output
-            && out.status.success()
-        {
-            let raw = String::from_utf8_lossy(&out.stdout);
-            if let Some(parsed) = extract_claude_oauth_from_json(&raw) {
-                return Some(parsed);
-            }
+        && out.status.success()
+    {
+        let raw = String::from_utf8_lossy(&out.stdout);
+        if let Some(parsed) = extract_claude_oauth_from_json(&raw) {
+            return Some(parsed);
         }
     }
 

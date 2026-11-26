@@ -284,12 +284,12 @@ pub fn open_url_in_browser(url: &str) -> Result<(), AcpError> {
     #[cfg(target_os = "macos")]
     {
         std::process::Command::new("open").arg(url).spawn()?;
-        return Ok(());
+        Ok(())
     }
     #[cfg(all(unix, not(target_os = "macos")))]
     {
         std::process::Command::new("xdg-open").arg(url).spawn()?;
-        return Ok(());
+        Ok(())
     }
 }
 
@@ -317,7 +317,7 @@ pub fn open_terminal_in_dir(dir: &Path) -> Result<(), AcpError> {
             .args(["-a", "Terminal"])
             .arg(dir_clean)
             .spawn()?;
-        return Ok(());
+        Ok(())
     }
     #[cfg(all(unix, not(target_os = "macos")))]
     {

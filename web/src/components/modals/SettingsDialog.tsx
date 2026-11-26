@@ -21,6 +21,8 @@ import { HarnessAvatar, QuotaSnapshotSummary, THEMES } from "../common/Badges";
 import { HarnessMaintenance } from "./HarnessMaintenance";
 import { SharedAntigravityUsage } from "./SharedAntigravityUsage";
 import { PersonaModelFields, type PersonaModel } from "./PersonaModelFields";
+import { GlobalPersonas } from "./GlobalPersonas";
+import { SettingsBackup } from "./SettingsBackup";
 
 function formatBytes(bytes: number): string {
   if (!Number.isFinite(bytes) || bytes <= 0) return "0 B";
@@ -59,7 +61,7 @@ const PERMISSION_OPTIONS: Array<{
 export function SettingsDialog({ onClose }: { onClose: () => void }) {
   const dialog = useRef<HTMLDialogElement>(null);
   const [section, setSection] = useState<
-    "harnesses" | "session" | "storage" | "appearance"
+    "harnesses" | "session" | "personas" | "storage" | "appearance"
   >("harnesses");
   const [saving, setSaving] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -82,6 +84,7 @@ export function SettingsDialog({ onClose }: { onClose: () => void }) {
     quotas,
     adapterCatalogs,
     adapterDefaults,
+    savedProfiles,
     quotasRefreshing,
     refreshQuotasLive,
     updateAdapterDefaults,
@@ -247,6 +250,7 @@ export function SettingsDialog({ onClose }: { onClose: () => void }) {
               [
                 ["harnesses", "Harnesses & Models", Terminal],
                 ["session", "Session & Personas", Sliders],
+                ["personas", "Global Personas", UserPlus],
                 ["storage", "Storage & Data", HardDrive],
                 ["appearance", "Appearance", Palette],
               ] as const
@@ -280,6 +284,7 @@ export function SettingsDialog({ onClose }: { onClose: () => void }) {
 
             {section === "storage" && (
               <div className="space-y-4 text-xs">
+                <SettingsBackup />
                 <div className="flex items-center justify-between gap-2">
                   <h2 className="text-[11px] uppercase tracking-wider font-semibold text-ink-muted">
                     Disk Usage &amp; Cleanup
@@ -540,6 +545,7 @@ export function SettingsDialog({ onClose }: { onClose: () => void }) {
                         <HarnessMaintenance
                           adapterId={probe.adapter_id}
                           profile={adapter?.profile_dir}
+                          hasSavedProfile={savedProfiles.includes(probe.adapter_id)}
                           offersDeviceCode={adapter?.quota_provider === "codex_local"}
                           offersSignIn={["codex_local", "claude_local"].includes(adapter?.quota_provider ?? "") || isAntigravityCli}
                         />
@@ -670,6 +676,8 @@ export function SettingsDialog({ onClose }: { onClose: () => void }) {
                 )}
               </div>
             )}
+
+            {section === "personas" && <GlobalPersonas />}
 
             {section === "session" && (
               <div className="space-y-5 text-xs">

@@ -352,6 +352,8 @@ CREATE TABLE project_facts (
 ### 7.2 REST & Multiplexed WebSocket API
 - **Projects & Git Onboarding**: `GET/POST/DELETE /api/projects`, `POST /api/projects/:id/git-init`, `GET /api/fs/list`, `POST /api/fs/pick-folder` (localhost native OS folder chooser on Windows/macOS/Linux).
 - **Sessions & Personas**: `GET/POST /api/projects/:id/sessions`, `GET/PATCH/DELETE /api/sessions/:id`, `POST/PATCH/DELETE /api/sessions/:id/members` (add/configure `@codex-reviewer` personas, assign Orchestrator).
+- **Global personas** are returned with `GET /api/adapters`. Save or delete them with `POST /api/personas` or `DELETE /api/personas/:handle`. Default session creation copies templates for available adapters. `POST /api/sessions/:id/personas/:handle` copies a template into an existing session.
+- **Settings and profiles**: `GET/POST /api/settings` exports and merges portable preference records. `PATCH /api/adapters/:id/profile` selects the default CLI sign-in or the saved web-managed profile.
 - **Session Git Integration & Promotion**:
   - `GET /api/sessions/:id/diff` — Cumulative diff of `integration_branch` vs `base_branch` + per-member unmerged status.
   - `POST /api/sessions/:id/preview-terminal` — Spawns/attaches a test command or opens a shell rooted in `_integration`.
@@ -371,7 +373,7 @@ Supports four selectable themes (`Obsidian Studio`, `Tokyo Night`, `Catppuccin M
    - **Top Session Changes Bar**: Shows `mh/<sid>/integration` ahead of `main` (`+142 / -31 · 5 files`), **[Diff]** (`DiffViewer` per-file +/- view), **[Preview / Shell]**, and **[Promote ▾]** (`Fast-Forward / Merge`, `Squash Merge`, `Apply Uncommitted Patch`).
    - **Developer Thread Group Chat Stream**:
      - Right-aligned user bubbles and left-aligned harness replies with rich Markdown rendering, **Orchestrator Dispatch Cards**, **Collapsible `peer_consult` Threads**, **Trajectory Read Pills**, **Git Clean-Merge / Conflict Notices**, and **Worktree-Smart Permission Cards**.
-   - **Keyboard-navigable composer** with an auto-resizing input, autocomplete for `@member` with live quota badges, `@all`, `@orchestrator`, and slash commands such as `/plan`. The model and effort menu follows the orchestrator or the single mentioned member. Group messages use each member's settings.
+   - **Keyboard-navigable composer** with an auto-resizing input, autocomplete for `@member` with live quota badges, `@all`, `@orchestrator`, and slash commands such as `/plan`. The model and effort menu follows the recipient and shows one tab per member for group messages. The message request carries independent `recipient_overrides` by handle.
 3. **Right Inspector Drawer**:
    - **Trajectory**: Thoughts and plans, plus collapsible tool calls with status, terminal output, and file diffs. Codex terminal chunks attach to their parent call, so the tool count reflects distinct calls.
    - **Memory Ledger**: Orchestrator-curated job history & pinned architectural/affinity facts.

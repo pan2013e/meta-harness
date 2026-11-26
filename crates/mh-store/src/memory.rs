@@ -1,6 +1,7 @@
 use std::collections::HashSet;
 
-use rusqlite::{OptionalExtension, params};
+use rusqlite::{Connection, OptionalExtension, params};
+use serde::{Deserialize, Serialize};
 
 use mh_core::{AdapterModelPref, EpisodicJob, ProjectFact};
 
@@ -23,14 +24,13 @@ pub struct RecordEpisodicJobParams {
     pub pinned: bool,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AdapterQuotaPref {
     pub adapter_id: String,
     pub plan_label: Option<String>,
     pub exact_probe_opt_in: bool,
     pub manual_5h_pct: Option<f32>,
     pub manual_weekly_pct: Option<f32>,
-    pub updated_at: i64,
 }
 
 impl Store {
@@ -249,78 +249,33 @@ impl Store {
         manual_5h_pct: Option<f32>,
         manual_weekly_pct: Option<f32>,
     ) -> Result<AdapterQuotaPref, StoreError> {
-        let now = now_millis();
-        let conn = self.conn()?;
-        conn.execute(
-            "INSERT INTO adapter_quota_prefs (
-                adapter_id, plan_label, exact_probe_opt_in, manual_5h_pct, manual_weekly_pct, updated_at
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)
-             ON CONFLICT(adapter_id) DO UPDATE SET
-                plan_label = excluded.plan_label,
-                exact_probe_opt_in = excluded.exact_probe_opt_in,
-                manual_5h_pct = excluded.manual_5h_pct,
-                manual_weekly_pct = excluded.manual_weekly_pct,
-                updated_at = excluded.updated_at",
-            params![
-                adapter_id,
-                plan_label,
-                i32::from(exact_probe_opt_in),
-                manual_5h_pct,
-                manual_weekly_pct,
-                now,
-            ],
-        )?;
-        Ok(AdapterQuotaPref {
-            adapter_id: adapter_id.to_string(),
+        let pref = AdapterQuotaPref {
+            adapter_id: adapter_id.into(),
             plan_label: plan_label.map(str::to_string),
             exact_probe_opt_in,
             manual_5h_pct,
             manual_weekly_pct,
-            updated_at: now,
-        })
+        };
+        let conn = self.conn()?;
+        write_quota_pref(&conn, &pref)?;
+        Ok(pref)
     }
 
     pub fn get_adapter_quota_pref(
         &self,
         adapter_id: &str,
     ) -> Result<Option<AdapterQuotaPref>, StoreError> {
-        let conn = self.conn()?;
-        conn.query_row(
-            "SELECT adapter_id, plan_label, exact_probe_opt_in, manual_5h_pct, manual_weekly_pct, updated_at
+        self.conn()?.query_row(
+            "SELECT adapter_id, plan_label, exact_probe_opt_in, manual_5h_pct, manual_weekly_pct
              FROM adapter_quota_prefs WHERE adapter_id = ?1",
             params![adapter_id],
-            |row| {
-                Ok(AdapterQuotaPref {
-                    adapter_id: row.get(0)?,
-                    plan_label: row.get(1)?,
-                    exact_probe_opt_in: row.get::<_, i32>(2)? != 0,
-                    manual_5h_pct: row.get(3)?,
-                    manual_weekly_pct: row.get(4)?,
-                    updated_at: row.get(5)?,
-                })
-            },
-        )
-        .optional()
-        .map_err(Into::into)
+            query_quota_pref,
+        ).optional().map_err(Into::into)
     }
 
     pub fn list_adapter_quota_prefs(&self) -> Result<Vec<AdapterQuotaPref>, StoreError> {
         let conn = self.conn()?;
-        let mut stmt = conn.prepare(
-            "SELECT adapter_id, plan_label, exact_probe_opt_in, manual_5h_pct, manual_weekly_pct, updated_at
-             FROM adapter_quota_prefs",
-        )?;
-        let rows = stmt.query_map([], |row| {
-            Ok(AdapterQuotaPref {
-                adapter_id: row.get(0)?,
-                plan_label: row.get(1)?,
-                exact_probe_opt_in: row.get::<_, i32>(2)? != 0,
-                manual_5h_pct: row.get(3)?,
-                manual_weekly_pct: row.get(4)?,
-                updated_at: row.get(5)?,
-            })
-        })?;
-        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+        list_quota_prefs(&conn)
     }
 
     pub fn upsert_adapter_model_pref(
@@ -329,30 +284,20 @@ impl Store {
         default_model: Option<&str>,
         default_effort: Option<&str>,
     ) -> Result<AdapterModelPref, StoreError> {
-        let now = now_millis();
-        let m = default_model
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
-            .map(str::to_string);
-        let e = default_effort
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
-            .map(str::to_string);
+        let clean = |value: Option<&str>| {
+            value
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_string)
+        };
+        let pref = AdapterModelPref {
+            adapter_id: adapter_id.into(),
+            default_model: clean(default_model),
+            default_effort: clean(default_effort),
+        };
         let conn = self.conn()?;
-        conn.execute(
-            "INSERT INTO adapter_model_prefs (adapter_id, default_model, default_effort, updated_at)
-             VALUES (?1, ?2, ?3, ?4)
-             ON CONFLICT(adapter_id) DO UPDATE SET
-                default_model = excluded.default_model,
-                default_effort = excluded.default_effort,
-                updated_at = excluded.updated_at",
-            params![adapter_id, m, e, now],
-        )?;
-        Ok(AdapterModelPref {
-            adapter_id: adapter_id.to_string(),
-            default_model: m,
-            default_effort: e,
-        })
+        write_model_pref(&conn, &pref)?;
+        Ok(pref)
     }
 
     pub fn get_adapter_model_pref(
@@ -378,17 +323,88 @@ impl Store {
 
     pub fn list_adapter_model_prefs(&self) -> Result<Vec<AdapterModelPref>, StoreError> {
         let conn = self.conn()?;
-        let mut stmt = conn
-            .prepare("SELECT adapter_id, default_model, default_effort FROM adapter_model_prefs")?;
-        let rows = stmt.query_map([], |row| {
-            Ok(AdapterModelPref {
-                adapter_id: row.get(0)?,
-                default_model: row.get(1)?,
-                default_effort: row.get(2)?,
-            })
-        })?;
-        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+        list_model_prefs(&conn)
     }
+}
+
+fn query_quota_pref(row: &rusqlite::Row<'_>) -> rusqlite::Result<AdapterQuotaPref> {
+    Ok(AdapterQuotaPref {
+        adapter_id: row.get(0)?,
+        plan_label: row.get(1)?,
+        exact_probe_opt_in: row.get(2)?,
+        manual_5h_pct: row.get(3)?,
+        manual_weekly_pct: row.get(4)?,
+    })
+}
+
+pub(crate) fn list_quota_prefs(conn: &Connection) -> Result<Vec<AdapterQuotaPref>, StoreError> {
+    let mut stmt = conn.prepare(
+        "SELECT adapter_id, plan_label, exact_probe_opt_in, manual_5h_pct, manual_weekly_pct
+         FROM adapter_quota_prefs ORDER BY adapter_id",
+    )?;
+    let rows = stmt.query_map([], query_quota_pref)?;
+    rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+}
+
+pub(crate) fn write_quota_pref(
+    conn: &Connection,
+    pref: &AdapterQuotaPref,
+) -> Result<(), StoreError> {
+    conn.execute(
+        "INSERT INTO adapter_quota_prefs (
+            adapter_id, plan_label, exact_probe_opt_in, manual_5h_pct, manual_weekly_pct, updated_at
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+         ON CONFLICT(adapter_id) DO UPDATE SET
+            plan_label = excluded.plan_label,
+            exact_probe_opt_in = excluded.exact_probe_opt_in,
+            manual_5h_pct = excluded.manual_5h_pct,
+            manual_weekly_pct = excluded.manual_weekly_pct,
+            updated_at = excluded.updated_at",
+        params![
+            pref.adapter_id,
+            pref.plan_label,
+            pref.exact_probe_opt_in,
+            pref.manual_5h_pct,
+            pref.manual_weekly_pct,
+            now_millis()
+        ],
+    )?;
+    Ok(())
+}
+
+pub(crate) fn list_model_prefs(conn: &Connection) -> Result<Vec<AdapterModelPref>, StoreError> {
+    let mut stmt = conn.prepare(
+        "SELECT adapter_id, default_model, default_effort FROM adapter_model_prefs ORDER BY adapter_id",
+    )?;
+    let rows = stmt.query_map([], |row| {
+        Ok(AdapterModelPref {
+            adapter_id: row.get(0)?,
+            default_model: row.get(1)?,
+            default_effort: row.get(2)?,
+        })
+    })?;
+    rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+}
+
+pub(crate) fn write_model_pref(
+    conn: &Connection,
+    pref: &AdapterModelPref,
+) -> Result<(), StoreError> {
+    conn.execute(
+        "INSERT INTO adapter_model_prefs (adapter_id, default_model, default_effort, updated_at)
+         VALUES (?1, ?2, ?3, ?4)
+         ON CONFLICT(adapter_id) DO UPDATE SET
+            default_model = excluded.default_model,
+            default_effort = excluded.default_effort,
+            updated_at = excluded.updated_at",
+        params![
+            pref.adapter_id,
+            pref.default_model,
+            pref.default_effort,
+            now_millis()
+        ],
+    )?;
+    Ok(())
 }
 
 fn map_job_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<EpisodicJob> {

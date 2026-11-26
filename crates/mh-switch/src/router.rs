@@ -19,7 +19,7 @@ use mh_core::{
     AppConfig, AppPaths, ChatMessage, DiffStat, DiscoveredConfigOption, DispatchTaskSpec,
     IsolationMode, MemberContextBreakdown, MemberRole, MemberStatus, MessageKind,
     PendingPermissionView, SenderKind, Session, SessionContextReport, SessionMember,
-    TrajectoryEventKind, TurnStatus, WaitForGraph, WsEvent, parse_mentions,
+    TrajectoryEventKind, TurnModelSelection, TurnStatus, WaitForGraph, WsEvent, parse_mentions,
 };
 use mh_store::{
     NewMessageParams, PatchSessionParams, RecordEpisodicJobParams, StartTrajectoryParams, Store,
@@ -250,16 +250,21 @@ impl SwitchEngine {
         session_id: &str,
         content: String,
     ) -> Result<ChatMessage, SwitchError> {
-        self.handle_user_message_with_overrides(session_id, content, None, None)
-            .await
+        self.handle_user_message_with_overrides(
+            session_id,
+            content,
+            TurnModelSelection::default(),
+            HashMap::new(),
+        )
+        .await
     }
 
     pub async fn handle_user_message_with_overrides(
         self: &Arc<Self>,
         session_id: &str,
         content: String,
-        model_override: Option<String>,
-        effort_override: Option<String>,
+        defaults: TurnModelSelection,
+        recipient_overrides: HashMap<String, TurnModelSelection>,
     ) -> Result<ChatMessage, SwitchError> {
         let session = self.store.get_session(session_id)?;
         if session.archived_at.is_some() {
@@ -274,16 +279,21 @@ impl SwitchEngine {
             ));
         }
 
-        let clean_model = model_override
-            .as_deref()
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
-            .map(str::to_string);
-        let clean_effort = effort_override
-            .as_deref()
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
-            .map(str::to_string);
+        let clean = |value: Option<&str>| {
+            value
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_string)
+        };
+        let selection = |handle: &str| {
+            let targeted = recipient_overrides.get(handle);
+            TurnModelSelection {
+                model: clean(targeted.and_then(|choice| choice.model.as_deref()))
+                    .or_else(|| clean(defaults.model.as_deref())),
+                effort: clean(targeted.and_then(|choice| choice.effort.as_deref()))
+                    .or_else(|| clean(defaults.effort.as_deref())),
+            }
+        };
 
         let valid_handles: HashSet<String> = members.iter().map(|m| m.handle.clone()).collect();
         let parsed = parse_mentions(&content, &valid_handles);
@@ -377,12 +387,13 @@ impl SwitchEngine {
 
         let tasks: Vec<(DispatchTaskSpec, TurnPurpose)> =
             if parsed.has_orchestrator || parsed.is_unmentioned() {
+                let TurnModelSelection { model, effort } = selection(&recipients[0]);
                 if let Some(orch) = orchestrator {
-                    let brief = if clean_model.is_some() || clean_effort.is_some() {
+                    let brief = if model.is_some() || effort.is_some() {
                         format!(
                             "<user_model_preference model=\"{}\" effort=\"{}\"/>\n{}",
-                            clean_model.as_deref().unwrap_or("default"),
-                            clean_effort.as_deref().unwrap_or("default"),
+                            model.as_deref().unwrap_or("default"),
+                            effort.as_deref().unwrap_or("default"),
                             dispatch_content
                         )
                     } else {
@@ -391,8 +402,8 @@ impl SwitchEngine {
                     vec![(
                         DispatchTaskSpec {
                             target: orch.clone(),
-                            model: clean_model.clone(),
-                            effort: clean_effort.clone(),
+                            model,
+                            effort,
                             task_brief: brief,
                             mode: "parallel".into(),
                         },
@@ -402,8 +413,8 @@ impl SwitchEngine {
                     vec![(
                         DispatchTaskSpec {
                             target: recipients[0].clone(),
-                            model: clean_model.clone(),
-                            effort: clean_effort.clone(),
+                            model,
+                            effort,
                             task_brief: dispatch_content.clone(),
                             mode: "parallel".into(),
                         },
@@ -414,11 +425,12 @@ impl SwitchEngine {
                 recipients
                     .into_iter()
                     .map(|r| {
+                        let TurnModelSelection { model, effort } = selection(&r);
                         (
                             DispatchTaskSpec {
                                 target: r,
-                                model: clean_model.clone(),
-                                effort: clean_effort.clone(),
+                                model,
+                                effort,
                                 task_brief: dispatch_content.clone(),
                                 mode: "parallel".into(),
                             },
@@ -431,11 +443,12 @@ impl SwitchEngine {
                     .targets
                     .into_iter()
                     .map(|t| {
+                        let TurnModelSelection { model, effort } = selection(&t.handle);
                         (
                             DispatchTaskSpec {
                                 target: t.handle,
-                                model: t.model_override.or_else(|| clean_model.clone()),
-                                effort: t.effort_override.or_else(|| clean_effort.clone()),
+                                model: t.model_override.or(model),
+                                effort: t.effort_override.or(effort),
                                 task_brief: dispatch_content.clone(),
                                 mode: "parallel".into(),
                             },
@@ -1057,18 +1070,18 @@ impl SwitchEngine {
             }
             let mut member = self.store.get_member(session_id, &task.target)?;
             let previous_cwd = member.worktree_path.clone();
-            let cfg = self.config.read().await.clone();
-            let adapter_cfg = cfg
-                .adapters
-                .get(&member.adapter_id)
-                .cloned()
-                .ok_or_else(|| SwitchError::NotFound(format!("adapter {}", member.adapter_id)))?;
             let _adapter_use = self
                 .supervisor
                 .adapter_activity(&member.adapter_id)
                 .await
                 .read_owned()
                 .await;
+            let cfg = self.config.read().await.clone();
+            let adapter_cfg = cfg
+                .adapters
+                .get(&member.adapter_id)
+                .cloned()
+                .ok_or_else(|| SwitchError::NotFound(format!("adapter {}", member.adapter_id)))?;
 
             rt.active_member_chain
                 .write()
@@ -2337,14 +2350,19 @@ impl SwitchEngine {
             .and_then(|h| members.iter().find(|m| m.handle == h))
             .or_else(|| members.iter().find(|m| available.contains(&m.handle)));
 
-        let cfg = self.config.read().await.clone();
         let generated = if let Some(target_member) = picker
-            && let Some(adapter_cfg) = cfg.adapters.get(&target_member.adapter_id)
             && let Ok(_activity) = self
                 .supervisor
                 .adapter_activity(&target_member.adapter_id)
                 .await
                 .try_read_owned()
+            && let Some(adapter_cfg) = self
+                .config
+                .read()
+                .await
+                .adapters
+                .get(&target_member.adapter_id)
+                .cloned()
         {
             let cwd = session
                 .integration_wt_path
@@ -2369,7 +2387,7 @@ impl SwitchEngine {
             );
             self.supervisor
                 .run_ephemeral_prompt(
-                    adapter_cfg,
+                    &adapter_cfg,
                     &cwd,
                     Some("low"),
                     &prompt,

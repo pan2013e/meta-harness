@@ -138,6 +138,22 @@ pub struct SessionMember {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GlobalPersona {
+    pub handle: String,
+    pub adapter_id: String,
+    pub display_name: String,
+    pub persona_prompt: String,
+    pub active_model: Option<String>,
+    pub active_effort: Option<String>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+pub struct TurnModelSelection {
+    pub model: Option<String>,
+    pub effort: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PermissionRule {
     pub id: String,
     pub session_id: String,

@@ -690,9 +690,6 @@ describe("UI primitives", () => {
         },
       },
     });
-    const saveMember = vi.spyOn(api, "patchMemberConfig").mockResolvedValue({
-      member: { ...claude, active_model: "sonnet", active_effort: "low" },
-    });
     render(<Composer />);
 
     const trigger = screen.getByRole("button", { name: "Model and reasoning effort" });
@@ -715,21 +712,26 @@ describe("UI primitives", () => {
     expect(slider.getAttribute("aria-valuetext")).toBe("Ultra");
     fireEvent.click(codexMenu.getByRole("button", { name: "Done" }));
 
-    draft("Please ask (@Reviewer) for help");
-    const claudeMenu = openMenu("reviewer");
+    draft("Please ask (@Reviewer) and @codex for help");
+    const multiMenu = openMenu("codex");
+    expect(multiMenu.getByRole("tab", { name: "@codex" }).getAttribute("aria-selected")).toBe("true");
+    fireEvent.click(multiMenu.getByRole("tab", { name: "@reviewer" }));
+    const claudeMenu = within(screen.getByRole("tabpanel", { name: "@reviewer" }));
     expect(claudeMenu.queryByRole("button", { name: "gpt-6-astra" })).toBeNull();
     fireEvent.click(claudeMenu.getByRole("button", { name: "Sonnet" }));
     fireEvent.change(claudeMenu.getByRole("slider"), { target: { value: "1" } });
-    fireEvent.click(claudeMenu.getByRole("button", { name: "Done" }));
-    await waitFor(() => expect(trigger.textContent).toContain("Sonnet"));
-    expect(saveMember).toHaveBeenCalledWith("s_standalone", "reviewer", {
-      active_model: "sonnet", active_effort: "low",
-    });
+    fireEvent.keyDown(multiMenu.getByRole("tab", { name: "@reviewer" }), { key: "ArrowLeft" });
+    expect(multiMenu.getByRole("tab", { name: "@codex" }).getAttribute("aria-selected")).toBe("true");
+    expect(multiMenu.getByRole("slider").getAttribute("aria-valuetext")).toBe("Ultra");
+    fireEvent.click(multiMenu.getByRole("button", { name: "Done" }));
 
-    draft("@reviewer @codex check this");
-    expect((trigger as HTMLButtonElement).disabled).toBe(true);
     fireEvent.click(send);
-    expect(sendMessage).toHaveBeenLastCalledWith("@reviewer @codex check this", undefined);
+    expect(sendMessage).toHaveBeenLastCalledWith("Please ask (@Reviewer) and @codex for help", {
+      recipient_overrides: {
+        codex: { model: "gpt-6-astra", effort: "ultra" },
+        reviewer: { model: "sonnet", effort: "low" },
+      },
+    });
 
     await waitFor(() => expect((send as HTMLButtonElement).disabled).toBe(true));
     draft("@orchestrator ask @reviewer to check this");
@@ -740,7 +742,7 @@ describe("UI primitives", () => {
     fireEvent.click(resetMenu.getByRole("button", { name: "Done" }));
     fireEvent.click(send);
     expect(sendMessage).toHaveBeenLastCalledWith("@orchestrator ask @reviewer to check this", {
-      model: "gpt-5.6-luna", effort: undefined,
+      recipient_overrides: { codex: { model: "gpt-5.6-luna", effort: null } },
     });
 
     await waitFor(() => expect((send as HTMLButtonElement).disabled).toBe(true));

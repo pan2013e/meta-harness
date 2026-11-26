@@ -28,6 +28,7 @@ use tokio::{
 use crate::{AppState, routes::ApiResult};
 
 const PROFILE_MARKER: &str = ".meta-harness-profile";
+const DEFAULT_PROFILE_MARKER: &str = ".use-default-profile";
 const MAX_OUTPUT_CHARS: usize = 8_000;
 
 #[derive(Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
@@ -71,10 +72,113 @@ pub fn restore_profiles(config: &mut AppConfig, data_dir: &Path) {
         if adapter.profile_dir.is_none()
             && let Some(path) = managed_profile(data_dir, id)
             && path.join(PROFILE_MARKER).is_file()
+            && !path.join(DEFAULT_PROFILE_MARKER).is_file()
         {
             adapter.profile_dir = Some(path);
         }
     }
+}
+
+pub(crate) fn has_saved_profile(data_dir: &Path, id: &str, current: Option<&Path>) -> bool {
+    managed_profile(data_dir, id).is_some_and(|path| {
+        current.is_none_or(|current| current == path) && path.join(PROFILE_MARKER).is_file()
+    })
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProfileSelection {
+    Default,
+    Separate,
+}
+
+#[derive(Deserialize)]
+pub struct SelectProfile {
+    profile: ProfileSelection,
+}
+
+pub async fn select_profile(
+    State(state): State<AppState>,
+    AxumPath(id): AxumPath<String>,
+    Json(body): Json<SelectProfile>,
+) -> ApiResult<Value> {
+    let _activity = state
+        .switch
+        .supervisor
+        .adapter_activity(&id)
+        .await
+        .try_write_owned()
+        .map_err(|_| {
+            error(
+                StatusCode::CONFLICT,
+                "Wait for this harness's active turns or maintenance to finish.",
+            )
+        })?;
+    let current = state
+        .switch
+        .config
+        .read()
+        .await
+        .adapters
+        .get(&id)
+        .cloned()
+        .ok_or_else(|| error(StatusCode::NOT_FOUND, "Unknown harness"))?;
+    let data_dir = &state.switch.app_paths.data_dir;
+    let path = managed_profile(data_dir, &id)
+        .filter(|_| has_saved_profile(data_dir, &id, current.profile_dir.as_deref()))
+        .ok_or_else(|| {
+            error(
+                StatusCode::CONFLICT,
+                "No web-managed separate profile is saved for this harness.",
+            )
+        })?;
+    let profile = match body.profile {
+        ProfileSelection::Default => {
+            tokio::fs::write(path.join(DEFAULT_PROFILE_MARKER), b"")
+                .await
+                .map_err(profile_io_error)?;
+            None
+        }
+        ProfileSelection::Separate => {
+            remove_default_marker(&path)
+                .await
+                .map_err(profile_io_error)?;
+            Some(path)
+        }
+    };
+    activate_profile(&state, &id, profile.clone()).await;
+    state.harness_jobs.0.lock().await.remove(&id);
+    Ok(Json(json!({ "profile_dir": profile })))
+}
+
+async fn remove_default_marker(path: &Path) -> std::io::Result<()> {
+    match tokio::fs::remove_file(path.join(DEFAULT_PROFILE_MARKER)).await {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        result => result,
+    }
+}
+
+fn profile_io_error(cause: std::io::Error) -> (StatusCode, Json<Value>) {
+    error(
+        StatusCode::INTERNAL_SERVER_ERROR,
+        format!("Could not save profile selection: {cause}"),
+    )
+}
+
+async fn activate_profile(state: &AppState, id: &str, profile: Option<PathBuf>) {
+    state.switch.supervisor.retire_adapter(id).await;
+    let mut config = state.switch.config.write().await;
+    if let Some(adapter) = config.adapters.get_mut(id) {
+        adapter.profile_dir = profile;
+        state
+            .switch
+            .quota
+            .configure_launch_profile(id, adapter)
+            .await;
+        state.switch.quota.clear_rate_limit(id).await;
+    }
+    state.switch.supervisor.invalidate_catalog(id).await;
+    state.switch.quota.invalidate(id).await;
 }
 
 #[derive(Deserialize)]
@@ -127,15 +231,6 @@ pub async fn start(
     AxumPath(id): AxumPath<String>,
     Json(request): Json<StartOperation>,
 ) -> ApiResult<Value> {
-    let mut adapter = state
-        .switch
-        .config
-        .read()
-        .await
-        .adapters
-        .get(&id)
-        .cloned()
-        .ok_or_else(|| error(StatusCode::NOT_FOUND, "Unknown harness"))?;
     let activity = state
         .switch
         .supervisor
@@ -148,6 +243,15 @@ pub async fn start(
                 "Wait for this harness's active turns or maintenance to finish.",
             )
         })?;
+    let mut adapter = state
+        .switch
+        .config
+        .read()
+        .await
+        .adapters
+        .get(&id)
+        .cloned()
+        .ok_or_else(|| error(StatusCode::NOT_FOUND, "Unknown harness"))?;
     let mut activated = None;
     let command = match request.kind {
         Operation::SignIn => {
@@ -326,18 +430,24 @@ async fn run_operation(
             tokio::fs::write(path.join(PROFILE_MARKER), b"enabled\n")
                 .await
                 .map_err(|cause| cause.to_string())?;
-            let mut config = state.switch.config.write().await;
-            if let Some(adapter) = config.adapters.get_mut(&id) {
-                adapter.profile_dir = Some(path);
-                state
-                    .switch
-                    .quota
-                    .configure_launch_profile(&id, adapter)
-                    .await;
-            }
+            remove_default_marker(&path)
+                .await
+                .map_err(|cause| cause.to_string())?;
+            activate_profile(&state, &id, Some(path)).await;
+        } else if kind == Operation::SignIn {
+            let current = state
+                .switch
+                .config
+                .read()
+                .await
+                .adapters
+                .get(&id)
+                .and_then(|adapter| adapter.profile_dir.clone());
+            activate_profile(&state, &id, current).await;
+        } else {
+            state.switch.supervisor.invalidate_catalog(&id).await;
+            state.switch.quota.invalidate(&id).await;
         }
-        state.switch.supervisor.invalidate_catalog(&id).await;
-        state.switch.quota.invalidate(&id).await;
         Ok(())
     }
     .await;
@@ -530,6 +640,45 @@ mod tests {
                 .profile_dir
                 .as_ref(),
             Some(&profile)
+        );
+        drop(jobs);
+
+        let credentials = profile.join("fixture-auth");
+        std::fs::write(&credentials, b"fixture-credentials").unwrap();
+        let response = select_profile(
+            State(state.clone()),
+            AxumPath(id.clone()),
+            Json(SelectProfile {
+                profile: ProfileSelection::Default,
+            }),
+        )
+        .await
+        .unwrap();
+        assert!(response.0["profile_dir"].is_null());
+        assert!(
+            state.switch.config.read().await.adapters[&id]
+                .profile_dir
+                .is_none()
+        );
+        let mut restarted = AppConfig::default();
+        restore_profiles(&mut restarted, &state.switch.app_paths.data_dir);
+        assert!(restarted.adapters[&id].profile_dir.is_none());
+        assert_eq!(std::fs::read(&credentials).unwrap(), b"fixture-credentials");
+
+        let response = select_profile(
+            State(state.clone()),
+            AxumPath(id.clone()),
+            Json(SelectProfile {
+                profile: ProfileSelection::Separate,
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(response.0["profile_dir"], json!(profile));
+        restore_profiles(&mut restarted, &state.switch.app_paths.data_dir);
+        assert_eq!(
+            restarted.adapters[&id].profile_dir.as_deref(),
+            Some(profile.as_path())
         );
     }
 

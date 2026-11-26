@@ -8,7 +8,9 @@ import type {
   ChatMessage,
   DiscoveredConfigOption,
   EpisodicJob,
+  GlobalPersona,
   MemberStatus,
+  MessageOptions,
   PendingPermissionView,
   PermissionPolicy,
   PermissionRule,
@@ -93,6 +95,8 @@ interface AppState {
   adapters: Record<string, AdapterConfig>;
   adapterCatalogs: Record<string, AdapterModelCatalog>;
   adapterDefaults: Record<string, AdapterModelPref>;
+  globalPersonas: GlobalPersona[];
+  savedProfiles: string[];
   probes: AdapterProbeStatus[];
   quotas: Record<string, QuotaSnapshot>;
 
@@ -184,8 +188,13 @@ interface AppState {
 
   sendMessage: (
     content: string,
-    opts?: { model?: string | null; effort?: string | null }
+    opts?: MessageOptions
   ) => Promise<void>;
+
+  saveGlobalPersona: (persona: GlobalPersona) => Promise<void>;
+  deleteGlobalPersona: (handle: string) => Promise<void>;
+  importSettings: (file: unknown) => Promise<void>;
+  selectHarnessProfile: (id: string, profile: "default" | "separate") => Promise<void>;
   runShellCommand: (sessionId: string, command: string) => Promise<void>;
   clearShellHistory: (sessionId: string) => void;
   stopAll: () => Promise<void>;
@@ -267,6 +276,8 @@ export const useAppStore = create<AppState>((set, get) => {
     adapters: {},
     adapterCatalogs: {},
     adapterDefaults: {},
+    globalPersonas: [],
+    savedProfiles: [],
     probes: [],
     quotas: {},
 
@@ -373,6 +384,8 @@ export const useAppStore = create<AppState>((set, get) => {
           adapters: adaptersRes.adapters,
           adapterCatalogs: adaptersRes.catalogs ?? {},
           adapterDefaults: adaptersRes.defaults ?? {},
+          globalPersonas: adaptersRes.global_personas ?? [],
+          savedProfiles: adaptersRes.saved_profiles ?? [],
           probes: probeRes.probes,
           projects: projRes.projects,
           wsClient: ws,
@@ -679,6 +692,39 @@ export const useAppStore = create<AppState>((set, get) => {
       }));
     },
 
+    saveGlobalPersona: async (input) => {
+      const { persona } = await api.saveGlobalPersona(input);
+      set((state) => ({
+        globalPersonas: [
+          ...state.globalPersonas.filter((item) => item.handle !== persona.handle),
+          persona,
+        ].sort((a, b) => a.handle.localeCompare(b.handle)),
+      }));
+    },
+
+    deleteGlobalPersona: async (handle) => {
+      await api.deleteGlobalPersona(handle);
+      set((state) => ({ globalPersonas: state.globalPersonas.filter((persona) => persona.handle !== handle) }));
+    },
+
+    importSettings: async (file) => {
+      const { preferences, theme } = await api.importSettings(file);
+      set({
+        globalPersonas: preferences.global_personas,
+        adapterDefaults: Object.fromEntries(preferences.adapter_defaults.map((pref) => [pref.adapter_id, pref])),
+      });
+      if (theme) get().setTheme(theme);
+      void get().refreshQuotas();
+    },
+
+    selectHarnessProfile: async (id, profile) => {
+      const { profile_dir } = await api.selectHarnessProfile(id, profile);
+      set((state) => ({
+        adapters: { ...state.adapters, [id]: { ...state.adapters[id], profile_dir } },
+      }));
+      void get().refreshQuotasLive();
+    },
+
     updateMemberConfig: async (handle, payload) => {
       const sid = get().activeSession?.id;
       if (!sid) return;
@@ -821,7 +867,13 @@ export const useAppStore = create<AppState>((set, get) => {
         const map: Record<string, QuotaSnapshot> = {};
         for (const q of quotas) map[q.adapter_id] = q;
         if (request === catalogRequest) {
-          set({ quotas: map, probes, adapters: catalog.adapters, adapterCatalogs: catalog.catalogs ?? get().adapterCatalogs });
+          set({
+            quotas: map,
+            probes,
+            adapters: catalog.adapters,
+            adapterCatalogs: catalog.catalogs ?? get().adapterCatalogs,
+            savedProfiles: catalog.saved_profiles ?? get().savedProfiles,
+          });
         }
       } catch (e) {
         set({ errorBanner: e instanceof Error ? e.message : String(e) });

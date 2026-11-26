@@ -28,6 +28,8 @@ All harnesses run locally over the **Agent Client Protocol (ACP)** using your **
 
 In **Settings → Harnesses**, choose **Create profile & sign in** for Codex, Claude Code, or Antigravity. Follow the provider's sign-in steps shown in Settings. Meta-Harness activates the new directory after sign-in completes and restores it on restart. A preconfigured `profile_dir` takes precedence.
 
+For profiles created in the web app, **Use default CLI profile** returns to the CLI's ordinary sign-in. **Use saved separate profile** switches back using the saved credentials. The selection persists across restarts.
+
 Codex's primary sign-in button opens the provider's browser login on the machine running Meta-Harness. **Use device code** starts the alternative flow, where you enter the code on the provider's page. Separate Antigravity profiles can use **Check shared CLI usage** to view the shared account's quota for reference.
 
 Use **Check CLI version** and **Upgrade CLI** in the same card for supported launchers. Upgrades run the vendor updater or refresh the compatible npm bundle for the default Codex ACP launcher.
@@ -50,6 +52,14 @@ profile_dir = "profiles/antigravity"
 Add these keys to the existing adapter sections in `configs/harnesses.local.toml`, or start with `configs/harnesses.example.toml`. Meta-Harness creates the directories on first launch of each harness and starts a fresh ACP session when the profile changes. Existing chat stays in Meta-Harness, and existing native conversations stay in their original profiles.
 
 For Codex or Claude Code, sign in to the separate directory using the harness CLI with `CODEX_HOME` or `CLAUDE_CONFIG_DIR` pointing to the resolved profile path shown in Settings. For Antigravity, the ACP launcher uses `--gemini-dir <profile> --app-data-dir antigravity-cli`. The OS keyring may still supply the same Google account. When needed, run `agy acp --login` with the same directory flags. Gemini CLI fallback uses `GEMINI_CLI_HOME`.
+
+## Global personas and settings backups
+
+Create reusable personas under **Settings → Global Personas**. New sessions include saved personas whose harnesses are available. Use **Add to session** for an existing session. Each session keeps its own copy of the persona's instructions and defaults.
+
+Mention multiple agents in the composer to get a model and reasoning effort tab for each recipient. Selections in the composer apply to messages from that composer. Set a persona's persistent defaults in Settings.
+
+Use **Settings → Storage & Data → Settings backup** to export or import versioned JSON containing the theme, harness model defaults, quota preferences, and global personas. Import merges records by harness ID or persona handle. Keep machine-specific TOML, sign-in profiles, and session data in their original locations.
 
 ## Repository Map
 

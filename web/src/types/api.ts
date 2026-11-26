@@ -250,6 +250,42 @@ export interface AdapterModelPref {
   default_effort: string | null;
 }
 
+export interface GlobalPersona {
+  handle: string;
+  adapter_id: string;
+  display_name: string;
+  persona_prompt: string;
+  active_model: string | null;
+  active_effort: string | null;
+}
+
+export interface ModelSelection {
+  model: string | null;
+  effort: string | null;
+}
+
+export interface MessageOptions {
+  model?: string | null;
+  effort?: string | null;
+  recipient_overrides?: Record<string, ModelSelection>;
+}
+
+export interface SettingsFile {
+  version: number;
+  preferences: {
+    global_personas: GlobalPersona[];
+    adapter_defaults: AdapterModelPref[];
+    quota_preferences: Array<{
+      adapter_id: string;
+      plan_label: string | null;
+      exact_probe_opt_in: boolean;
+      manual_5h_pct: number | null;
+      manual_weekly_pct: number | null;
+    }>;
+  };
+  theme?: ThemeId;
+}
+
 export interface MemberContextBreakdown {
   handle: string;
   adapter_id: string;

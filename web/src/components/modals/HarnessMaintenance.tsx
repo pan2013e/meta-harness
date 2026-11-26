@@ -20,9 +20,10 @@ function signInLinks(output: string): string[] {
   });
 }
 
-export function HarnessMaintenance({ adapterId, profile, offersSignIn, offersDeviceCode }: {
+export function HarnessMaintenance({ adapterId, profile, hasSavedProfile, offersSignIn, offersDeviceCode }: {
   adapterId: string;
   profile?: string | null;
+  hasSavedProfile: boolean;
   offersSignIn: boolean;
   offersDeviceCode: boolean;
 }) {
@@ -31,6 +32,7 @@ export function HarnessMaintenance({ adapterId, profile, offersSignIn, offersDev
   const [working, setWorking] = useState(false);
   const [code, setCode] = useState("");
   const [error, setError] = useState<string | null>(null);
+  const selectProfile = useAppStore((state) => state.selectHarnessProfile);
   const running = operation?.status === "running";
 
   useEffect(() => {
@@ -106,7 +108,16 @@ export function HarnessMaintenance({ adapterId, profile, offersSignIn, offersDev
         )}
         {(version?.can_sign_in ?? offersSignIn) && (
           <button type="button" className={actionClass} disabled={working || running} onClick={() => void start("sign_in")}>
-            {profile ? "Sign in to profile" : "Create profile & sign in"}
+            {profile || hasSavedProfile ? "Sign in to separate profile" : "Create profile & sign in"}
+          </button>
+        )}
+        {hasSavedProfile && (
+          <button type="button" className={actionClass} disabled={working || running}
+            onClick={() => void run(async () => {
+              await selectProfile(adapterId, profile ? "default" : "separate");
+              setOperation(null);
+            })}>
+            {profile ? "Use default CLI profile" : "Use saved separate profile"}
           </button>
         )}
         {offersDeviceCode && (version?.can_sign_in ?? offersSignIn) && (

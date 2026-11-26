@@ -232,5 +232,16 @@ pub fn apply_migrations(conn: &Connection) -> Result<(), StoreError> {
              PRAGMA foreign_keys = ON;",
         )?;
     }
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS global_personas (
+             handle         TEXT PRIMARY KEY COLLATE NOCASE,
+             adapter_id     TEXT NOT NULL,
+             display_name   TEXT NOT NULL,
+             persona_prompt TEXT NOT NULL,
+             active_model   TEXT,
+             active_effort  TEXT
+         );
+         INSERT OR IGNORE INTO schema_migrations (version) VALUES (4);",
+    )?;
     Ok(())
 }

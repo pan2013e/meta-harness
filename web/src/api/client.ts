@@ -7,11 +7,13 @@ import type {
   DiscoveredConfigOption,
   EpisodicJob,
   FsEntry,
+  GlobalPersona,
   HarnessCliVersion,
   HarnessOperation,
   IsolationMode,
   MemberRole,
   MemberStatus,
+  MessageOptions,
   PendingPermissionView,
   PermissionPolicy,
   PermissionRule,
@@ -24,6 +26,7 @@ import type {
   SessionContextReport,
   SessionDiffReport,
   SessionMember,
+  SettingsFile,
   StorageCleanupResult,
   StorageSummary,
   TrajectoryEvent,
@@ -113,6 +116,8 @@ export const api = {
       adapters: Record<string, AdapterConfig>;
       catalogs?: Record<string, AdapterModelCatalog>;
       defaults?: Record<string, AdapterModelPref>;
+      global_personas?: GlobalPersona[];
+      saved_profiles?: string[];
     }>(summary ? "/api/adapters?summary=true" : refresh ? "/api/adapters?refresh=true" : "/api/adapters"),
   updateAdapterDefaults: (
     adapterId: string,
@@ -127,6 +132,21 @@ export const api = {
     ),
   probeAdapters: () =>
     apiFetch<{ probes: AdapterProbeStatus[] }>("/api/adapters/probe"),
+  exportSettings: () => apiFetch<SettingsFile>("/api/settings"),
+  importSettings: (document: unknown) =>
+    apiFetch<SettingsFile>("/api/settings", { method: "POST", body: JSON.stringify(document) }),
+  saveGlobalPersona: (persona: GlobalPersona) =>
+    apiFetch<{ persona: GlobalPersona }>("/api/personas", { method: "POST", body: JSON.stringify(persona) }),
+  deleteGlobalPersona: (handle: string) =>
+    apiFetch<{ deleted: boolean }>(`/api/personas/${encodeURIComponent(handle)}`, { method: "DELETE" }),
+  addGlobalPersonaToSession: (session: string, handle: string) =>
+    apiFetch<{ member: SessionMember }>(
+      `/api/sessions/${encodeURIComponent(session)}/personas/${encodeURIComponent(handle)}`, { method: "POST" },
+    ),
+  selectHarnessProfile: (id: string, profile: "default" | "separate") =>
+    apiFetch<{ profile_dir: string | null }>(`/api/adapters/${encodeURIComponent(id)}/profile`, {
+      method: "PATCH", body: JSON.stringify({ profile }),
+    }),
   checkHarnessVersion: (id: string) =>
     apiFetch<{ version: HarnessCliVersion }>(`/api/adapters/${encodeURIComponent(id)}/version`),
   harnessOperation: (id: string) =>
@@ -301,7 +321,7 @@ export const api = {
   postMessage: (
     sessionId: string,
     content: string,
-    opts?: { model?: string | null; effort?: string | null }
+    opts?: MessageOptions
   ) =>
     apiFetch<{ message: ChatMessage }>(
       `/api/sessions/${encodeURIComponent(sessionId)}/messages`,
@@ -311,6 +331,7 @@ export const api = {
           content,
           ...(opts?.model ? { model: opts.model } : {}),
           ...(opts?.effort ? { effort: opts.effort } : {}),
+          ...(opts?.recipient_overrides ? { recipient_overrides: opts.recipient_overrides } : {}),
         }),
       }
     ),

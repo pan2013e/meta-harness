@@ -3,6 +3,7 @@ pub mod harness_jobs;
 pub mod mcp_bridge;
 pub mod pty;
 pub mod routes;
+mod settings;
 pub mod ws;
 
 use std::sync::Arc;
@@ -37,7 +38,21 @@ pub fn build_router(state: AppState) -> Router {
         .route("/api/fs/pick-folder", post(routes::pick_fs_folder))
         .route("/api/adapters", get(routes::list_adapters))
         .route("/api/adapters/probe", get(routes::probe_adapters))
+        .route(
+            "/api/settings",
+            get(settings::export_settings).post(settings::import_settings),
+        )
+        .route("/api/personas", post(settings::save_persona))
+        .route("/api/personas/{handle}", delete(settings::delete_persona))
+        .route(
+            "/api/sessions/{id}/personas/{handle}",
+            post(settings::add_persona_to_session),
+        )
         .route("/api/adapters/{id}/version", get(harness_jobs::version))
+        .route(
+            "/api/adapters/{id}/profile",
+            patch(harness_jobs::select_profile),
+        )
         .route(
             "/api/adapters/{id}/operation",
             get(harness_jobs::status)

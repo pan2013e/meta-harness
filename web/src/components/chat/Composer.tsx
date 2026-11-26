@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useEffect, useId, useMemo, useRef, useState } from "react";
 import {
   Check,
   ChevronDown,
@@ -13,7 +13,9 @@ import { api } from "../../api/client";
 import { useAppStore } from "../../store/useAppStore";
 import type {
   MemberContextBreakdown,
+  ModelSelection,
   PermissionPolicy,
+  SessionMember,
 } from "../../types/api";
 import { HarnessAvatar } from "../common/Badges";
 import {
@@ -60,8 +62,11 @@ const EFFORT_LABELS: Record<string, string> = {
 const EFFORT_ORDER = Object.keys(EFFORT_LABELS);
 const COMPACT_COMMAND = /^\/compact(?:\s+([\s\S]+))?$/i;
 
-type ModelSettings = { model: string | null; effort: string | null };
-const DEFAULT_MODEL_SETTINGS: ModelSettings = { model: null, effort: null };
+const DEFAULT_MODEL_SETTINGS: ModelSelection = { model: null, effort: null };
+
+function recipientKey(member: SessionMember): string {
+  return member.adapter_id + "/" + member.handle;
+}
 
 function routingMentions(markdown: string): Set<string> {
   // Match the router's mention boundaries and ignore fenced and inline code.
@@ -113,6 +118,7 @@ export function Composer({
     adapters,
     adapterCatalogs,
     adapterDefaults,
+    globalPersonas,
     memberOptions,
     probes,
     quotas,
@@ -122,7 +128,6 @@ export function Composer({
     memoryFacts,
     pendingPermissionPolicy,
     setPendingPermissionPolicy,
-    updateMemberConfig,
     createAndSelectSession,
     archiveSession,
     compactActiveSession,
@@ -143,14 +148,18 @@ export function Composer({
   const [slashQuery, setSlashQuery] = useState<string | null>(null);
   const [selectedIdx, setSelectedIdx] = useState(0);
   const [menuDismissed, setMenuDismissed] = useState(false);
-  const [modelDraft, setModelDraft] = useState<(ModelSettings & { target: string }) | null>(null);
-  const [modelOverrides, setModelOverrides] = useState<Record<string, ModelSettings>>({});
-  const [savingModel, setSavingModel] = useState(false);
+  const [modelMenu, setModelMenu] = useState<{
+    route: string;
+    tab: number;
+    edits: Record<string, ModelSelection>;
+  } | null>(null);
+  const [modelOverrides, setModelOverrides] = useState<Record<string, ModelSelection>>({});
   const [permOpen, setPermOpen] = useState(false);
   const [contextOpen, setContextOpen] = useState(false);
   const [contextMemberHandle, setContextMemberHandle] = useState<string | null>(null);
   const editorRef = useRef<MentionEditorHandle | null>(null);
   const modelButtonRef = useRef<HTMLButtonElement | null>(null);
+  const modelMenuId = useId();
 
   useEffect(() => {
     if (draftPreset?.text) {
@@ -166,13 +175,13 @@ export function Composer({
   );
 
   // Use installed session members when in a session, otherwise synthesize virtual installed targets for the Welcome composer.
-  const availableMembers = useMemo(() => {
+  const availableMembers = useMemo<SessionMember[]>(() => {
     if (activeSession) {
       return members.filter((member) =>
         installedProbes.some((probe) => probe.adapter_id === member.adapter_id)
       );
     }
-    return installedProbes.map((p) => ({
+    const defaults: SessionMember[] = installedProbes.map((p) => ({
       session_id: "pending",
       handle: p.adapter_id,
       adapter_id: p.adapter_id,
@@ -186,7 +195,21 @@ export function Composer({
       active_effort: adapterDefaults[p.adapter_id]?.default_effort ?? null,
       last_seen_msg_seq: 0,
     }));
-  }, [activeSession, members, installedProbes, adapterDefaults]);
+    for (const persona of globalPersonas) {
+      if (!installedProbes.some((probe) => probe.adapter_id === persona.adapter_id) ||
+          defaults.some((member) => member.handle.toLowerCase() === persona.handle.toLowerCase())) continue;
+      defaults.push({
+        session_id: "pending",
+        role: "executor",
+        worktree_branch: null,
+        worktree_path: null,
+        acp_session_id: null,
+        last_seen_msg_seq: 0,
+        ...persona,
+      });
+    }
+    return defaults;
+  }, [activeSession, members, installedProbes, adapterDefaults, globalPersonas]);
 
   const orchestrator = useMemo(() => {
     if (activeSession) {
@@ -283,22 +306,25 @@ export function Composer({
     explicitMentions.has(member.handle.toLowerCase())
   );
   const toOrchestrator = explicitMentions.has("orchestrator");
-  const multipleRecipients =
-    !toOrchestrator && (explicitMentions.has("all") || mentionedMembers.length > 1);
-  const directMember = !toOrchestrator && !multipleRecipients ? mentionedMembers[0] : undefined;
-  const recipient = multipleRecipients
-    ? undefined
-    : toOrchestrator
-      ? orchestrator ?? undefined
-      : directMember ?? orchestrator ?? availableMembers[0];
-  const targetMember = availableMembers.find((m) => m.handle === recipient?.handle);
+  const automaticRecipient = orchestrator ?? availableMembers[0];
+  const recipients = toOrchestrator
+    ? orchestrator ? [orchestrator] : []
+    : explicitMentions.has("all")
+      ? availableMembers.filter((member) => member.handle !== activeSession?.orchestrator_member || member.role !== "orchestrator")
+      : mentionedMembers.length
+        ? mentionedMembers
+        : automaticRecipient ? [automaticRecipient] : [];
+  const route = JSON.stringify(recipients.map(recipientKey));
+  const openMenu = modelMenu?.route === route ? modelMenu : null;
+  const selectedTab = openMenu?.tab ?? 0;
+  const recipient = recipients[selectedTab];
+  const targetMember = availableMembers.find((member) => member.handle === recipient?.handle);
   const targetAdapterId = targetMember?.adapter_id;
   const targetCatalog = targetAdapterId ? adapterCatalogs[targetAdapterId] : undefined;
   const targetDefaults = targetAdapterId ? adapterDefaults[targetAdapterId] : undefined;
-  const targetKey = targetMember ? targetMember.adapter_id + "/" + targetMember.handle : undefined;
-  const savesMemberConfig = Boolean(activeSession && directMember);
-  const menuTarget = targetKey ? (savesMemberConfig ? "member/" : "draft/") + targetKey : undefined;
-  const openModelDraft = modelDraft?.target === menuTarget ? modelDraft : null;
+  const targetKey = targetMember ? recipientKey(targetMember) : undefined;
+  const selectedSettings = (targetKey && modelOverrides[targetKey]) || DEFAULT_MODEL_SETTINGS;
+  const openModelDraft = targetKey && openMenu ? openMenu.edits[targetKey] ?? selectedSettings : null;
 
   const liveOptions = targetMember ? memberOptions[targetMember.handle] : undefined;
   const discoveredEfforts = liveOptions?.find(
@@ -339,12 +365,8 @@ export function Composer({
     return [...merged.values()];
   }, [targetAdapterId, targetCatalog, liveOptions, discoveredEfforts, targetMember?.active_model, targetDefaults]);
 
-  const inheritedModel = (savesMemberConfig ? null : targetMember?.active_model) ??
+  const inheritedModel = targetMember?.active_model ??
     targetDefaults?.default_model ?? targetCatalog?.model_details?.find((model) => model.is_default)?.value;
-  const override = targetKey && !savesMemberConfig ? modelOverrides[targetKey] : undefined;
-  const selectedSettings = savesMemberConfig
-    ? { model: targetMember?.active_model ?? null, effort: targetMember?.active_effort ?? null }
-    : override ?? DEFAULT_MODEL_SETTINGS;
   const selectedModel = selectedSettings.model ?? inheritedModel;
   const modelLabel =
     modelDetailsForTarget.find((model) => model.value === selectedModel)?.label ??
@@ -366,30 +388,22 @@ export function Composer({
     : null;
 
   const closeAllMenus = () => {
-    setModelDraft(null);
+    setModelMenu(null);
     setPermOpen(false);
     setContextOpen(false);
   };
 
-  const applyModelSettings = async () => {
-    if (!openModelDraft || !targetMember || !targetKey) return;
-    const model = openModelDraft.model;
-    const effort = currentEffort?.value ?? null;
-    setModelDraft(null);
-    if (model === selectedSettings.model && effort === selectedSettings.effort) return;
-
-    if (savesMemberConfig) {
-      setSavingModel(true);
-      try {
-        await updateMemberConfig(targetMember.handle, { active_model: model, active_effort: effort });
-      } catch (error) {
-        setError(error instanceof Error ? error.message : String(error));
-      } finally {
-        setSavingModel(false);
-      }
-    } else {
-      setModelOverrides((current) => ({ ...current, [targetKey]: { model, effort } }));
+  const editModelSettings = (settings: ModelSelection) => {
+    if (targetKey && openMenu) {
+      setModelMenu({ ...openMenu, edits: { ...openMenu.edits, [targetKey]: settings } });
     }
+  };
+
+  const applyModelSettings = () => {
+    if (!openMenu) return;
+    setModelOverrides((current) => ({ ...current, ...openMenu.edits }));
+    setModelMenu(null);
+    modelButtonRef.current?.focus();
   };
 
   const currentPolicy: PermissionPolicy =
@@ -446,12 +460,13 @@ export function Composer({
   const contextPct = Math.min(100, Math.round((contextTotalWithDraft / contextWindow) * 100));
 
   const handleSend = async () => {
-    if (!raw || sending || savingModel) return;
+    if (!raw || sending) return;
 
-    const opts = override ? {
-      model: override.model ?? undefined,
-      effort: override.effort ?? undefined,
-    } : undefined;
+    const overrides = Object.fromEntries(recipients.flatMap((member) => {
+      const selection = modelOverrides[recipientKey(member)];
+      return selection?.model || selection?.effort ? [[member.handle, selection]] : [];
+    }));
+    const opts = Object.keys(overrides).length ? { recipient_overrides: overrides } : undefined;
 
     const lowerRaw = raw.toLowerCase();
     if (lowerRaw === "/diff") {
@@ -690,41 +705,43 @@ export function Composer({
                     ref={modelButtonRef}
                     type="button"
                     aria-label="Model and reasoning effort"
-                    aria-expanded={Boolean(openModelDraft)}
+                    aria-expanded={Boolean(openMenu)}
+                    aria-controls={openMenu ? modelMenuId : undefined}
                     title={
-                      targetMember
+                      recipients.length > 1
+                        ? "Choose a model and effort for each recipient"
+                        : targetMember
                         ? [modelLabel, selectedEffortLabel, "@" + targetMember.handle].filter(Boolean).join(" · ")
-                        : multipleRecipients
-                          ? "Each recipient uses its own model and reasoning effort"
-                          : "The recipient's harness is unavailable"
+                        : "The recipient's harness is unavailable"
                     }
-                    disabled={!menuTarget || savingModel}
+                    disabled={recipients.length < 2 && !targetMember}
                     onClick={() => {
                       closeAllMenus();
-                      if (!openModelDraft && menuTarget) {
-                        setModelDraft({ ...selectedSettings, target: menuTarget });
+                      if (!openMenu) {
+                        setModelMenu({ route, tab: 0, edits: {} });
                       }
                     }}
                     className="inline-flex max-w-full items-center gap-1.5 rounded-lg border border-line bg-elevated px-2 py-1 text-ink-soft transition-colors hover:bg-hover hover:text-ink disabled:opacity-65"
                   >
                     <Cpu className="h-3.5 w-3.5 shrink-0 text-brand-ink" />
                     <span className="max-w-40 truncate font-medium">
-                      {multipleRecipients ? "Per agent" : modelLabel}
+                      {recipients.length > 1 ? `${recipients.length} recipients` : modelLabel}
                     </span>
-                    {selectedEffortLabel && (
+                    {recipients.length === 1 && selectedEffortLabel && (
                       <span className="hidden shrink-0 text-ink-muted @[30rem]:inline">
                         · {selectedEffortLabel}
                       </span>
                     )}
-                    {menuTarget && <ChevronDown className="h-3 w-3 shrink-0 text-ink-muted" />}
+                    <ChevronDown className="h-3 w-3 shrink-0 text-ink-muted" />
                   </button>
 
-                  {openModelDraft && targetMember && (
+                  {openMenu && recipient && (
                     <>
                       <div className="fixed inset-0 z-20" onClick={closeAllMenus} />
                       <div
                         role="group"
-                        aria-label={"Model and effort for @" + targetMember.handle}
+                        id={modelMenuId}
+                        aria-label={"Model and effort for @" + recipient.handle}
                         onKeyDown={(event) => {
                           if (event.key === "Escape") {
                             event.preventDefault();
@@ -736,62 +753,111 @@ export function Composer({
                       >
                         <div className="flex items-center justify-between gap-3 px-3 pt-3 pb-2">
                           <span className="font-semibold text-ink">Model</span>
-                          <span className="truncate font-mono text-[11px] text-ink-muted">
-                            @{targetMember.handle}
-                          </span>
-                        </div>
-                        <div className="max-h-[min(12rem,28vh)] space-y-0.5 overflow-y-auto px-1.5 pb-1.5">
-                          {[{ value: null, label: "Default" }, ...modelDetailsForTarget].map((option) => {
-                            const active = openModelDraft.model === option.value;
-                            return (
-                              <button
-                                key={option.value ?? ""}
-                                type="button"
-                                aria-pressed={active}
-                                onClick={() => {
-                                  const effort = effortsForModel(option.value).some(
-                                    (choice) => choice.value === openModelDraft.effort
-                                  ) ? openModelDraft.effort : null;
-                                  setModelDraft({ ...openModelDraft, model: option.value, effort });
-                                }}
-                                className={"flex w-full items-center justify-between gap-2 rounded-lg px-2 py-1.5 text-left transition-colors " +
-                                  (active ? "bg-brand-soft font-medium text-ink" : "text-ink-soft hover:bg-hover")}
-                              >
-                                <span className="truncate" title={option.label}>{option.label}</span>
-                                {active && <Check className="h-3.5 w-3.5 shrink-0 text-brand-ink" />}
-                              </button>
-                            );
-                          })}
-                        </div>
-                        {effortChoices.length > 0 && (
-                          <label className="block border-t border-line px-3 pt-3 pb-1.5">
-                            <span className="flex items-center justify-between gap-2">
-                              <span className="font-medium text-ink-soft">Reasoning effort</span>
-                              <span className="text-brand-ink">{effortLabel}</span>
+                          {recipients.length === 1 && (
+                            <span className="truncate font-mono text-[11px] text-ink-muted">
+                              @{recipient.handle}
                             </span>
-                            <input
-                              type="range"
-                              aria-label="Reasoning effort"
-                              aria-valuetext={effortLabel}
-                              min={0}
-                              max={effortChoices.length}
-                              step={1}
-                              value={effortIndex}
-                              onChange={(event) => setModelDraft({
-                                ...openModelDraft,
-                                effort: effortChoices[event.currentTarget.valueAsNumber - 1]?.value ?? null,
-                              })}
-                              className="mt-1.5 block h-5 w-full cursor-pointer accent-brand"
-                            />
-                          </label>
+                          )}
+                        </div>
+                        {recipients.length > 1 && (
+                          <div
+                            role="tablist"
+                            aria-label="Message recipients"
+                            className="flex gap-1 overflow-x-auto border-b border-line px-2 pb-2"
+                            onKeyDown={(event) => {
+                              const last = recipients.length - 1;
+                              const next = {
+                                ArrowLeft: selectedTab === 0 ? last : selectedTab - 1,
+                                ArrowRight: selectedTab === last ? 0 : selectedTab + 1,
+                                Home: 0,
+                                End: last,
+                              }[event.key];
+                              if (typeof next !== "number") return;
+                              event.preventDefault();
+                              setModelMenu({ ...openMenu, tab: next });
+                              event.currentTarget.querySelectorAll("button")[next]?.focus();
+                            }}
+                          >
+                            {recipients.map((member, index) => (
+                              <button
+                                key={member.handle}
+                                type="button"
+                                role="tab"
+                                tabIndex={index === selectedTab ? 0 : -1}
+                                aria-selected={index === selectedTab}
+                                aria-controls={modelMenuId + "-panel"}
+                                id={modelMenuId + "-tab-" + index}
+                                onClick={() => setModelMenu({ ...openMenu, tab: index })}
+                                className={`max-w-40 shrink-0 truncate rounded-md px-2 py-1.5 font-mono ${index === selectedTab
+                                  ? "bg-brand-soft text-brand-ink"
+                                  : "text-ink-soft hover:bg-hover"}`}
+                              >
+                                @{member.handle}
+                              </button>
+                            ))}
+                          </div>
                         )}
+                        <div
+                          role={recipients.length > 1 ? "tabpanel" : undefined}
+                          id={modelMenuId + "-panel"}
+                          aria-labelledby={recipients.length > 1 ? modelMenuId + "-tab-" + selectedTab : undefined}
+                        >
+                          {!openModelDraft ? (
+                            <p className="px-3 py-4 text-ink-muted">This recipient’s harness is unavailable.</p>
+                          ) : (
+                            <>
+                              <div className="max-h-[min(12rem,28vh)] space-y-0.5 overflow-y-auto px-1.5 pb-1.5">
+                                {[{ value: null, label: "Default" }, ...modelDetailsForTarget].map((option) => {
+                                  const active = openModelDraft.model === option.value;
+                                  return (
+                                    <button
+                                      key={option.value ?? ""}
+                                      type="button"
+                                      aria-pressed={active}
+                                      onClick={() => {
+                                        const effort = effortsForModel(option.value).some(
+                                          (choice) => choice.value === openModelDraft.effort
+                                        ) ? openModelDraft.effort : null;
+                                        editModelSettings({ model: option.value, effort });
+                                      }}
+                                      className={"flex w-full items-center justify-between gap-2 rounded-lg px-2 py-1.5 text-left transition-colors " +
+                                        (active ? "bg-brand-soft font-medium text-ink" : "text-ink-soft hover:bg-hover")}
+                                    >
+                                      <span className="truncate" title={option.label}>{option.label}</span>
+                                      {active && <Check className="h-3.5 w-3.5 shrink-0 text-brand-ink" />}
+                                    </button>
+                                  );
+                                })}
+                              </div>
+                              {effortChoices.length > 0 && (
+                                <label className="block border-t border-line px-3 pt-3 pb-1.5">
+                                  <span className="flex items-center justify-between gap-2">
+                                    <span className="font-medium text-ink-soft">Reasoning effort</span>
+                                    <span className="text-brand-ink">{effortLabel}</span>
+                                  </span>
+                                  <input
+                                    type="range"
+                                    aria-label="Reasoning effort"
+                                    aria-valuetext={effortLabel}
+                                    min={0}
+                                    max={effortChoices.length}
+                                    step={1}
+                                    value={effortIndex}
+                                    onChange={(event) => editModelSettings({
+                                      ...openModelDraft,
+                                      effort: effortChoices[event.currentTarget.valueAsNumber - 1]?.value ?? null,
+                                    })}
+                                    className="mt-1.5 block h-5 w-full rounded cursor-pointer accent-brand focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-brand-ink"
+                                  />
+                                </label>
+                              )}
+                            </>
+                          )}
+                        </div>
                         <div className="flex justify-end border-t border-line px-3 py-2">
                           <button
                             type="button"
-                            onClick={() => {
-                              void applyModelSettings();
-                              modelButtonRef.current?.focus();
-                            }}
+                            onClick={applyModelSettings}
                             className="rounded-md bg-brand-soft px-3 py-1.5 font-medium text-brand-ink hover:bg-hover"
                           >
                             Done
@@ -956,7 +1022,6 @@ export function Composer({
                 disabled={
                   !text.trim() ||
                   sending ||
-                  savingModel ||
                   (!availableMembers.length && !/^\/(diff|shell|memory|new|archive|compact)\b/i.test(text.trim()))
                 }
                 onClick={() => void handleSend()}

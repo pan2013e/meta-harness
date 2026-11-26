@@ -944,3 +944,172 @@ async fn personas_share_an_adapter_with_independent_preferences_and_can_be_remov
     switch.supervisor.shutdown_all().await;
     srv.abort();
 }
+
+#[tokio::test]
+async fn settings_backup_and_global_personas_preserve_session_choices() {
+    let (base_url, switch, srv, _tmp, _paths) = start_test_server_with_paths().await;
+    let http = reqwest::Client::new();
+    let settings_url = format!("{base_url}/api/settings");
+    let sessions_url = format!("{base_url}/api/sessions");
+    let create_session = |title: &'static str| {
+        http.post(&sessions_url)
+            .json(&json!({"title": title, "orchestrator_member": "codex"}))
+    };
+
+    let existing: Value = create_session("Existing session")
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let existing_id = existing["session"]["id"].as_str().unwrap();
+
+    let backup = json!({
+        "version": 1,
+        "theme": "daylight",
+        "preferences": {
+            "global_personas": [{
+                "handle": "@Reviewer", "adapter_id": "claude", "display_name": "Reviewer",
+                "persona_prompt": "Review diffs.",
+                "active_model": "mock-sonnet", "active_effort": "low"
+            }],
+            "adapter_defaults": [{
+                "adapter_id": "codex", "default_model": "mock-fast", "default_effort": "medium"
+            }],
+            "quota_preferences": [{
+                "adapter_id": "codex", "plan_label": "Fixture", "exact_probe_opt_in": false,
+                "manual_5h_pct": 25.0, "manual_weekly_pct": null
+            }]
+        }
+    });
+    let mut invalid = backup.clone();
+    invalid["preferences"]["quota_preferences"][0]["manual_5h_pct"] = json!(150.0);
+    assert_eq!(
+        http.post(&settings_url)
+            .json(&invalid)
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        reqwest::StatusCode::BAD_REQUEST
+    );
+    assert!(switch.store.list_global_personas().unwrap().is_empty());
+
+    let imported: Value = http
+        .post(&settings_url)
+        .json(&backup)
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let mut expected = backup;
+    expected["preferences"]["global_personas"][0]["handle"] = json!("reviewer");
+    assert_eq!(imported, expected);
+
+    let exported: Value = http
+        .get(&settings_url)
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(exported["preferences"], imported["preferences"]);
+    assert!(switch.store.get_member(existing_id, "reviewer").is_err());
+
+    let add = || http.post(format!("{sessions_url}/{existing_id}/personas/reviewer"));
+    add().send().await.unwrap().error_for_status().unwrap();
+    assert_eq!(
+        add().send().await.unwrap().status(),
+        reqwest::StatusCode::CONFLICT
+    );
+
+    let created: Value = create_session("New session from backup")
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let sid = created["session"]["id"].as_str().unwrap();
+    let reviewer = switch.store.get_member(sid, "reviewer").unwrap();
+    assert_eq!(reviewer.active_model.as_deref(), Some("mock-sonnet"));
+    assert_eq!(reviewer.persona_prompt, "Review diffs.");
+    assert_eq!(
+        switch
+            .store
+            .get_member(sid, "codex")
+            .unwrap()
+            .active_model
+            .as_deref(),
+        Some("mock-fast")
+    );
+
+    http.post(format!("{sessions_url}/{sid}/messages"))
+        .json(&json!({
+            "content":"@codex and @reviewer[mentioned-model] summarize this.",
+            "recipient_overrides":{
+                "codex":{"model":"mock-strong","effort":"high"},
+                "reviewer":{"model":"from-menu","effort":"medium"},
+                "antigravity":{"model":"unaddressed"}
+            }
+        }))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap();
+    let find_turn = |handle: &str| {
+        switch
+            .store
+            .list_trajectories(sid, Some(handle), 1)
+            .unwrap()
+            .pop()
+    };
+    tokio::time::timeout(Duration::from_secs(20), async {
+        loop {
+            if let (Some(codex), Some(reviewer)) = (find_turn("codex"), find_turn("reviewer")) {
+                assert_eq!(codex.model.as_deref(), Some("mock-strong"));
+                assert_eq!(codex.effort.as_deref(), Some("high"));
+                assert_eq!(reviewer.model.as_deref(), Some("mentioned-model"));
+                assert_eq!(reviewer.effort.as_deref(), Some("medium"));
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(40)).await;
+        }
+    })
+    .await
+    .unwrap();
+    assert!(find_turn("antigravity").is_none());
+    assert_eq!(
+        switch
+            .store
+            .get_member(sid, "reviewer")
+            .unwrap()
+            .active_effort
+            .as_deref(),
+        Some("low")
+    );
+
+    http.delete(format!("{base_url}/api/personas/reviewer"))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap();
+    assert!(switch.store.list_global_personas().unwrap().is_empty());
+    assert!(switch.store.get_member(sid, "reviewer").is_ok());
+    switch.supervisor.shutdown_all().await;
+    srv.abort();
+}

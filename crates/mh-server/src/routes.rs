@@ -1,4 +1,7 @@
-use std::path::{Path, PathBuf};
+use std::{
+    collections::HashMap,
+    path::{Path, PathBuf},
+};
 
 use axum::{
     Json,
@@ -17,7 +20,7 @@ use mh_acp::{
 };
 use mh_core::{
     DiffStat, IsolationMode, MemberRole, MemberStatus, PermissionPolicy, PromoteMode, Session,
-    StorageSummary, WsEvent, expand_user_path, is_path_within, normalize_path,
+    StorageSummary, TurnModelSelection, WsEvent, expand_user_path, is_path_within, normalize_path,
 };
 use mh_store::{CreateSessionParams, PatchSessionParams, UpsertMemberParams};
 use mh_switch::{SwitchError, execute_mcp_tool, list_switch_tools};
@@ -27,7 +30,7 @@ use crate::{AppState, WebAssets};
 
 pub type ApiResult<T> = Result<Json<T>, (StatusCode, Json<Value>)>;
 
-fn err_resp(status: StatusCode, msg: impl Into<String>) -> (StatusCode, Json<Value>) {
+pub(crate) fn err_resp(status: StatusCode, msg: impl Into<String>) -> (StatusCode, Json<Value>) {
     (status, Json(json!({ "error": msg.into() })))
 }
 
@@ -241,10 +244,29 @@ pub async fn list_adapters(
     for p in prefs {
         defaults.insert(p.adapter_id.clone(), p);
     }
+    let personas = state
+        .switch
+        .store
+        .list_global_personas()
+        .map_err(|e| err_resp(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    let saved_profiles = cfg
+        .adapters
+        .iter()
+        .filter_map(|(id, adapter)| {
+            crate::harness_jobs::has_saved_profile(
+                &state.switch.app_paths.data_dir,
+                id,
+                adapter.profile_dir.as_deref(),
+            )
+            .then_some(id)
+        })
+        .collect::<Vec<_>>();
     Ok(Json(json!({
         "adapters": cfg.adapters,
         "catalogs": catalogs,
         "defaults": defaults,
+        "global_personas": personas,
+        "saved_profiles": saved_profiles,
     })))
 }
 
@@ -363,14 +385,13 @@ pub async fn update_adapter_quota(
     AxumPath(adapter_id): AxumPath<String>,
     Json(body): Json<UpdateQuotaRequest>,
 ) -> ApiResult<Value> {
-    let config = state.switch.config.read().await;
+    let config = state.switch.config.write().await;
     let adapter = config
         .adapters
         .get(&adapter_id)
         .ok_or_else(|| err_resp(StatusCode::NOT_FOUND, "unknown adapter"))?;
     let provider = adapter.quota_provider.clone();
     let default_opt_in = adapter.exact_quota_probe_opt_in;
-    drop(config);
     let prev = state
         .switch
         .store
@@ -405,6 +426,7 @@ pub async fn update_adapter_quota(
     if body.clear_rate_limit.unwrap_or(false) {
         state.switch.quota.clear_rate_limit(&adapter_id).await;
     }
+    drop(config);
     let snap = state.switch.quota.snapshot(&adapter_id, &provider).await;
     let _ = state.switch.events_tx.send(mh_core::WsEvent::QuotaUpdated {
         snapshot: snap.clone(),
@@ -618,8 +640,11 @@ async fn create_session_internal(
     };
 
     let probes = probe_installed_adapters(&cfg);
-    let member_inputs = body.members.unwrap_or_else(|| {
-        cfg.adapters
+    let member_inputs = if let Some(members) = body.members {
+        members
+    } else {
+        let mut members = cfg
+            .adapters
             .iter()
             .filter(|(id, a)| {
                 a.enabled && probes.iter().any(|p| p.adapter_id == **id && p.installed)
@@ -633,8 +658,33 @@ async fn create_session_internal(
                 active_model: None,
                 active_effort: None,
             })
-            .collect()
-    });
+            .collect::<Vec<_>>();
+        let personas = state
+            .switch
+            .store
+            .list_global_personas()
+            .map_err(|e| err_resp(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+        for persona in personas {
+            if probes
+                .iter()
+                .any(|p| p.adapter_id == persona.adapter_id && p.installed)
+                && !members
+                    .iter()
+                    .any(|m| m.handle.eq_ignore_ascii_case(&persona.handle))
+            {
+                members.push(CreateMemberInput {
+                    handle: persona.handle,
+                    adapter_id: persona.adapter_id,
+                    display_name: Some(persona.display_name),
+                    role: Some(MemberRole::Executor),
+                    persona_prompt: Some(persona.persona_prompt),
+                    active_model: persona.active_model,
+                    active_effort: persona.active_effort,
+                });
+            }
+        }
+        members
+    };
 
     let orch = body.orchestrator_member.or_else(|| {
         member_inputs
@@ -681,7 +731,7 @@ async fn create_session_internal(
         .switch
         .store
         .list_adapter_model_prefs()
-        .unwrap_or_default();
+        .map_err(|e| err_resp(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
     let mut members = Vec::new();
     for m in member_inputs {
         let role = if orch.as_deref() == Some(&m.handle) {
@@ -710,20 +760,21 @@ async fn create_session_internal(
                 worktree_path: None,
             })
             .map_err(|e| err_resp(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-        let final_member = if let Some(pref) =
-            model_prefs.iter().find(|p| p.adapter_id == adapter_id)
-            && (pref.default_model.is_some() || pref.default_effort.is_some())
-        {
+        let pref = model_prefs.iter().find(|p| p.adapter_id == adapter_id);
+        let model = m
+            .active_model
+            .as_deref()
+            .or_else(|| pref.and_then(|p| p.default_model.as_deref()));
+        let effort = m
+            .active_effort
+            .as_deref()
+            .or_else(|| pref.and_then(|p| p.default_effort.as_deref()));
+        let final_member = if model.is_some() || effort.is_some() {
             state
                 .switch
                 .store
-                .update_member_model_effort(
-                    &sess.id,
-                    &inserted.handle,
-                    Some(pref.default_model.as_deref()),
-                    Some(pref.default_effort.as_deref()),
-                )
-                .unwrap_or(inserted)
+                .update_member_model_effort(&sess.id, &inserted.handle, Some(model), Some(effort))
+                .map_err(|e| err_resp(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
         } else {
             inserted
         };
@@ -1181,6 +1232,8 @@ pub struct PostMessageRequest {
     pub model: Option<String>,
     #[serde(default)]
     pub effort: Option<String>,
+    #[serde(default)]
+    pub recipient_overrides: HashMap<String, TurnModelSelection>,
 }
 
 pub async fn post_message(
@@ -1190,7 +1243,15 @@ pub async fn post_message(
 ) -> ApiResult<Value> {
     let msg = state
         .switch
-        .handle_user_message_with_overrides(&session_id, body.content, body.model, body.effort)
+        .handle_user_message_with_overrides(
+            &session_id,
+            body.content,
+            TurnModelSelection {
+                model: body.model,
+                effort: body.effort,
+            },
+            body.recipient_overrides,
+        )
         .await
         .map_err(map_switch_err)?;
     Ok(Json(json!({ "message": msg })))

@@ -2,7 +2,7 @@ use std::collections::HashSet;
 
 use rusqlite::{OptionalExtension, params};
 
-use mh_core::{EpisodicJob, ProjectFact};
+use mh_core::{AdapterModelPref, EpisodicJob, ProjectFact};
 
 use crate::{Store, StoreError, now_millis};
 
@@ -145,6 +145,16 @@ impl Store {
         )?;
         let rows = stmt.query_map(params![project_id, limit_i], map_job_row)?;
         rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+    }
+
+    pub fn has_job_for_turn(&self, turn_id: &str) -> Result<bool, StoreError> {
+        let conn = self.conn()?;
+        let exists: bool = conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM episodic_jobs WHERE turn_id = ?1)",
+            params![turn_id],
+            |row| row.get(0),
+        )?;
+        Ok(exists)
     }
 
     pub fn set_job_pinned(&self, job_id: &str, pinned: bool) -> Result<(), StoreError> {
@@ -308,6 +318,73 @@ impl Store {
                 manual_5h_pct: row.get(3)?,
                 manual_weekly_pct: row.get(4)?,
                 updated_at: row.get(5)?,
+            })
+        })?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+    }
+
+    pub fn upsert_adapter_model_pref(
+        &self,
+        adapter_id: &str,
+        default_model: Option<&str>,
+        default_effort: Option<&str>,
+    ) -> Result<AdapterModelPref, StoreError> {
+        let now = now_millis();
+        let m = default_model
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string);
+        let e = default_effort
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string);
+        let conn = self.conn()?;
+        conn.execute(
+            "INSERT INTO adapter_model_prefs (adapter_id, default_model, default_effort, updated_at)
+             VALUES (?1, ?2, ?3, ?4)
+             ON CONFLICT(adapter_id) DO UPDATE SET
+                default_model = excluded.default_model,
+                default_effort = excluded.default_effort,
+                updated_at = excluded.updated_at",
+            params![adapter_id, m, e, now],
+        )?;
+        Ok(AdapterModelPref {
+            adapter_id: adapter_id.to_string(),
+            default_model: m,
+            default_effort: e,
+        })
+    }
+
+    pub fn get_adapter_model_pref(
+        &self,
+        adapter_id: &str,
+    ) -> Result<Option<AdapterModelPref>, StoreError> {
+        let conn = self.conn()?;
+        conn.query_row(
+            "SELECT adapter_id, default_model, default_effort
+             FROM adapter_model_prefs WHERE adapter_id = ?1",
+            params![adapter_id],
+            |row| {
+                Ok(AdapterModelPref {
+                    adapter_id: row.get(0)?,
+                    default_model: row.get(1)?,
+                    default_effort: row.get(2)?,
+                })
+            },
+        )
+        .optional()
+        .map_err(Into::into)
+    }
+
+    pub fn list_adapter_model_prefs(&self) -> Result<Vec<AdapterModelPref>, StoreError> {
+        let conn = self.conn()?;
+        let mut stmt = conn
+            .prepare("SELECT adapter_id, default_model, default_effort FROM adapter_model_prefs")?;
+        let rows = stmt.query_map([], |row| {
+            Ok(AdapterModelPref {
+                adapter_id: row.get(0)?,
+                default_model: row.get(1)?,
+                default_effort: row.get(2)?,
             })
         })?;
         rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)

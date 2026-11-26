@@ -44,7 +44,7 @@ export interface Project {
 
 export interface Session {
   id: string;
-  project_id: string;
+  project_id: string | null;
   title: string;
   base_branch: string | null;
   base_commit_sha: string | null;
@@ -56,6 +56,7 @@ export interface Session {
   max_hops: number;
   permission_policy: PermissionPolicy;
   working_summary: string;
+  archived_at?: number | null;
   created_at: number;
   updated_at: number;
 }
@@ -176,6 +177,91 @@ export interface AdapterConfig {
   };
 }
 
+export interface ConfigOptionChoice {
+  value: string;
+  label: string;
+}
+
+export interface DiscoveredConfigOption {
+  id: string;
+  category: string | null;
+  label: string | null;
+  current_value: string | null;
+  choices: ConfigOptionChoice[];
+}
+
+export interface ModelChoiceDetail {
+  value: string;
+  label: string;
+  description: string;
+  is_default: boolean;
+  default_effort: string | null;
+  supported_efforts: ConfigOptionChoice[];
+}
+
+export interface AdapterModelCatalog {
+  adapter_id: string;
+  models: ConfigOptionChoice[];
+  model_details?: ModelChoiceDetail[];
+  efforts: ConfigOptionChoice[];
+  default_context_window: number;
+}
+
+export interface StorageSummary {
+  total_bytes: number;
+  database_bytes: number;
+  active_worktrees_bytes: number;
+  active_worktrees_count: number;
+  standalone_workspaces_bytes: number;
+  standalone_count: number;
+  archived_sessions_count: number;
+  archived_bytes: number;
+  cache_and_orphans_bytes: number;
+  orphan_dirs_count: number;
+  data_dir: string;
+  workspaces_dir: string;
+}
+
+export interface StorageCleanupResult {
+  action: "clear_caches" | "delete_archived";
+  removed_sessions: number;
+  removed_dirs: number;
+  freed_bytes: number;
+}
+
+export interface AdapterModelPref {
+  adapter_id: string;
+  default_model: string | null;
+  default_effort: string | null;
+}
+
+export interface MemberContextBreakdown {
+  handle: string;
+  adapter_id: string;
+  model: string | null;
+  used_tokens: number;
+  context_window: number;
+  is_exact: boolean;
+  system_and_persona_tokens: number;
+  memory_and_telemetry_tokens: number;
+  chat_history_tokens: number;
+  agent_and_tool_tokens: number;
+}
+
+export interface SessionContextReport {
+  session_id: string;
+  members: MemberContextBreakdown[];
+}
+
+export interface ShellHistoryEntry {
+  id: string;
+  command: string;
+  cwd: string;
+  exit_code: number;
+  stdout: string;
+  stderr: string;
+}
+
 export interface AdapterProbeStatus {
   adapter_id: string;
   display_name: string;
@@ -266,6 +352,7 @@ export type WsEvent =
       turn_id: string;
       member_handle: string;
       delta: string;
+      replace?: boolean;
     }
   | { type: "chat.message_completed"; message: ChatMessage }
   | {
@@ -331,4 +418,6 @@ export type WsEvent =
       decision: string;
     }
   | { type: "quota.updated"; snapshot: QuotaSnapshot }
-  | { type: "memory.job_curated"; job: EpisodicJob };
+  | { type: "memory.job_curated"; job: EpisodicJob }
+  | { type: "session.updated"; session: Session }
+  | { type: "context.updated"; session_id: string; report: SessionContextReport };

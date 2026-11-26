@@ -10,12 +10,13 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 use mh_acp::{
-    ensure_session_integration_worktree, get_session_diff, init_git_repo, inspect_repo,
-    open_terminal_in_dir, pick_folder_native, probe_installed_adapters, promote_session,
-    prune_session_worktrees,
+    commit_worktree_if_dirty, ensure_session_integration_worktree, get_session_diff, init_git_repo,
+    inspect_repo, probe_installed_adapters, promote_session, prune_session_worktree_checkouts,
+    prune_session_worktrees, reset_worktree_to_sha, sync_member_worktree,
 };
 use mh_core::{
-    IsolationMode, MemberRole, PermissionPolicy, PromoteMode, expand_user_path, normalize_path,
+    DiffStat, IsolationMode, MemberRole, MemberStatus, PermissionPolicy, PromoteMode,
+    StorageSummary, WsEvent, expand_user_path, is_path_within, normalize_path,
 };
 use mh_store::{CreateSessionParams, PatchSessionParams, UpsertMemberParams};
 use mh_switch::{SwitchError, execute_mcp_tool, list_switch_tools};
@@ -36,6 +37,7 @@ fn map_switch_err(err: SwitchError) -> (StatusCode, Json<Value>) {
             err_resp(StatusCode::BAD_REQUEST, err.to_string())
         }
         SwitchError::Store(e) => err_resp(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
+        SwitchError::Io(e) => err_resp(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
         other => err_resp(StatusCode::BAD_REQUEST, other.to_string()),
     }
 }
@@ -185,55 +187,84 @@ pub async fn list_fs(Query(q): Query<FsListQuery>) -> ApiResult<Value> {
     })))
 }
 
-pub async fn pick_fs_folder(
-    State(state): State<AppState>,
-    headers: axum::http::HeaderMap,
-) -> ApiResult<Value> {
-    let host_is_local = headers
-        .get(header::HOST)
-        .and_then(|v| v.to_str().ok())
-        .map(|h| {
-            let h_lower = h.to_ascii_lowercase();
-            h_lower.starts_with("127.0.0.1")
-                || h_lower.starts_with("localhost")
-                || h_lower.starts_with("[::1]")
-        })
-        .unwrap_or(true);
-
-    if state.auth.required || !host_is_local {
-        return Ok(Json(json!({
-            "supported": false,
-            "cancelled": false,
-            "path": null,
-        })));
-    }
-
-    match pick_folder_native().await {
-        Ok(Some(chosen)) => {
-            let norm = normalize_path(&chosen).unwrap_or(chosen);
-            let clean = dunce::simplified(&norm).to_string_lossy().into_owned();
-            Ok(Json(json!({
-                "supported": true,
-                "cancelled": false,
-                "path": clean,
-            })))
-        }
-        Ok(None) => Ok(Json(json!({
-            "supported": true,
-            "cancelled": true,
-            "path": null,
-        }))),
-        Err(_) => Ok(Json(json!({
-            "supported": false,
-            "cancelled": false,
-            "path": null,
-        }))),
-    }
+pub async fn pick_fs_folder() -> ApiResult<Value> {
+    // OS native file picker is disabled for platform consistency; clients use the built-in web browser.
+    Ok(Json(json!({
+        "supported": false,
+        "cancelled": false,
+        "path": null,
+    })))
 }
 
-pub async fn list_adapters(State(state): State<AppState>) -> Json<Value> {
+pub async fn list_adapters(State(state): State<AppState>) -> ApiResult<Value> {
     let cfg = state.switch.config.read().await.clone();
-    Json(json!({ "adapters": cfg.adapters }))
+    let prefs = state
+        .switch
+        .store
+        .list_adapter_model_prefs()
+        .map_err(|e| err_resp(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    let mut catalogs = std::collections::BTreeMap::new();
+    for (id, acfg) in &cfg.adapters {
+        let cat = state
+            .switch
+            .supervisor
+            .resolve_adapter_catalog(id, acfg)
+            .await;
+        catalogs.insert(id.clone(), cat);
+    }
+    let mut defaults = std::collections::BTreeMap::new();
+    for p in prefs {
+        defaults.insert(p.adapter_id.clone(), p);
+    }
+    Ok(Json(json!({
+        "adapters": cfg.adapters,
+        "catalogs": catalogs,
+        "defaults": defaults,
+    })))
+}
+
+#[derive(Debug, Deserialize)]
+pub struct UpdateAdapterDefaultsRequest {
+    #[serde(default, deserialize_with = "deserialize_orchestrator_patch")]
+    pub default_model: Option<Option<String>>,
+    #[serde(default, deserialize_with = "deserialize_orchestrator_patch")]
+    pub default_effort: Option<Option<String>>,
+}
+
+pub async fn update_adapter_defaults(
+    State(state): State<AppState>,
+    AxumPath(adapter_id): AxumPath<String>,
+    Json(body): Json<UpdateAdapterDefaultsRequest>,
+) -> ApiResult<Value> {
+    let exists = state
+        .switch
+        .config
+        .read()
+        .await
+        .adapters
+        .contains_key(&adapter_id);
+    if !exists {
+        return Err(err_resp(StatusCode::NOT_FOUND, "unknown adapter"));
+    }
+    let prev = state
+        .switch
+        .store
+        .get_adapter_model_pref(&adapter_id)
+        .map_err(|e| err_resp(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    let model = match body.default_model {
+        Some(v) => v,
+        None => prev.as_ref().and_then(|p| p.default_model.clone()),
+    };
+    let effort = match body.default_effort {
+        Some(v) => v,
+        None => prev.as_ref().and_then(|p| p.default_effort.clone()),
+    };
+    let pref = state
+        .switch
+        .store
+        .upsert_adapter_model_pref(&adapter_id, model.as_deref(), effort.as_deref())
+        .map_err(|e| err_resp(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    Ok(Json(json!({ "pref": pref })))
 }
 
 pub async fn probe_adapters(State(state): State<AppState>) -> Json<Value> {
@@ -406,7 +437,7 @@ pub async fn delete_project(
         .store
         .get_project(&project_id)
         .map_err(|e| err_resp(StatusCode::NOT_FOUND, e.to_string()))?;
-    if let Ok(sessions) = state.switch.store.list_sessions(&project_id) {
+    if let Ok(sessions) = state.switch.store.list_sessions(Some(&project_id), true) {
         for s in sessions {
             state.switch.supervisor.shutdown_session(&s.id).await;
             let _ = prune_session_worktrees(Path::new(&proj.root_path), &s.id).await;
@@ -420,14 +451,33 @@ pub async fn delete_project(
     Ok(Json(json!({ "deleted": true })))
 }
 
+#[derive(Debug, Default, Deserialize)]
+pub struct ListSessionsQuery {
+    #[serde(default)]
+    pub include_archived: bool,
+}
+
 pub async fn list_sessions(
     State(state): State<AppState>,
     AxumPath(project_id): AxumPath<String>,
+    Query(q): Query<ListSessionsQuery>,
 ) -> ApiResult<Value> {
     let sessions = state
         .switch
         .store
-        .list_sessions(&project_id)
+        .list_sessions(Some(&project_id), q.include_archived)
+        .map_err(|e| err_resp(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    Ok(Json(json!({ "sessions": sessions })))
+}
+
+pub async fn list_standalone_sessions(
+    State(state): State<AppState>,
+    Query(q): Query<ListSessionsQuery>,
+) -> ApiResult<Value> {
+    let sessions = state
+        .switch
+        .store
+        .list_sessions(None, q.include_archived)
         .map_err(|e| err_resp(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
     Ok(Json(json!({ "sessions": sessions })))
 }
@@ -456,20 +506,43 @@ pub async fn create_session(
     AxumPath(project_id): AxumPath<String>,
     Json(body): Json<CreateSessionRequest>,
 ) -> ApiResult<Value> {
-    let proj = state
-        .switch
-        .store
-        .get_project(&project_id)
-        .map_err(|e| err_resp(StatusCode::NOT_FOUND, e.to_string()))?;
-    let cfg = state.switch.config.read().await.clone();
+    create_session_internal(state, Some(project_id), body).await
+}
 
+pub async fn create_standalone_session(
+    State(state): State<AppState>,
+    Json(body): Json<CreateSessionRequest>,
+) -> ApiResult<Value> {
+    create_session_internal(state, None, body).await
+}
+
+async fn create_session_internal(
+    state: AppState,
+    project_id: Option<String>,
+    body: CreateSessionRequest,
+) -> ApiResult<Value> {
+    let cfg = state.switch.config.read().await.clone();
     let sid = format!("s_{}", &uuid::Uuid::new_v4().simple().to_string()[..10]);
-    let root = Path::new(&proj.root_path);
-    let repo = inspect_repo(root).await;
+    let root_path = if let Some(ref pid) = project_id {
+        let proj = state
+            .switch
+            .store
+            .get_project(pid)
+            .map_err(|e| err_resp(StatusCode::NOT_FOUND, e.to_string()))?;
+        PathBuf::from(proj.root_path)
+    } else {
+        let ws_root = state.switch.app_paths.standalone_session_root(&sid);
+        tokio::fs::create_dir_all(&ws_root)
+            .await
+            .map_err(|e| err_resp(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+        let _ = init_git_repo(&ws_root).await;
+        ws_root
+    };
+    let repo = inspect_repo(&root_path).await;
 
     let want_worktree = body.isolation_mode != Some(IsolationMode::SharedCwd) && repo.is_git_repo;
     let (isolation_mode, base_branch, base_sha, int_branch, int_wt_path) = if want_worktree {
-        match ensure_session_integration_worktree(root, &sid).await {
+        match ensure_session_integration_worktree(&root_path, &sid).await {
             Ok(int) => (
                 IsolationMode::WorktreePerMember,
                 int.base_branch,
@@ -483,10 +556,13 @@ pub async fn create_session(
         (IsolationMode::SharedCwd, None, None, None, None)
     };
 
+    let probes = probe_installed_adapters(&cfg);
     let member_inputs = body.members.unwrap_or_else(|| {
         cfg.adapters
             .iter()
-            .filter(|(_, a)| a.enabled)
+            .filter(|(id, a)| {
+                a.enabled && probes.iter().any(|p| p.adapter_id == **id && p.installed)
+            })
             .map(|(id, a)| CreateMemberInput {
                 handle: id.clone(),
                 adapter_id: id.clone(),
@@ -498,7 +574,6 @@ pub async fn create_session(
     });
 
     let orch = body.orchestrator_member.or_else(|| {
-        let probes = probe_installed_adapters(&cfg);
         member_inputs
             .iter()
             .filter(|m| {
@@ -510,13 +585,21 @@ pub async fn create_session(
             .map(|m| m.handle.clone())
     });
 
+    let clean_title = body
+        .title
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .unwrap_or_else(|| "New session".into());
+
     let sess = state
         .switch
         .store
         .create_session(CreateSessionParams {
             id: Some(sid.clone()),
             project_id,
-            title: body.title.unwrap_or_else(|| "Group Session".into()),
+            title: clean_title,
             base_branch,
             base_commit_sha: base_sha,
             integration_branch: int_branch,
@@ -531,6 +614,11 @@ pub async fn create_session(
         })
         .map_err(|e| err_resp(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
+    let model_prefs = state
+        .switch
+        .store
+        .list_adapter_model_prefs()
+        .unwrap_or_default();
     let mut members = Vec::new();
     for m in member_inputs {
         let role = if orch.as_deref() == Some(&m.handle) {
@@ -544,13 +632,14 @@ pub async fn create_session(
                 .map(|a| a.display_name.clone())
                 .unwrap_or_else(|| m.handle.clone())
         });
+        let adapter_id = m.adapter_id.clone();
         let inserted = state
             .switch
             .store
             .upsert_member(UpsertMemberParams {
                 session_id: sess.id.clone(),
                 handle: m.handle,
-                adapter_id: m.adapter_id,
+                adapter_id: adapter_id.clone(),
                 display_name: display,
                 role,
                 persona_prompt: m.persona_prompt.unwrap_or_default(),
@@ -558,7 +647,24 @@ pub async fn create_session(
                 worktree_path: None,
             })
             .map_err(|e| err_resp(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-        members.push(inserted);
+        let final_member = if let Some(pref) =
+            model_prefs.iter().find(|p| p.adapter_id == adapter_id)
+            && (pref.default_model.is_some() || pref.default_effort.is_some())
+        {
+            state
+                .switch
+                .store
+                .update_member_model_effort(
+                    &sess.id,
+                    &inserted.handle,
+                    Some(pref.default_model.as_deref()),
+                    Some(pref.default_effort.as_deref()),
+                )
+                .unwrap_or(inserted)
+        } else {
+            inserted
+        };
+        members.push(final_member);
     }
 
     Ok(Json(json!({ "session": sess, "members": members })))
@@ -568,16 +674,66 @@ pub async fn get_session(
     State(state): State<AppState>,
     AxumPath(session_id): AxumPath<String>,
 ) -> ApiResult<Value> {
-    let sess = state
+    let mut sess = state
         .switch
         .store
         .get_session(&session_id)
         .map_err(|e| err_resp(StatusCode::NOT_FOUND, e.to_string()))?;
-    let members = state
+    let cfg = state.switch.config.read().await.clone();
+    let probes = probe_installed_adapters(&cfg);
+    let mut all_members = state
         .switch
         .store
         .list_members(&session_id)
         .map_err(|e| err_resp(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    // Auto-provision default member for any newly installed adapter missing in older sessions
+    for (id, a) in &cfg.adapters {
+        let is_installed = a.enabled && probes.iter().any(|p| p.adapter_id == *id && p.installed);
+        if is_installed
+            && !all_members.iter().any(|m| m.handle == *id)
+            && let Ok(created) = state.switch.store.upsert_member(UpsertMemberParams {
+                session_id: session_id.clone(),
+                handle: id.clone(),
+                adapter_id: id.clone(),
+                display_name: a.display_name.clone(),
+                role: MemberRole::Executor,
+                persona_prompt: String::new(),
+                worktree_branch: None,
+                worktree_path: None,
+            })
+        {
+            all_members.push(created);
+        }
+    }
+
+    let members: Vec<_> = all_members
+        .into_iter()
+        .filter(|m| {
+            probes
+                .iter()
+                .any(|p| p.adapter_id == m.adapter_id && p.installed)
+        })
+        .collect();
+
+    if let Some(ref orch) = sess.orchestrator_member
+        && !members.iter().any(|m| m.handle == *orch)
+    {
+        let fallback_orch = members
+            .iter()
+            .min_by_key(|m| m.handle != "antigravity")
+            .map(|m| m.handle.clone());
+        if let Ok(updated) = state.switch.store.patch_session(
+            &session_id,
+            PatchSessionParams {
+                orchestrator_member: Some(fallback_orch),
+                ..Default::default()
+            },
+        ) {
+            sess = updated;
+        }
+    }
+
     let rules = state
         .switch
         .store
@@ -585,12 +741,26 @@ pub async fn get_session(
         .map_err(|e| err_resp(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
     let statuses = state.switch.get_member_statuses(&session_id).await;
     let pending_perms = state.switch.list_pending_permissions(&session_id).await;
+    let mut discovered_options = std::collections::BTreeMap::new();
+    for m in &members {
+        let opts = state
+            .switch
+            .supervisor
+            .get_discovered_options(&session_id, &m.handle)
+            .await;
+        if !opts.is_empty() {
+            discovered_options.insert(m.handle.clone(), opts);
+        }
+    }
+    let context = state.switch.compute_session_context(&session_id).await.ok();
     Ok(Json(json!({
         "session": sess,
         "members": members,
         "permission_rules": rules,
         "statuses": statuses,
         "pending_permissions": pending_perms,
+        "discovered_options": discovered_options,
+        "context": context,
     })))
 }
 
@@ -602,6 +772,7 @@ pub struct PatchSessionRequest {
     pub confirm_before_dispatch: Option<bool>,
     pub max_hops: Option<u32>,
     pub permission_policy: Option<PermissionPolicy>,
+    pub archived: Option<bool>,
 }
 
 fn deserialize_orchestrator_patch<'de, D>(value: D) -> Result<Option<Option<String>>, D::Error>
@@ -643,6 +814,62 @@ pub async fn patch_session(
             .get_member(&session_id, handle)
             .map_err(|e| err_resp(StatusCode::BAD_REQUEST, e.to_string()))?;
     }
+    let existing = state
+        .switch
+        .store
+        .get_session(&session_id)
+        .map_err(|e| err_resp(StatusCode::NOT_FOUND, e.to_string()))?;
+
+    let mut archived_at_patch: Option<Option<i64>> = None;
+    if let Some(archive) = body.archived {
+        if archive && existing.archived_at.is_none() {
+            state.switch.cancel_all_in_session(&session_id).await;
+            state.switch.supervisor.shutdown_session(&session_id).await;
+            if let Some(wt) = existing.integration_wt_path.as_deref() {
+                let _ = commit_worktree_if_dirty(Path::new(wt), "session", &existing.title).await;
+            }
+            if let Ok(members) = state.switch.store.list_members(&session_id) {
+                for m in members {
+                    if let Some(wt) = m.worktree_path.as_deref() {
+                        let _ = commit_worktree_if_dirty(Path::new(wt), &m.handle, &existing.title)
+                            .await;
+                    }
+                }
+            }
+            if let Ok(repo_root) = state.switch.resolve_session_repo_root(&existing) {
+                let _ = prune_session_worktree_checkouts(&repo_root, &session_id).await;
+            }
+            let _ = state.switch.store.clear_session_acp_ids(&session_id);
+            let now_ms = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis() as i64;
+            archived_at_patch = Some(Some(now_ms));
+        } else if !archive && existing.archived_at.is_some() {
+            if existing.isolation_mode == IsolationMode::WorktreePerMember
+                && let Ok(repo_root) = state.switch.resolve_session_repo_root(&existing)
+                && let Ok(int) = ensure_session_integration_worktree(&repo_root, &session_id).await
+            {
+                let int_wt = dunce::simplified(&int.path).to_string_lossy().into_owned();
+                let _ = state.switch.store.update_session_git_state(
+                    &session_id,
+                    existing
+                        .base_branch
+                        .as_deref()
+                        .or(int.base_branch.as_deref()),
+                    existing
+                        .base_commit_sha
+                        .as_deref()
+                        .or(Some(int.base_commit_sha.as_str())),
+                    Some(&int.branch),
+                    Some(&int_wt),
+                    existing.isolation_mode,
+                );
+            }
+            archived_at_patch = Some(None);
+        }
+    }
+
     let sess = state
         .switch
         .store
@@ -655,10 +882,105 @@ pub async fn patch_session(
                 max_hops: body.max_hops,
                 permission_policy: body.permission_policy,
                 working_summary: None,
+                archived_at: archived_at_patch,
             },
         )
         .map_err(|e| err_resp(StatusCode::BAD_REQUEST, e.to_string()))?;
+    let _ = state.switch.events_tx.send(WsEvent::SessionUpdated {
+        session: sess.clone(),
+    });
     Ok(Json(json!({ "session": sess })))
+}
+
+#[derive(Debug, Deserialize)]
+pub struct PatchMemberConfigRequest {
+    #[serde(default, deserialize_with = "deserialize_orchestrator_patch")]
+    pub active_model: Option<Option<String>>,
+    #[serde(default, deserialize_with = "deserialize_orchestrator_patch")]
+    pub active_effort: Option<Option<String>>,
+}
+
+pub async fn patch_member_config(
+    State(state): State<AppState>,
+    AxumPath((session_id, handle)): AxumPath<(String, String)>,
+    Json(body): Json<PatchMemberConfigRequest>,
+) -> ApiResult<Value> {
+    let updated = state
+        .switch
+        .store
+        .update_member_model_effort(
+            &session_id,
+            &handle,
+            body.active_model.as_ref().map(|o| o.as_deref()),
+            body.active_effort.as_ref().map(|o| o.as_deref()),
+        )
+        .map_err(|e| err_resp(StatusCode::BAD_REQUEST, e.to_string()))?;
+
+    if let Some((applied_m, applied_e)) = state
+        .switch
+        .supervisor
+        .apply_member_config(
+            &session_id,
+            &handle,
+            updated.active_model.as_deref(),
+            updated.active_effort.as_deref(),
+        )
+        .await
+        && (applied_m.is_some() || applied_e.is_some())
+    {
+        let _ = state.switch.store.update_member_runtime(
+            &session_id,
+            &handle,
+            None,
+            applied_m.as_deref(),
+            applied_e.as_deref(),
+            None,
+            None,
+        );
+    }
+    let final_member = state
+        .switch
+        .store
+        .get_member(&session_id, &handle)
+        .unwrap_or(updated);
+    let statuses = state.switch.get_member_statuses(&session_id).await;
+    let (status, turn_id) = statuses
+        .get(&handle)
+        .cloned()
+        .unwrap_or((MemberStatus::Hibernated, None));
+    let _ = state.switch.events_tx.send(WsEvent::MemberStatusChanged {
+        session_id: session_id.clone(),
+        handle: handle.clone(),
+        status,
+        active_model: final_member.active_model.clone(),
+        active_effort: final_member.active_effort.clone(),
+        turn_id,
+    });
+    Ok(Json(json!({ "member": final_member })))
+}
+
+pub async fn get_session_context_handler(
+    State(state): State<AppState>,
+    AxumPath(session_id): AxumPath<String>,
+) -> ApiResult<Value> {
+    let report = state
+        .switch
+        .compute_session_context(&session_id)
+        .await
+        .map_err(map_switch_err)?;
+    Ok(Json(json!({ "context": report })))
+}
+
+pub async fn compact_session_handler(
+    State(state): State<AppState>,
+    AxumPath(session_id): AxumPath<String>,
+) -> ApiResult<Value> {
+    let msg = state
+        .switch
+        .compact_session(&session_id)
+        .await
+        .map_err(map_switch_err)?;
+    Ok(Json(json!({ "message": msg })))
 }
 
 pub async fn delete_session(
@@ -670,15 +992,22 @@ pub async fn delete_session(
         .store
         .get_session(&session_id)
         .map_err(|e| err_resp(StatusCode::NOT_FOUND, e.to_string()))?;
-    let proj = state
-        .switch
-        .store
-        .get_project(&sess.project_id)
-        .map_err(|e| err_resp(StatusCode::NOT_FOUND, e.to_string()))?;
 
     state.switch.cancel_all_in_session(&session_id).await;
     state.switch.supervisor.shutdown_session(&session_id).await;
-    let _ = prune_session_worktrees(Path::new(&proj.root_path), &session_id).await;
+    if let Ok(repo_root) = state.switch.resolve_session_repo_root(&sess) {
+        let _ = prune_session_worktrees(&repo_root, &session_id).await;
+        if sess.project_id.is_none() {
+            for attempt in 0..4 {
+                if tokio::fs::remove_dir_all(&repo_root).await.is_ok() || !repo_root.exists() {
+                    break;
+                }
+                if attempt < 3 {
+                    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                }
+            }
+        }
+    }
     state
         .switch
         .store
@@ -754,6 +1083,10 @@ pub async fn list_messages(
 #[derive(Debug, Deserialize)]
 pub struct PostMessageRequest {
     pub content: String,
+    #[serde(default)]
+    pub model: Option<String>,
+    #[serde(default)]
+    pub effort: Option<String>,
 }
 
 pub async fn post_message(
@@ -763,7 +1096,7 @@ pub async fn post_message(
 ) -> ApiResult<Value> {
     let msg = state
         .switch
-        .handle_user_message(&session_id, body.content)
+        .handle_user_message_with_overrides(&session_id, body.content, body.model, body.effort)
         .await
         .map_err(map_switch_err)?;
     Ok(Json(json!({ "message": msg })))
@@ -859,6 +1192,10 @@ pub async fn get_session_diff_handler(
         .store
         .get_session(&session_id)
         .map_err(|e| err_resp(StatusCode::NOT_FOUND, e.to_string()))?;
+    let repo_root = state
+        .switch
+        .resolve_session_repo_root(&sess)
+        .map_err(map_switch_err)?;
     let (Some(wt), Some(br)) = (
         sess.integration_wt_path.as_deref(),
         sess.integration_branch.as_deref(),
@@ -868,20 +1205,54 @@ pub async fn get_session_diff_handler(
             "isolation_mode": sess.isolation_mode
         })));
     };
-    let base = sess
-        .base_commit_sha
-        .as_deref()
-        .or(sess.base_branch.as_deref())
-        .unwrap_or("HEAD");
-    let report = get_session_diff(Path::new(wt), base, br)
-        .await
-        .map_err(|e| err_resp(StatusCode::BAD_REQUEST, e.to_string()))?;
+    let report = get_session_diff(
+        &repo_root,
+        Path::new(wt),
+        sess.base_branch.as_deref(),
+        sess.base_commit_sha.as_deref(),
+        br,
+    )
+    .await
+    .map_err(|e| err_resp(StatusCode::BAD_REQUEST, e.to_string()))?;
     Ok(Json(json!({ "diff": report })))
+}
+
+pub async fn serve_session_worktree_file(
+    State(state): State<AppState>,
+    AxumPath((session_id, rel_path)): AxumPath<(String, String)>,
+) -> Response {
+    let Ok(sess) = state.switch.store.get_session(&session_id) else {
+        return (StatusCode::NOT_FOUND, "session not found").into_response();
+    };
+    let Ok(repo_root) = state.switch.resolve_session_repo_root(&sess) else {
+        return (StatusCode::NOT_FOUND, "session workspace not found").into_response();
+    };
+    let root_owned = sess
+        .integration_wt_path
+        .as_deref()
+        .map(PathBuf::from)
+        .unwrap_or(repo_root);
+    let root = root_owned.as_path();
+    let cleaned = rel_path.trim_start_matches(['/', '\\']);
+    if cleaned.is_empty() {
+        return (StatusCode::BAD_REQUEST, "empty path").into_response();
+    }
+    let candidate = root.join(cleaned);
+    if !is_path_within(&candidate, root) || !candidate.is_file() {
+        return (StatusCode::NOT_FOUND, "file not found").into_response();
+    }
+    let Ok(bytes) = tokio::fs::read(&candidate).await else {
+        return (StatusCode::FORBIDDEN, "cannot read file").into_response();
+    };
+    let mime = guess_mime(&candidate.to_string_lossy());
+    (StatusCode::OK, [(header::CONTENT_TYPE, mime)], bytes).into_response()
 }
 
 #[derive(Debug, Deserialize)]
 pub struct RunCommandRequest {
     pub command: String,
+    #[serde(default)]
+    pub cwd: Option<String>,
 }
 
 pub async fn run_session_preview_command(
@@ -894,12 +1265,56 @@ pub async fn run_session_preview_command(
         .store
         .get_session(&session_id)
         .map_err(|e| err_resp(StatusCode::NOT_FOUND, e.to_string()))?;
-    let proj = state
+    let repo_root = state
         .switch
-        .store
-        .get_project(&sess.project_id)
-        .map_err(|e| err_resp(StatusCode::NOT_FOUND, e.to_string()))?;
-    let cwd = sess.integration_wt_path.unwrap_or(proj.root_path);
+        .resolve_session_repo_root(&sess)
+        .map_err(map_switch_err)?;
+    let base_root_owned = sess
+        .integration_wt_path
+        .as_deref()
+        .map(PathBuf::from)
+        .unwrap_or_else(|| repo_root.clone());
+    let base_root = base_root_owned.as_path();
+    let proj_root = repo_root.as_path();
+    let mut cwd = base_root.to_path_buf();
+    if let Some(req_cwd) = body.cwd.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+        let cand = PathBuf::from(req_cwd);
+        if (is_path_within(&cand, base_root) || is_path_within(&cand, proj_root)) && cand.is_dir() {
+            cwd = dunce::canonicalize(&cand).unwrap_or(cand);
+        }
+    }
+
+    let trimmed = body.command.trim();
+    if trimmed == "cd" || trimmed.starts_with("cd ") {
+        let arg = trimmed
+            .strip_prefix("cd")
+            .unwrap_or("")
+            .trim()
+            .trim_matches(|c| c == '"' || c == '\'');
+        let target = if arg.is_empty() {
+            base_root.to_path_buf()
+        } else {
+            let p = PathBuf::from(arg);
+            if p.is_absolute() { p } else { cwd.join(p) }
+        };
+        if !target.is_dir()
+            || (!is_path_within(&target, base_root) && !is_path_within(&target, proj_root))
+        {
+            return Ok(Json(json!({
+                "cwd": dunce::simplified(&cwd).to_string_lossy(),
+                "exit_code": 1,
+                "stdout": "",
+                "stderr": format!("cd: cannot access directory inside session workspace: {}", arg),
+            })));
+        }
+        let clean = dunce::canonicalize(&target).unwrap_or(target);
+        return Ok(Json(json!({
+            "cwd": dunce::simplified(&clean).to_string_lossy(),
+            "exit_code": 0,
+            "stdout": "",
+            "stderr": "",
+        })));
+    }
 
     let (prog, args) = mh_acp::platform::shell_command_invocation(&body.command);
     let out = tokio::process::Command::new(prog)
@@ -912,31 +1327,18 @@ pub async fn run_session_preview_command(
     let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
     let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
     Ok(Json(json!({
-        "cwd": cwd,
+        "cwd": dunce::simplified(&cwd).to_string_lossy(),
         "exit_code": out.status.code().unwrap_or(-1),
         "stdout": stdout,
         "stderr": stderr,
     })))
 }
 
-pub async fn open_session_terminal(
-    State(state): State<AppState>,
-    AxumPath(session_id): AxumPath<String>,
-) -> ApiResult<Value> {
-    let sess = state
-        .switch
-        .store
-        .get_session(&session_id)
-        .map_err(|e| err_resp(StatusCode::NOT_FOUND, e.to_string()))?;
-    let proj = state
-        .switch
-        .store
-        .get_project(&sess.project_id)
-        .map_err(|e| err_resp(StatusCode::NOT_FOUND, e.to_string()))?;
-    let cwd = sess.integration_wt_path.unwrap_or(proj.root_path);
-    open_terminal_in_dir(Path::new(&cwd))
-        .map_err(|e| err_resp(StatusCode::BAD_REQUEST, e.to_string()))?;
-    Ok(Json(json!({ "opened": true, "cwd": cwd })))
+pub async fn open_session_terminal() -> ApiResult<Value> {
+    Err(err_resp(
+        StatusCode::BAD_REQUEST,
+        "OS terminal launching is disabled; use the built-in Web Shell.",
+    ))
 }
 
 #[derive(Debug, Deserialize)]
@@ -954,11 +1356,16 @@ pub async fn promote_session_handler(
         .store
         .get_session(&session_id)
         .map_err(|e| err_resp(StatusCode::NOT_FOUND, e.to_string()))?;
-    let proj = state
+    if sess.project_id.is_none() {
+        return Err(err_resp(
+            StatusCode::BAD_REQUEST,
+            "Standalone sessions do not have a parent repository branch to promote into.",
+        ));
+    }
+    let repo_root = state
         .switch
-        .store
-        .get_project(&sess.project_id)
-        .map_err(|e| err_resp(StatusCode::NOT_FOUND, e.to_string()))?;
+        .resolve_session_repo_root(&sess)
+        .map_err(map_switch_err)?;
     let int_br = sess
         .integration_branch
         .as_deref()
@@ -966,15 +1373,40 @@ pub async fn promote_session_handler(
     let base_br = sess.base_branch.as_deref().unwrap_or("main");
     let base_sha = sess.base_commit_sha.as_deref().unwrap_or(base_br);
 
-    let res = promote_session(
-        Path::new(&proj.root_path),
-        base_br,
-        base_sha,
-        int_br,
-        body.mode,
-    )
-    .await
-    .map_err(|e| err_resp(StatusCode::BAD_REQUEST, e.to_string()))?;
+    if let Some(wt) = sess.integration_wt_path.as_deref() {
+        let _ = commit_worktree_if_dirty(Path::new(wt), "session", &sess.title).await;
+    }
+
+    let res = promote_session(&repo_root, base_br, base_sha, int_br, body.mode)
+        .await
+        .map_err(|e| err_resp(StatusCode::BAD_REQUEST, e.to_string()))?;
+
+    if let Some(new_sha) = res.new_head_sha.as_deref() {
+        let _ = state.switch.store.update_session_git_state(
+            &session_id,
+            Some(base_br),
+            Some(new_sha),
+            Some(int_br),
+            sess.integration_wt_path.as_deref(),
+            sess.isolation_mode,
+        );
+        if let Some(wt) = sess.integration_wt_path.as_deref() {
+            let _ = reset_worktree_to_sha(Path::new(wt), new_sha).await;
+        }
+        if let Ok(members) = state.switch.store.list_members(&session_id) {
+            for m in members {
+                if let Some(p_wt) = m.worktree_path.as_deref() {
+                    let _ = sync_member_worktree(Path::new(p_wt), int_br).await;
+                }
+            }
+        }
+        let _ = state.switch.events_tx.send(WsEvent::GitBranchUpdated {
+            session_id,
+            integration_branch: int_br.to_string(),
+            ahead_commits: 0,
+            diff_stat: DiffStat::default(),
+        });
+    }
 
     Ok(Json(json!({ "result": res })))
 }
@@ -1108,6 +1540,277 @@ pub async fn delete_memory_job(
     Ok(Json(json!({ "deleted": true })))
 }
 
+async fn dir_size_bytes(root: PathBuf) -> u64 {
+    tokio::task::spawn_blocking(move || {
+        let mut total = 0u64;
+        if !root.exists() {
+            return 0;
+        }
+        let mut stack = vec![root];
+        while let Some(dir) = stack.pop() {
+            let Ok(rd) = std::fs::read_dir(&dir) else {
+                continue;
+            };
+            for entry in rd.flatten() {
+                let path = entry.path();
+                let Ok(meta) = std::fs::symlink_metadata(&path) else {
+                    continue;
+                };
+                if meta.file_type().is_symlink() {
+                    continue;
+                }
+                if meta.is_dir() {
+                    stack.push(path);
+                } else if meta.is_file() {
+                    total = total.saturating_add(meta.len());
+                }
+            }
+        }
+        total
+    })
+    .await
+    .unwrap_or(0)
+}
+
+async fn compute_storage_summary(switch: &mh_switch::SwitchEngine) -> StorageSummary {
+    let db_path = switch.app_paths.db_path();
+    let mut database_bytes = 0u64;
+    for candidate in [
+        db_path.clone(),
+        PathBuf::from(format!("{}-wal", db_path.display())),
+        PathBuf::from(format!("{}-shm", db_path.display())),
+    ] {
+        if let Ok(meta) = tokio::fs::metadata(&candidate).await {
+            database_bytes = database_bytes.saturating_add(meta.len());
+        }
+    }
+
+    let projects = switch.store.list_projects().unwrap_or_default();
+    let all_sessions = switch.store.list_all_sessions(true).unwrap_or_default();
+    let active_ids: std::collections::HashSet<String> = all_sessions
+        .iter()
+        .filter(|s| s.archived_at.is_none())
+        .map(|s| s.id.clone())
+        .collect();
+    let archived_ids: std::collections::HashSet<String> = all_sessions
+        .iter()
+        .filter(|s| s.archived_at.is_some())
+        .map(|s| s.id.clone())
+        .collect();
+
+    let mut active_worktrees_bytes = 0u64;
+    let mut active_worktrees_count = 0u32;
+    let mut standalone_workspaces_bytes = 0u64;
+    let mut standalone_count = 0u32;
+    let mut archived_bytes = 0u64;
+    let mut cache_and_orphans_bytes = 0u64;
+    let mut orphan_dirs_count = 0u32;
+
+    for proj in &projects {
+        let wt_root = Path::new(&proj.root_path)
+            .join(".meta-harness")
+            .join("worktrees");
+        if let Ok(mut rd) = tokio::fs::read_dir(&wt_root).await {
+            while let Ok(Some(entry)) = rd.next_entry().await {
+                let p = entry.path();
+                if !p.is_dir() {
+                    continue;
+                }
+                let name = entry.file_name().to_string_lossy().into_owned();
+                let sz = dir_size_bytes(p).await;
+                if active_ids.contains(&name) {
+                    active_worktrees_count = active_worktrees_count.saturating_add(1);
+                    active_worktrees_bytes = active_worktrees_bytes.saturating_add(sz);
+                } else if archived_ids.contains(&name) {
+                    archived_bytes = archived_bytes.saturating_add(sz);
+                } else {
+                    orphan_dirs_count = orphan_dirs_count.saturating_add(1);
+                    cache_and_orphans_bytes = cache_and_orphans_bytes.saturating_add(sz);
+                }
+            }
+        }
+    }
+
+    let ws_root = &switch.app_paths.workspaces_dir;
+    if let Ok(mut rd) = tokio::fs::read_dir(ws_root).await {
+        while let Ok(Some(entry)) = rd.next_entry().await {
+            let p = entry.path();
+            if !p.is_dir() {
+                continue;
+            }
+            let name = entry.file_name().to_string_lossy().into_owned();
+            let sz = dir_size_bytes(p).await;
+            if active_ids.contains(&name) {
+                standalone_count = standalone_count.saturating_add(1);
+                standalone_workspaces_bytes = standalone_workspaces_bytes.saturating_add(sz);
+            } else if archived_ids.contains(&name) {
+                archived_bytes = archived_bytes.saturating_add(sz);
+            } else {
+                orphan_dirs_count = orphan_dirs_count.saturating_add(1);
+                cache_and_orphans_bytes = cache_and_orphans_bytes.saturating_add(sz);
+            }
+        }
+    }
+
+    for sub in ["cache", "logs"] {
+        let dir = switch.app_paths.data_dir.join(sub);
+        if dir.exists() {
+            cache_and_orphans_bytes =
+                cache_and_orphans_bytes.saturating_add(dir_size_bytes(dir).await);
+        }
+    }
+
+    let total_bytes = database_bytes
+        .saturating_add(active_worktrees_bytes)
+        .saturating_add(standalone_workspaces_bytes)
+        .saturating_add(archived_bytes)
+        .saturating_add(cache_and_orphans_bytes);
+
+    StorageSummary {
+        total_bytes,
+        database_bytes,
+        active_worktrees_bytes,
+        active_worktrees_count,
+        standalone_workspaces_bytes,
+        standalone_count,
+        archived_sessions_count: archived_ids.len() as u32,
+        archived_bytes,
+        cache_and_orphans_bytes,
+        orphan_dirs_count,
+        data_dir: dunce::simplified(&switch.app_paths.data_dir)
+            .to_string_lossy()
+            .into_owned(),
+        workspaces_dir: dunce::simplified(&switch.app_paths.workspaces_dir)
+            .to_string_lossy()
+            .into_owned(),
+    }
+}
+
+pub async fn get_storage_handler(State(state): State<AppState>) -> ApiResult<Value> {
+    let storage = compute_storage_summary(&state.switch).await;
+    Ok(Json(json!({ "storage": storage })))
+}
+
+#[derive(Debug, Deserialize)]
+pub struct CleanupStorageRequest {
+    pub action: String,
+}
+
+pub async fn cleanup_storage_handler(
+    State(state): State<AppState>,
+    Json(body): Json<CleanupStorageRequest>,
+) -> ApiResult<Value> {
+    let action = body.action.trim().to_string();
+    if action != "clear_caches" && action != "delete_archived" {
+        return Err(err_resp(
+            StatusCode::BAD_REQUEST,
+            "action must be 'clear_caches' or 'delete_archived'",
+        ));
+    }
+
+    let before = compute_storage_summary(&state.switch).await;
+    let mut removed_sessions = 0usize;
+    let mut removed_dirs = 0usize;
+
+    if action == "clear_caches" {
+        let all_ids: std::collections::HashSet<String> = state
+            .switch
+            .store
+            .list_all_sessions(true)
+            .unwrap_or_default()
+            .into_iter()
+            .map(|s| s.id)
+            .collect();
+        let projects = state.switch.store.list_projects().unwrap_or_default();
+        for proj in &projects {
+            let wt_root = Path::new(&proj.root_path)
+                .join(".meta-harness")
+                .join("worktrees");
+            if let Ok(mut rd) = tokio::fs::read_dir(&wt_root).await {
+                while let Ok(Some(entry)) = rd.next_entry().await {
+                    let p = entry.path();
+                    if !p.is_dir() {
+                        continue;
+                    }
+                    let name = entry.file_name().to_string_lossy().into_owned();
+                    if !all_ids.contains(&name) {
+                        let _ = prune_session_worktrees(Path::new(&proj.root_path), &name).await;
+                        if p.exists() {
+                            let _ = tokio::fs::remove_dir_all(&p).await;
+                        }
+                        removed_dirs += 1;
+                    }
+                }
+            }
+        }
+        let ws_root = &state.switch.app_paths.workspaces_dir;
+        if let Ok(mut rd) = tokio::fs::read_dir(ws_root).await {
+            while let Ok(Some(entry)) = rd.next_entry().await {
+                let p = entry.path();
+                if !p.is_dir() {
+                    continue;
+                }
+                let name = entry.file_name().to_string_lossy().into_owned();
+                if !all_ids.contains(&name) && tokio::fs::remove_dir_all(&p).await.is_ok() {
+                    removed_dirs += 1;
+                }
+            }
+        }
+        for sub in ["cache", "logs"] {
+            let dir = state.switch.app_paths.data_dir.join(sub);
+            if dir.exists() {
+                let _ = tokio::fs::remove_dir_all(&dir).await;
+            }
+        }
+        let _ = state.switch.store.vacuum();
+    } else {
+        let archived = state
+            .switch
+            .store
+            .delete_archived_sessions()
+            .map_err(|e| err_resp(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+        removed_sessions = archived.len();
+        for sess in &archived {
+            state.switch.supervisor.shutdown_session(&sess.id).await;
+            if let Some(ref pid) = sess.project_id {
+                if let Ok(proj) = state.switch.store.get_project(pid)
+                    && prune_session_worktrees(Path::new(&proj.root_path), &sess.id)
+                        .await
+                        .is_ok()
+                {
+                    removed_dirs += 1;
+                }
+            } else {
+                let ws_root = state.switch.app_paths.standalone_session_root(&sess.id);
+                if ws_root.exists() {
+                    for attempt in 0..4 {
+                        if tokio::fs::remove_dir_all(&ws_root).await.is_ok() || !ws_root.exists() {
+                            removed_dirs += 1;
+                            break;
+                        }
+                        if attempt < 3 {
+                            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                        }
+                    }
+                }
+            }
+        }
+        let _ = state.switch.store.vacuum();
+    }
+
+    let after = compute_storage_summary(&state.switch).await;
+    let freed_bytes = before.total_bytes.saturating_sub(after.total_bytes);
+    Ok(Json(json!({
+        "result": {
+            "action": action,
+            "removed_sessions": removed_sessions,
+            "removed_dirs": removed_dirs,
+            "freed_bytes": freed_bytes,
+        },
+        "storage": after,
+    })))
+}
+
 pub async fn internal_mcp_handler(
     State(state): State<AppState>,
     headers: axum::http::HeaderMap,
@@ -1180,18 +1883,33 @@ pub async fn serve_embedded_spa(uri: axum::http::Uri) -> Response {
 }
 
 fn guess_mime(path: &str) -> &'static str {
-    if path.ends_with(".html") {
+    let lower = path.to_ascii_lowercase();
+    if lower.ends_with(".html") || lower.ends_with(".htm") {
         "text/html; charset=utf-8"
-    } else if path.ends_with(".js") || path.ends_with(".mjs") {
+    } else if lower.ends_with(".js") || lower.ends_with(".mjs") {
         "application/javascript; charset=utf-8"
-    } else if path.ends_with(".css") {
+    } else if lower.ends_with(".css") {
         "text/css; charset=utf-8"
-    } else if path.ends_with(".svg") {
+    } else if lower.ends_with(".svg") {
         "image/svg+xml"
-    } else if path.ends_with(".png") {
+    } else if lower.ends_with(".png") {
         "image/png"
-    } else if path.ends_with(".json") {
+    } else if lower.ends_with(".webp") {
+        "image/webp"
+    } else if lower.ends_with(".jpg") || lower.ends_with(".jpeg") {
+        "image/jpeg"
+    } else if lower.ends_with(".gif") {
+        "image/gif"
+    } else if lower.ends_with(".ico") {
+        "image/x-icon"
+    } else if lower.ends_with(".woff2") {
+        "font/woff2"
+    } else if lower.ends_with(".json") {
         "application/json"
+    } else if lower.ends_with(".wasm") {
+        "application/wasm"
+    } else if lower.ends_with(".md") || lower.ends_with(".txt") {
+        "text/plain; charset=utf-8"
     } else {
         "application/octet-stream"
     }

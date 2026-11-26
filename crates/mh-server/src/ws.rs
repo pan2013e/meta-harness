@@ -77,7 +77,7 @@ async fn handle_socket(mut socket: WebSocket, state: AppState, mut active_sessio
 fn should_forward(
     ev: &WsEvent,
     active_session: Option<&str>,
-    subscribed_turn: Option<&str>,
+    _subscribed_turn: Option<&str>,
 ) -> bool {
     let ev_session = match ev {
         WsEvent::ChatMessageCreated { message }
@@ -88,27 +88,16 @@ fn should_forward(
         | WsEvent::SwitchDispatchDecided { session_id, .. }
         | WsEvent::SwitchHopLimitPaused { session_id, .. }
         | WsEvent::MemberStatusChanged { session_id, .. }
+        | WsEvent::TrajectoryEvent { session_id, .. }
         | WsEvent::TrajectoryCounters { session_id, .. }
         | WsEvent::GitBranchUpdated { session_id, .. }
         | WsEvent::GitConflictEscalated { session_id, .. }
         | WsEvent::PermissionResolved { session_id, .. } => Some(session_id.as_str()),
         WsEvent::PermissionRequested { prompt } => Some(prompt.session_id.as_str()),
-        WsEvent::TrajectoryEvent {
-            session_id,
-            turn_id,
-            ..
-        } => {
-            if let Some(sub) = subscribed_turn {
-                if sub != turn_id {
-                    return false;
-                }
-            } else {
-                // Only send full granular events when drawer has subscribed to a turn
-                return false;
-            }
-            Some(session_id.as_str())
-        }
-        WsEvent::QuotaUpdated { .. } | WsEvent::MemoryJobCurated { .. } => None,
+        WsEvent::ContextUpdated { session_id, .. } => Some(session_id.as_str()),
+        WsEvent::QuotaUpdated { .. }
+        | WsEvent::MemoryJobCurated { .. }
+        | WsEvent::SessionUpdated { .. } => None,
     };
 
     ev_session.is_none_or(|actual| active_session == Some(actual))

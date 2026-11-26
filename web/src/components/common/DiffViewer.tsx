@@ -1,14 +1,15 @@
 import { useMemo, useState } from "react";
-import { ChevronDown, ChevronRight, FileCode2 } from "lucide-react";
+import { ChevronDown, ChevronRight, FileCode2, FileImage } from "lucide-react";
 
-interface DiffSection {
+export interface DiffSection {
   filename: string;
   additions: number;
   deletions: number;
+  binary: boolean;
   lines: string[];
 }
 
-function parseUnifiedDiff(diffText: string): DiffSection[] {
+export function parseUnifiedDiff(diffText: string): DiffSection[] {
   const rawLines = diffText.split(/\r?\n/);
   const sections: DiffSection[] = [];
   let current: DiffSection | null = null;
@@ -23,6 +24,7 @@ function parseUnifiedDiff(diffText: string): DiffSection[] {
         filename: m ? m[1] : line.slice(11),
         additions: 0,
         deletions: 0,
+        binary: false,
         lines: [],
       };
       continue;
@@ -34,8 +36,15 @@ function parseUnifiedDiff(diffText: string): DiffSection[] {
         filename: "Patch",
         additions: 0,
         deletions: 0,
+        binary: false,
         lines: [],
       };
+    }
+
+    if (line.startsWith("Binary files ") && line.endsWith(" differ")) {
+      current.binary = true;
+      current.lines.push(line);
+      continue;
     }
 
     if (line.startsWith("@@")) inHunk = true;
@@ -45,9 +54,12 @@ function parseUnifiedDiff(diffText: string): DiffSection[] {
       continue;
     }
     if (
-      !inHunk && (line.startsWith("index ") ||
-      line.startsWith("--- ") || line.startsWith("+++ ") ||
-      line.startsWith("new file mode") || line.startsWith("deleted file mode"))
+      !inHunk &&
+      (line.startsWith("index ") ||
+        line.startsWith("--- ") ||
+        line.startsWith("+++ ") ||
+        line.startsWith("new file mode") ||
+        line.startsWith("deleted file mode"))
     ) {
       continue;
     }
@@ -64,9 +76,18 @@ function parseUnifiedDiff(diffText: string): DiffSection[] {
   return sections;
 }
 
-export function DiffViewer({ diffText }: { diffText: string }) {
-  const sections = useMemo(() => parseUnifiedDiff(diffText), [diffText]);
-  const [collapsed, setCollapsed] = useState<Record<number, boolean>>({});
+export function DiffViewer({
+  diffText,
+  selectedFile,
+}: {
+  diffText: string;
+  selectedFile?: string | null;
+}) {
+  const sections = useMemo(() => {
+    const parsed = parseUnifiedDiff(diffText);
+    return selectedFile ? parsed.filter((s) => s.filename === selectedFile) : parsed;
+  }, [diffText, selectedFile]);
+  const [collapsed, setCollapsed] = useState<Record<string, boolean>>({});
 
   if (!diffText.trim() || sections.length === 0) {
     return (
@@ -77,42 +98,55 @@ export function DiffViewer({ diffText }: { diffText: string }) {
   }
 
   return (
-    <div className="space-y-3">
+    <div className="space-y-3 min-w-0">
       {sections.map((sec, idx) => {
-        const isClosed = Boolean(collapsed[idx]);
+        const key = `${sec.filename}-${idx}`;
+        const isClosed = Boolean(collapsed[key]);
         return (
           <div
-            key={`${sec.filename}-${idx}`}
-            className="rounded-xl border border-line bg-inset overflow-hidden"
+            key={key}
+            className="rounded-xl border border-line bg-inset overflow-hidden min-w-0"
           >
             <button
               type="button"
               onClick={() =>
-                setCollapsed((prev) => ({ ...prev, [idx]: !prev[idx] }))
+                setCollapsed((prev) => ({ ...prev, [key]: !prev[key] }))
               }
-              className="w-full px-3 py-2 bg-elevated hover:bg-hover border-b border-line flex items-center justify-between text-xs transition-colors"
+              className="w-full px-3 py-2 bg-elevated hover:bg-hover border-b border-line flex items-center justify-between gap-2 text-xs transition-colors"
             >
-              <span className="flex items-center gap-2 font-mono text-ink truncate">
+              <span className="flex items-center gap-2 font-mono text-ink min-w-0">
                 {isClosed ? (
                   <ChevronRight className="w-3.5 h-3.5 text-ink-muted shrink-0" />
                 ) : (
                   <ChevronDown className="w-3.5 h-3.5 text-ink-muted shrink-0" />
                 )}
-                <FileCode2 className="w-3.5 h-3.5 text-brand-ink shrink-0" />
+                {sec.binary ? (
+                  <FileImage className="w-3.5 h-3.5 text-brand-ink shrink-0" />
+                ) : (
+                  <FileCode2 className="w-3.5 h-3.5 text-brand-ink shrink-0" />
+                )}
                 <span className="truncate">{sec.filename}</span>
               </span>
               <span className="flex items-center gap-2 font-mono text-[11px] shrink-0">
-                <span className="text-pos">+{sec.additions}</span>
-                <span className="text-neg">-{sec.deletions}</span>
+                {sec.binary ? (
+                  <span className="px-1.5 py-0.2 rounded bg-brand-soft text-brand-ink text-[10px]">
+                    binary
+                  </span>
+                ) : (
+                  <>
+                    <span className="text-pos">+{sec.additions}</span>
+                    <span className="text-neg">-{sec.deletions}</span>
+                  </>
+                )}
               </span>
             </button>
 
             {!isClosed && (
-              <div className="overflow-x-auto font-mono text-[11.5px] leading-5 py-1">
+              <div className="overflow-x-auto font-mono text-[11.5px] leading-5 py-1 max-w-full">
                 {sec.lines.map((line, li) => {
                   const isHunk = line.startsWith("@@");
-                  const isAdd = line.startsWith("+");
-                  const isDel = line.startsWith("-");
+                  const isAdd = !sec.binary && line.startsWith("+");
+                  const isDel = !sec.binary && line.startsWith("-");
                   const cls = isHunk
                     ? "bg-brand-soft text-brand-ink font-semibold"
                     : isAdd
@@ -121,7 +155,7 @@ export function DiffViewer({ diffText }: { diffText: string }) {
                         ? "bg-neg-soft text-neg"
                         : "text-ink-soft";
                   return (
-                    <div key={li} className={`px-3 whitespace-pre ${cls}`}>
+                    <div key={li} className={`px-3 whitespace-pre min-w-max ${cls}`}>
                       {line || " "}
                     </div>
                   );

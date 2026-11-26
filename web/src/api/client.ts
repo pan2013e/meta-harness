@@ -1,7 +1,10 @@
 import type {
   AdapterConfig,
+  AdapterModelCatalog,
+  AdapterModelPref,
   AdapterProbeStatus,
   ChatMessage,
+  DiscoveredConfigOption,
   EpisodicJob,
   FsEntry,
   IsolationMode,
@@ -15,8 +18,11 @@ import type {
   PromoteMode,
   QuotaSnapshot,
   Session,
+  SessionContextReport,
   SessionDiffReport,
   SessionMember,
+  StorageCleanupResult,
+  StorageSummary,
   TrajectoryEvent,
   TurnTrajectory,
   WsEvent,
@@ -54,6 +60,39 @@ async function apiFetch<T>(path: string, init?: RequestInit): Promise<T> {
   return (await resp.json()) as T;
 }
 
+export function sessionFileUrl(sessionId: string, relPath: string): string {
+  const safeSegments = relPath
+    .replace(/\\/g, "/")
+    .replace(/^\/+/, "")
+    .split("/")
+    .filter(Boolean)
+    .map(encodeURIComponent)
+    .join("/");
+  return `/api/sessions/${encodeURIComponent(sessionId)}/files/${safeSegments}`;
+}
+
+export function ptyWsUrl(
+  sessionId: string,
+  cols: number,
+  rows: number,
+  target?: string | null
+): string {
+  const proto = window.location.protocol === "https:" ? "wss:" : "ws:";
+  const params = new URLSearchParams({
+    cols: String(cols),
+    rows: String(rows),
+  });
+  if (target && target !== "integration") {
+    params.set("target", target);
+  }
+  if (bearerToken) {
+    params.set("token", bearerToken);
+  }
+  return `${proto}//${window.location.host}/api/sessions/${encodeURIComponent(
+    sessionId
+  )}/pty?${params.toString()}`;
+}
+
 export const api = {
   authStatus: () =>
     apiFetch<{ required: boolean; authenticated: boolean }>("/api/auth/status"),
@@ -66,13 +105,23 @@ export const api = {
     apiFetch<{ current: string; parent: string | null; entries: FsEntry[] }>(
       `/api/fs/list${path ? `?path=${encodeURIComponent(path)}` : ""}`
     ),
-  pickFolderNative: () =>
-    apiFetch<{ supported: boolean; cancelled: boolean; path: string | null }>(
-      "/api/fs/pick-folder",
-      { method: "POST" }
-    ),
   listAdapters: () =>
-    apiFetch<{ adapters: Record<string, AdapterConfig> }>("/api/adapters"),
+    apiFetch<{
+      adapters: Record<string, AdapterConfig>;
+      catalogs?: Record<string, AdapterModelCatalog>;
+      defaults?: Record<string, AdapterModelPref>;
+    }>("/api/adapters"),
+  updateAdapterDefaults: (
+    adapterId: string,
+    payload: {
+      default_model?: string | null;
+      default_effort?: string | null;
+    }
+  ) =>
+    apiFetch<{ pref: AdapterModelPref }>(
+      `/api/adapters/${encodeURIComponent(adapterId)}/defaults`,
+      { method: "PATCH", body: JSON.stringify(payload) }
+    ),
   probeAdapters: () =>
     apiFetch<{ probes: AdapterProbeStatus[] }>("/api/adapters/probe"),
   listQuotas: () => apiFetch<{ quotas: QuotaSnapshot[] }>("/api/quotas"),
@@ -112,9 +161,15 @@ export const api = {
       { method: "DELETE" }
     ),
 
-  listSessions: (projectId: string) =>
+  listSessions: (projectId: string, includeArchived = false) =>
     apiFetch<{ sessions: Session[] }>(
-      `/api/projects/${encodeURIComponent(projectId)}/sessions`
+      `/api/projects/${encodeURIComponent(projectId)}/sessions${
+        includeArchived ? "?include_archived=true" : ""
+      }`
+    ),
+  listStandaloneSessions: (includeArchived = false) =>
+    apiFetch<{ sessions: Session[] }>(
+      `/api/sessions${includeArchived ? "?include_archived=true" : ""}`
     ),
   createSession: (
     projectId: string,
@@ -130,6 +185,17 @@ export const api = {
       `/api/projects/${encodeURIComponent(projectId)}/sessions`,
       { method: "POST", body: JSON.stringify(payload) }
     ),
+  createStandaloneSession: (payload: {
+    title?: string;
+    orchestrator_member?: string | null;
+    confirm_before_dispatch?: boolean;
+    isolation_mode?: IsolationMode;
+    permission_policy?: PermissionPolicy;
+  }) =>
+    apiFetch<{ session: Session; members: SessionMember[] }>("/api/sessions", {
+      method: "POST",
+      body: JSON.stringify(payload),
+    }),
   getSession: (sessionId: string) =>
     apiFetch<{
       session: Session;
@@ -137,6 +203,8 @@ export const api = {
       permission_rules: PermissionRule[];
       statuses: Record<string, [MemberStatus, string | null]>;
       pending_permissions: PendingPermissionView[];
+      discovered_options?: Record<string, DiscoveredConfigOption[]>;
+      context?: SessionContextReport | null;
     }>(`/api/sessions/${encodeURIComponent(sessionId)}`),
   patchSession: (
     sessionId: string,
@@ -146,16 +214,28 @@ export const api = {
       confirm_before_dispatch?: boolean;
       max_hops?: number;
       permission_policy?: PermissionPolicy;
+      archived?: boolean;
     }
   ) =>
     apiFetch<{ session: Session }>(
       `/api/sessions/${encodeURIComponent(sessionId)}`,
       { method: "PATCH", body: JSON.stringify(payload) }
     ),
+  compactSession: (sessionId: string) =>
+    apiFetch<{ message: ChatMessage }>(
+      `/api/sessions/${encodeURIComponent(sessionId)}/compact`,
+      { method: "POST" }
+    ),
   deleteSession: (sessionId: string) =>
     apiFetch<{ deleted: boolean }>(
       `/api/sessions/${encodeURIComponent(sessionId)}`,
       { method: "DELETE" }
+    ),
+  getStorage: () => apiFetch<{ storage: StorageSummary }>("/api/storage"),
+  cleanupStorage: (action: "clear_caches" | "delete_archived") =>
+    apiFetch<{ result: StorageCleanupResult; storage: StorageSummary }>(
+      "/api/storage/cleanup",
+      { method: "POST", body: JSON.stringify({ action }) }
     ),
 
   upsertMember: (
@@ -177,6 +257,19 @@ export const api = {
       `/api/sessions/${encodeURIComponent(sessionId)}/members/${encodeURIComponent(handle)}`,
       { method: "DELETE" }
     ),
+  patchMemberConfig: (
+    sessionId: string,
+    handle: string,
+    payload: { active_model?: string | null; active_effort?: string | null }
+  ) =>
+    apiFetch<{ member: SessionMember }>(
+      `/api/sessions/${encodeURIComponent(sessionId)}/members/${encodeURIComponent(handle)}/config`,
+      { method: "PATCH", body: JSON.stringify(payload) }
+    ),
+  getSessionContext: (sessionId: string) =>
+    apiFetch<{ context: SessionContextReport }>(
+      `/api/sessions/${encodeURIComponent(sessionId)}/context`
+    ),
 
   listMessages: (sessionId: string, beforeSeq?: number) =>
     apiFetch<{ messages: ChatMessage[] }>(
@@ -184,10 +277,21 @@ export const api = {
         beforeSeq ? `?before_seq=${beforeSeq}` : ""
       }`
     ),
-  postMessage: (sessionId: string, content: string) =>
+  postMessage: (
+    sessionId: string,
+    content: string,
+    opts?: { model?: string | null; effort?: string | null }
+  ) =>
     apiFetch<{ message: ChatMessage }>(
       `/api/sessions/${encodeURIComponent(sessionId)}/messages`,
-      { method: "POST", body: JSON.stringify({ content }) }
+      {
+        method: "POST",
+        body: JSON.stringify({
+          content,
+          ...(opts?.model ? { model: opts.model } : {}),
+          ...(opts?.effort ? { effort: opts.effort } : {}),
+        }),
+      }
     ),
   cancelSession: (sessionId: string) =>
     apiFetch<{ cancelled: boolean }>(
@@ -232,15 +336,10 @@ export const api = {
     apiFetch<{ diff: SessionDiffReport | null }>(
       `/api/sessions/${encodeURIComponent(sessionId)}/diff`
     ),
-  runSessionCommand: (sessionId: string, command: string) =>
+  runSessionCommand: (sessionId: string, command: string, cwd?: string) =>
     apiFetch<{ cwd: string; exit_code: number; stdout: string; stderr: string }>(
       `/api/sessions/${encodeURIComponent(sessionId)}/run-command`,
-      { method: "POST", body: JSON.stringify({ command }) }
-    ),
-  openSessionTerminal: (sessionId: string) =>
-    apiFetch<{ opened: boolean; cwd: string }>(
-      `/api/sessions/${encodeURIComponent(sessionId)}/open-terminal`,
-      { method: "POST" }
+      { method: "POST", body: JSON.stringify({ command, ...(cwd ? { cwd } : {}) }) }
     ),
   promoteSession: (sessionId: string, mode: PromoteMode) =>
     apiFetch<{

@@ -152,6 +152,15 @@ CREATE TABLE IF NOT EXISTS adapter_quota_prefs (
 );
 "#;
 
+const MIGRATION_V2: &str = r#"
+CREATE TABLE IF NOT EXISTS adapter_model_prefs (
+    adapter_id     TEXT PRIMARY KEY,
+    default_model  TEXT,
+    default_effort TEXT,
+    updated_at     INTEGER NOT NULL
+);
+"#;
+
 pub fn configure_connection(conn: &Connection) -> Result<(), StoreError> {
     conn.execute_batch(
         "PRAGMA journal_mode = WAL;
@@ -169,5 +178,59 @@ pub fn apply_migrations(conn: &Connection) -> Result<(), StoreError> {
         "INSERT OR IGNORE INTO schema_migrations (version) VALUES (1)",
         [],
     )?;
+    conn.execute_batch(MIGRATION_V2)?;
+    conn.execute(
+        "INSERT OR IGNORE INTO schema_migrations (version) VALUES (2)",
+        [],
+    )?;
+    let current_ver: i64 = conn
+        .query_row(
+            "SELECT COALESCE(MAX(version), 0) FROM schema_migrations",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap_or(0);
+    if current_ver < 3 {
+        conn.execute_batch(
+            "PRAGMA foreign_keys = OFF;
+             BEGIN;
+             CREATE TABLE sessions_v3 (
+                 id                      TEXT PRIMARY KEY,
+                 project_id              TEXT REFERENCES projects(id) ON DELETE CASCADE,
+                 title                   TEXT NOT NULL,
+                 base_branch             TEXT,
+                 base_commit_sha         TEXT,
+                 integration_branch      TEXT,
+                 integration_wt_path     TEXT,
+                 isolation_mode          TEXT NOT NULL DEFAULT 'worktree_per_member',
+                 orchestrator_member     TEXT,
+                 confirm_before_dispatch INTEGER NOT NULL DEFAULT 0,
+                 max_hops                INTEGER NOT NULL DEFAULT 6,
+                 permission_policy       TEXT NOT NULL DEFAULT 'worktree_smart',
+                 working_summary         TEXT NOT NULL DEFAULT '',
+                 archived_at             INTEGER,
+                 created_at              INTEGER NOT NULL,
+                 updated_at              INTEGER NOT NULL
+             );
+             INSERT INTO sessions_v3 (
+                 id, project_id, title, base_branch, base_commit_sha,
+                 integration_branch, integration_wt_path, isolation_mode,
+                 orchestrator_member, confirm_before_dispatch, max_hops,
+                 permission_policy, working_summary, archived_at, created_at, updated_at
+             )
+             SELECT
+                 id, project_id, title, base_branch, base_commit_sha,
+                 integration_branch, integration_wt_path, isolation_mode,
+                 orchestrator_member, confirm_before_dispatch, max_hops,
+                 permission_policy, working_summary, NULL, created_at, updated_at
+             FROM sessions;
+             DROP TABLE sessions;
+             ALTER TABLE sessions_v3 RENAME TO sessions;
+             CREATE INDEX IF NOT EXISTS idx_sessions_project ON sessions(project_id, updated_at DESC);
+             INSERT OR IGNORE INTO schema_migrations (version) VALUES (3);
+             COMMIT;
+             PRAGMA foreign_keys = ON;",
+        )?;
+    }
     Ok(())
 }

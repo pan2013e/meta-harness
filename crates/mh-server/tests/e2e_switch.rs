@@ -6,7 +6,7 @@ use serde_json::{Value, json};
 use tokio::net::TcpListener;
 
 use mh_acp::{AcpSupervisor, QuotaTracker, init_git_repo};
-use mh_core::{AdapterConfig, AppConfig, DispatchTaskSpec, MessageKind, PromoteMode};
+use mh_core::{AdapterConfig, AppConfig, AppPaths, DispatchTaskSpec, MessageKind, PromoteMode};
 use mh_server::auth::AuthConfig;
 use mh_server::{AppState, build_router};
 use mh_store::Store;
@@ -367,7 +367,32 @@ async fn e2e_parallel_worktrees_consult_cycle_trajectory_orchestrator_and_promot
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
 
-    // 7. Promote session integration branch to main checkout via Squash
+    // 7. Serve preview file from worktree & block traversal, then promote via Squash & verify diff resets
+    let preview_ok = http
+        .get(format!(
+            "{base_url}/api/sessions/{session_id}/files/codex.txt"
+        ))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(preview_ok.status(), reqwest::StatusCode::OK);
+    assert!(
+        preview_ok
+            .text()
+            .await
+            .unwrap()
+            .contains("hello from codex")
+    );
+
+    let preview_escape = http
+        .get(format!(
+            "{base_url}/api/sessions/{session_id}/files/..%2FREADME.md"
+        ))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(preview_escape.status(), reqwest::StatusCode::NOT_FOUND);
+
     let prom_resp = http
         .post(format!("{base_url}/api/sessions/{session_id}/promote"))
         .json(&json!({ "mode": PromoteMode::Squash }))
@@ -388,6 +413,17 @@ async fn e2e_parallel_worktrees_consult_cycle_trajectory_orchestrator_and_promot
         );
     }
 
+    let diff_after: Value = http
+        .get(format!("{base_url}/api/sessions/{session_id}/diff"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(diff_after["diff"]["ahead_commits"], 0);
+    assert_eq!(diff_after["diff"]["diff_stat"]["files_changed"], 0);
+
     // 8. Delete session -> worktrees pruned cleanly
     let del_resp = http
         .delete(format!("{base_url}/api/sessions/{session_id}"))
@@ -402,6 +438,370 @@ async fn e2e_parallel_worktrees_consult_cycle_trajectory_orchestrator_and_promot
             .join(&session_id)
             .exists()
     );
+
+    switch.supervisor.shutdown_all().await;
+    srv.abort();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn default_new_session_title_auto_renames_context_defaults_and_web_shell() {
+    let (base_url, switch, _auth, srv) = start_test_server(false).await;
+    let http = reqwest::Client::new();
+
+    let tmp_repo = tempfile::tempdir().unwrap();
+    let repo_root = tmp_repo.path();
+    std::fs::create_dir_all(repo_root.join("sub")).unwrap();
+    std::fs::write(repo_root.join("sub/keep.txt"), "ok\n").unwrap();
+    std::fs::write(repo_root.join("README.md"), "# Test Repo\n").unwrap();
+    init_git_repo(repo_root).await.unwrap();
+
+    // OS native picker & terminal disabled
+    let pick: Value = http
+        .post(format!("{base_url}/api/fs/pick-folder"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(pick["supported"], false);
+
+    // Save adapter model/effort defaults
+    let def_resp = http
+        .patch(format!("{base_url}/api/adapters/codex/defaults"))
+        .json(&json!({ "default_model": "gpt-5.4-mini", "default_effort": "high" }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(def_resp.status(), reqwest::StatusCode::OK);
+
+    let proj_resp: Value = http
+        .post(format!("{base_url}/api/projects"))
+        .json(&json!({ "root_path": repo_root.to_string_lossy() }))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let project_id = proj_resp["project"]["id"].as_str().unwrap().to_string();
+
+    // Creating a session with omitted title uses "New session" and seeds adapter defaults
+    let sess_resp: Value = http
+        .post(format!("{base_url}/api/projects/{project_id}/sessions"))
+        .json(&json!({ "orchestrator_member": "codex" }))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(sess_resp["session"]["title"], "New session");
+    let session_id = sess_resp["session"]["id"].as_str().unwrap().to_string();
+    let codex_member = sess_resp["members"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|m| m["handle"] == "codex")
+        .unwrap();
+    assert_eq!(codex_member["active_model"], "gpt-5.4-mini");
+    assert_eq!(codex_member["active_effort"], "high");
+
+    // OS terminal endpoint returns 400
+    let os_term = http
+        .post(format!(
+            "{base_url}/api/sessions/{session_id}/open-terminal"
+        ))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(os_term.status(), reqwest::StatusCode::BAD_REQUEST);
+
+    // Web shell supports cd inside workspace and rejects escaping
+    let cd_ok: Value = http
+        .post(format!("{base_url}/api/sessions/{session_id}/run-command"))
+        .json(&json!({ "command": "cd sub" }))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(cd_ok["exit_code"], 0);
+    assert!(cd_ok["cwd"].as_str().unwrap().ends_with("sub"));
+
+    // Per-member model config update works
+    let cfg_upd: Value = http
+        .patch(format!(
+            "{base_url}/api/sessions/{session_id}/members/codex/config"
+        ))
+        .json(&json!({ "active_model": "gpt-5.4" }))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(cfg_upd["member"]["active_model"], "gpt-5.4");
+
+    // Context usage endpoint returns breakdown
+    let ctx_resp: Value = http
+        .get(format!("{base_url}/api/sessions/{session_id}/context"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert!(
+        !ctx_resp["context"]["members"]
+            .as_array()
+            .unwrap()
+            .is_empty()
+    );
+
+    // First user message triggers background LLM session auto-title replacement
+    http.post(format!("{base_url}/api/sessions/{session_id}/messages"))
+        .json(&json!({ "content": "Build distributed pelican tracker" }))
+        .send()
+        .await
+        .unwrap();
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(12);
+    loop {
+        let s = switch.store.get_session(&session_id).unwrap();
+        if s.title != "New session" {
+            assert!(!s.title.trim().is_empty());
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "timed out waiting for auto session title"
+        );
+        tokio::time::sleep(Duration::from_millis(80)).await;
+    }
+
+    switch.supervisor.shutdown_all().await;
+    srv.abort();
+}
+
+async fn start_test_server_with_paths() -> (
+    String,
+    Arc<SwitchEngine>,
+    tokio::task::JoinHandle<()>,
+    tempfile::TempDir,
+    AppPaths,
+) {
+    let tmp = tempfile::tempdir().unwrap();
+    let base = tmp.path();
+    let paths = AppPaths {
+        config_dir: base.join("config"),
+        data_dir: base.join("data"),
+        workspaces_dir: base.join("workspaces"),
+    };
+    let cfg = mock_app_config();
+    let store = Store::open(&paths.db_path()).unwrap();
+    let supervisor = AcpSupervisor::new(300);
+    let quota = Arc::new(QuotaTracker::new());
+    let exe = std::path::PathBuf::from(env!("CARGO_BIN_EXE_meta-harness"));
+    let bridge_token = "test_bridge_secret_123".to_string();
+
+    let switch = SwitchEngine::new_with_paths(
+        cfg,
+        store,
+        supervisor,
+        quota,
+        exe,
+        String::new(),
+        bridge_token,
+        paths.clone(),
+    );
+
+    let auth = AuthConfig::from_bind_and_flag("127.0.0.1:4410", None);
+    let state = AppState {
+        switch: Arc::clone(&switch),
+        auth,
+    };
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let base_url = format!("http://127.0.0.1:{port}");
+    switch
+        .set_internal_mcp_url(format!("{base_url}/internal/mcp"))
+        .await;
+
+    let app = build_router(state);
+    let handle = tokio::spawn(async move {
+        let _ = axum::serve(listener, app).await;
+    });
+
+    (base_url, switch, handle, tmp, paths)
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn standalone_archive_compact_and_storage_cleanup_lifecycle() {
+    let (base_url, switch, srv, _tmp, paths) = start_test_server_with_paths().await;
+    let http = reqwest::Client::new();
+
+    // 1. Standalone session creation with project_id == null & isolated workspace
+    let sess_resp: Value = http
+        .post(format!("{base_url}/api/sessions"))
+        .json(&json!({ "orchestrator_member": "codex" }))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert!(sess_resp["session"]["project_id"].is_null());
+    let sid = sess_resp["session"]["id"].as_str().unwrap().to_string();
+    let ws_root = paths.standalone_session_root(&sid);
+    let int_wt = std::path::PathBuf::from(
+        sess_resp["session"]["integration_wt_path"]
+            .as_str()
+            .unwrap(),
+    );
+    assert!(ws_root.join(".git").exists());
+    assert!(int_wt.exists());
+
+    let listed: Value = http
+        .get(format!("{base_url}/api/sessions"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(listed["sessions"].as_array().unwrap().len(), 1);
+    assert_eq!(listed["sessions"][0]["id"], sid);
+
+    // 2. Reject Promote on standalone session
+    let prom = http
+        .post(format!("{base_url}/api/sessions/{sid}/promote"))
+        .json(&json!({ "mode": PromoteMode::Squash }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(prom.status(), reqwest::StatusCode::BAD_REQUEST);
+
+    // 3. Archive prunes checkouts, hides from default list, unarchive restores checkout
+    let arch_resp: Value = http
+        .patch(format!("{base_url}/api/sessions/{sid}"))
+        .json(&json!({ "archived": true }))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert!(arch_resp["session"]["archived_at"].is_number());
+    assert!(!int_wt.exists());
+
+    let branch_out = std::process::Command::new("git")
+        .args(["branch", "--list", &format!("mh/{sid}/integration")])
+        .current_dir(&ws_root)
+        .output()
+        .unwrap();
+    assert!(String::from_utf8_lossy(&branch_out.stdout).contains(&format!("mh/{sid}/integration")));
+
+    let list_active: Value = http
+        .get(format!("{base_url}/api/sessions"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert!(list_active["sessions"].as_array().unwrap().is_empty());
+
+    let list_all: Value = http
+        .get(format!("{base_url}/api/sessions?include_archived=true"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(list_all["sessions"].as_array().unwrap().len(), 1);
+
+    let unarch_resp: Value = http
+        .patch(format!("{base_url}/api/sessions/{sid}"))
+        .json(&json!({ "archived": false }))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert!(unarch_resp["session"]["archived_at"].is_null());
+    assert!(int_wt.exists());
+
+    // 4. Compact updates working_summary and posts compaction message
+    http.post(format!("{base_url}/api/sessions/{sid}/messages"))
+        .json(&json!({ "content": "@codex [MOCK:WRITE path=\"note.txt\" content=\"hi\\n\"]" }))
+        .send()
+        .await
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(400)).await;
+
+    let cmp_resp: Value = http
+        .post(format!("{base_url}/api/sessions/{sid}/compact"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert!(!cmp_resp["message"]["id"].as_str().unwrap().is_empty());
+    let updated_sess = switch.store.get_session(&sid).unwrap();
+    assert!(!updated_sess.working_summary.trim().is_empty());
+
+    // 5. Storage stats + clear_caches (orphans) + delete_archived cleanup
+    let orphan_dir = paths.workspaces_dir.join("s_orphan_dir");
+    std::fs::create_dir_all(&orphan_dir).unwrap();
+    std::fs::write(orphan_dir.join("junk.bin"), vec![42u8; 4096]).unwrap();
+
+    let st_before: Value = http
+        .get(format!("{base_url}/api/storage"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(st_before["storage"]["standalone_count"], 1);
+    assert_eq!(st_before["storage"]["orphan_dirs_count"], 1);
+
+    let clear_resp: Value = http
+        .post(format!("{base_url}/api/storage/cleanup"))
+        .json(&json!({ "action": "clear_caches" }))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(clear_resp["result"]["removed_dirs"], 1);
+    assert!(!orphan_dir.exists());
+
+    // Archive again then delete archived sessions via cleanup API
+    http.patch(format!("{base_url}/api/sessions/{sid}"))
+        .json(&json!({ "archived": true }))
+        .send()
+        .await
+        .unwrap();
+    let del_arch: Value = http
+        .post(format!("{base_url}/api/storage/cleanup"))
+        .json(&json!({ "action": "delete_archived" }))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(del_arch["result"]["removed_sessions"], 1);
+    assert!(!ws_root.exists());
+    assert_eq!(del_arch["storage"]["archived_sessions_count"], 0);
 
     switch.supervisor.shutdown_all().await;
     srv.abort();

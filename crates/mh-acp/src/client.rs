@@ -20,13 +20,19 @@ use crate::protocol::{
     ClientCapabilities, ClientInfo, ContentBlock, FsCapabilities, InitializeParams,
     InitializeResult, JsonRpcNotification, JsonRpcRequest, JsonRpcResponse, LoadSessionParams,
     McpServerSpec, NewSessionParams, NewSessionResult, PromptParams, PromptResult,
-    SetConfigOptionParams, extract_update_text, parse_config_options,
+    SetConfigOptionParams, extract_update_text, parse_config_options, parse_new_session_options,
 };
 use crate::trajectory::{TrajectoryUpdate, parse_tool_update, push_update};
 
+#[derive(Debug, Clone, Default)]
+pub struct PromptTextOutput {
+    pub final_text: String,
+    pub intermediate_notes: Vec<String>,
+}
+
 #[async_trait]
 pub trait TurnStreamListener: Send + Sync {
-    async fn on_text_delta(&self, turn_id: &str, delta: String);
+    async fn on_text_delta(&self, turn_id: &str, delta: String, replace: bool);
     async fn on_thought_delta(&self, turn_id: &str, delta: String);
     async fn on_trajectory_event(&self, turn_id: &str, kind: TrajectoryEventKind, payload: Value);
     async fn on_config_options_updated(&self, options: Vec<DiscoveredConfigOption>);
@@ -36,9 +42,12 @@ struct TurnStreamAccumulator {
     turn_id: String,
     listener: Arc<dyn TurnStreamListener>,
     text_buf: String,
+    pending_replace: bool,
+    after_step_boundary: bool,
     thought_buf: String,
     trajectory_buf: Vec<TrajectoryUpdate>,
-    full_reply: String,
+    current_segment: String,
+    prior_segments: Vec<String>,
 }
 
 pub struct AcpClient {
@@ -54,6 +63,7 @@ pub struct AcpClient {
     pub agent_capabilities: RwLock<InitializeResult>,
     pub acp_session_id: RwLock<Option<String>>,
     pub config_options: RwLock<Vec<DiscoveredConfigOption>>,
+    pub latest_usage: RwLock<Option<(u64, u64)>>,
     reader_task: tokio::task::JoinHandle<()>,
     coalescer_task: tokio::task::JoinHandle<()>,
 }
@@ -129,12 +139,13 @@ impl AcpClient {
             loop {
                 interval.tick().await;
                 let _flush = flush_guard.lock().await;
-                let (turn_id, listener, text_delta, thought_delta, trajectory) = {
+                let (turn_id, listener, text_delta, replace, thought_delta, trajectory) = {
                     let mut guard = stream_for_flush.lock().await;
                     let Some(acc) = guard.as_mut() else {
                         continue;
                     };
                     if acc.text_buf.is_empty()
+                        && !acc.pending_replace
                         && acc.thought_buf.is_empty()
                         && acc.trajectory_buf.is_empty()
                     {
@@ -144,6 +155,7 @@ impl AcpClient {
                         acc.turn_id.clone(),
                         Arc::clone(&acc.listener),
                         std::mem::take(&mut acc.text_buf),
+                        std::mem::replace(&mut acc.pending_replace, false),
                         std::mem::take(&mut acc.thought_buf),
                         std::mem::take(&mut acc.trajectory_buf),
                     )
@@ -151,8 +163,8 @@ impl AcpClient {
                 if !thought_delta.is_empty() {
                     listener.on_thought_delta(&turn_id, thought_delta).await;
                 }
-                if !text_delta.is_empty() {
-                    listener.on_text_delta(&turn_id, text_delta).await;
+                if !text_delta.is_empty() || replace {
+                    listener.on_text_delta(&turn_id, text_delta, replace).await;
                 }
                 for (kind, payload) in trajectory {
                     listener.on_trajectory_event(&turn_id, kind, payload).await;
@@ -225,6 +237,7 @@ impl AcpClient {
                 agent_capabilities: RwLock::new(InitializeResult::default()),
                 acp_session_id: RwLock::new(None),
                 config_options: RwLock::new(Vec::new()),
+                latest_usage: RwLock::new(None),
                 reader_task,
                 coalescer_task,
             }
@@ -270,7 +283,7 @@ impl AcpClient {
             .await?;
         let res: NewSessionResult = serde_json::from_value(raw)?;
         *self.acp_session_id.write().await = Some(res.session_id.clone());
-        let opts = parse_config_options(&res.config_options);
+        let opts = parse_new_session_options(&res);
         *self.config_options.write().await = opts;
         Ok(res)
     }
@@ -361,7 +374,7 @@ impl AcpClient {
         turn_id: &str,
         prompt_text: &str,
         listener: Arc<dyn TurnStreamListener>,
-    ) -> Result<(PromptResult, String), AcpError> {
+    ) -> Result<(PromptResult, PromptTextOutput), AcpError> {
         let sid = self
             .acp_session_id
             .read()
@@ -379,9 +392,12 @@ impl AcpClient {
                 turn_id: turn_id.to_string(),
                 listener: Arc::clone(&listener),
                 text_buf: String::new(),
+                pending_replace: false,
+                after_step_boundary: false,
                 thought_buf: String::new(),
                 trajectory_buf: Vec::new(),
-                full_reply: String::new(),
+                current_segment: String::new(),
+                prior_segments: Vec::new(),
             });
         }
 
@@ -398,24 +414,36 @@ impl AcpClient {
 
         // Flush any remaining buffered deltas before returning
         let _flush = self.stream_flush.lock().await;
-        let (final_text_tail, final_thought_tail, full_reply, trajectory) = {
+        let (final_text_tail, replace_tail, final_thought_tail, output, trajectory) = {
             let mut guard = self.active_stream.lock().await;
             if let Some(mut acc) = guard.take() {
                 (
                     std::mem::take(&mut acc.text_buf),
+                    std::mem::replace(&mut acc.pending_replace, false),
                     std::mem::take(&mut acc.thought_buf),
-                    acc.full_reply,
+                    PromptTextOutput {
+                        final_text: acc.current_segment.trim().to_string(),
+                        intermediate_notes: acc.prior_segments,
+                    },
                     acc.trajectory_buf,
                 )
             } else {
-                (String::new(), String::new(), String::new(), Vec::new())
+                (
+                    String::new(),
+                    false,
+                    String::new(),
+                    PromptTextOutput::default(),
+                    Vec::new(),
+                )
             }
         };
         if !final_thought_tail.is_empty() {
             listener.on_thought_delta(turn_id, final_thought_tail).await;
         }
-        if !final_text_tail.is_empty() {
-            listener.on_text_delta(turn_id, final_text_tail).await;
+        if !final_text_tail.is_empty() || replace_tail {
+            listener
+                .on_text_delta(turn_id, final_text_tail, replace_tail)
+                .await;
         }
         for (kind, payload) in trajectory {
             listener.on_trajectory_event(turn_id, kind, payload).await;
@@ -427,7 +455,7 @@ impl AcpClient {
                 if res.stop_reason == "cancelled" {
                     return Err(AcpError::Cancelled);
                 }
-                Ok((res, full_reply))
+                Ok((res, output))
             }
             Err(err) => Err(err),
         }
@@ -618,8 +646,21 @@ impl AcpClient {
                 if !txt.is_empty() {
                     let mut guard = self.active_stream.lock().await;
                     if let Some(acc) = guard.as_mut() {
+                        if acc.after_step_boundary {
+                            let prev = std::mem::take(&mut acc.current_segment).trim().to_string();
+                            if !prev.is_empty() {
+                                acc.prior_segments.push(prev.clone());
+                                acc.trajectory_buf.push((
+                                    TrajectoryEventKind::Thought,
+                                    json!({ "kind": "narration", "text": prev }),
+                                ));
+                            }
+                            acc.text_buf.clear();
+                            acc.pending_replace = true;
+                            acc.after_step_boundary = false;
+                        }
                         acc.text_buf.push_str(&txt);
-                        acc.full_reply.push_str(&txt);
+                        acc.current_segment.push_str(&txt);
                     }
                 }
             }
@@ -628,16 +669,22 @@ impl AcpClient {
                 if !txt.is_empty() {
                     let mut guard = self.active_stream.lock().await;
                     if let Some(acc) = guard.as_mut() {
+                        if !acc.current_segment.trim().is_empty() {
+                            acc.after_step_boundary = true;
+                        }
                         acc.thought_buf.push_str(&txt);
                     }
                 }
             }
             "plan" => {
                 let (turn_id, listener) = {
-                    let guard = self.active_stream.lock().await;
-                    let Some(acc) = guard.as_ref() else {
+                    let mut guard = self.active_stream.lock().await;
+                    let Some(acc) = guard.as_mut() else {
                         return;
                     };
+                    if !acc.current_segment.trim().is_empty() {
+                        acc.after_step_boundary = true;
+                    }
                     (acc.turn_id.clone(), Arc::clone(&acc.listener))
                 };
                 listener
@@ -646,6 +693,9 @@ impl AcpClient {
             }
             "tool_call" | "tool_call_update" => {
                 if let Some(acc) = self.active_stream.lock().await.as_mut() {
+                    if !acc.current_segment.trim().is_empty() {
+                        acc.after_step_boundary = true;
+                    }
                     for event in parse_tool_update(update, kind == "tool_call") {
                         push_update(&mut acc.trajectory_buf, event);
                     }
@@ -662,6 +712,21 @@ impl AcpClient {
                     if let Some(l) = listener {
                         l.on_config_options_updated(parsed).await;
                     }
+                }
+            }
+            "usage_update" => {
+                let used = update
+                    .get("used")
+                    .or_else(|| update.get("usedTokens"))
+                    .and_then(Value::as_u64);
+                let size = update
+                    .get("size")
+                    .or_else(|| update.get("contextWindow"))
+                    .and_then(Value::as_u64);
+                if let (Some(u), Some(s)) = (used, size)
+                    && s > 0
+                {
+                    *self.latest_usage.write().await = Some((u, s));
                 }
             }
             _ => {}

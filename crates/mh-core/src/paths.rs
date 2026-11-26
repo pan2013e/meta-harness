@@ -1,16 +1,17 @@
 use std::path::{Component, Path, PathBuf};
 
-/// Resolved platform-standard configuration and data directories for Meta-Harness.
+/// Resolved platform-standard configuration, data, and standalone workspace directories for Meta-Harness.
 #[derive(Debug, Clone)]
 pub struct AppPaths {
     pub config_dir: PathBuf,
     pub data_dir: PathBuf,
+    pub workspaces_dir: PathBuf,
 }
 
 impl AppPaths {
     /// Resolves OS-appropriate directories on Windows (`%APPDATA%`/`%LOCALAPPDATA%`),
     /// macOS (`~/Library/Application Support`), and Linux (`$XDG_CONFIG_HOME`/`$XDG_DATA_HOME`),
-    /// honoring `MH_CONFIG_DIR` and `MH_DATA_DIR` environment overrides.
+    /// honoring `MH_CONFIG_DIR`, `MH_DATA_DIR`, and `MH_WORKSPACE_DIR` environment overrides.
     pub fn resolve() -> Self {
         let config_dir = std::env::var_os("MH_CONFIG_DIR")
             .filter(|v| !v.is_empty())
@@ -31,14 +32,29 @@ impl AppPaths {
                     .join("meta-harness")
             });
 
+        let workspaces_dir = std::env::var_os("MH_WORKSPACE_DIR")
+            .filter(|v| !v.is_empty())
+            .map(PathBuf::from)
+            .unwrap_or_else(|| {
+                dirs::home_dir()
+                    .unwrap_or_else(|| data_dir.clone())
+                    .join(".meta-harness")
+                    .join("workspaces")
+            });
+
         Self {
             config_dir,
             data_dir,
+            workspaces_dir,
         }
     }
 
     pub fn db_path(&self) -> PathBuf {
         self.data_dir.join("meta-harness.db")
+    }
+
+    pub fn standalone_session_root(&self, session_id: &str) -> PathBuf {
+        self.workspaces_dir.join(session_id)
     }
 }
 

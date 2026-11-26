@@ -1,5 +1,6 @@
 pub mod auth;
 pub mod mcp_bridge;
+pub mod pty;
 pub mod routes;
 pub mod ws;
 
@@ -35,6 +36,10 @@ pub fn build_router(state: AppState) -> Router {
         .route("/api/fs/pick-folder", post(routes::pick_fs_folder))
         .route("/api/adapters", get(routes::list_adapters))
         .route("/api/adapters/probe", get(routes::probe_adapters))
+        .route(
+            "/api/adapters/{id}/defaults",
+            patch(routes::update_adapter_defaults),
+        )
         .route("/api/quotas", get(routes::list_quotas))
         .route("/api/quotas/refresh", post(routes::refresh_quotas))
         .route(
@@ -68,10 +73,24 @@ pub fn build_router(state: AppState) -> Router {
             patch(routes::patch_memory_job).delete(routes::delete_memory_job),
         )
         .route(
+            "/api/sessions",
+            get(routes::list_standalone_sessions).post(routes::create_standalone_session),
+        )
+        .route(
             "/api/sessions/{id}",
             get(routes::get_session)
                 .patch(routes::patch_session)
                 .delete(routes::delete_session),
+        )
+        .route(
+            "/api/sessions/{id}/compact",
+            post(routes::compact_session_handler),
+        )
+        .route("/api/sessions/{id}/pty", get(pty::session_pty_ws_handler))
+        .route("/api/storage", get(routes::get_storage_handler))
+        .route(
+            "/api/storage/cleanup",
+            post(routes::cleanup_storage_handler),
         )
         .route(
             "/api/sessions/{id}/members",
@@ -80,6 +99,14 @@ pub fn build_router(state: AppState) -> Router {
         .route(
             "/api/sessions/{id}/members/{handle}",
             delete(routes::delete_session_member),
+        )
+        .route(
+            "/api/sessions/{id}/members/{handle}/config",
+            patch(routes::patch_member_config),
+        )
+        .route(
+            "/api/sessions/{id}/context",
+            get(routes::get_session_context_handler),
         )
         .route(
             "/api/sessions/{id}/messages",
@@ -109,6 +136,10 @@ pub fn build_router(state: AppState) -> Router {
         .route(
             "/api/sessions/{id}/diff",
             get(routes::get_session_diff_handler),
+        )
+        .route(
+            "/api/sessions/{id}/files/{*path}",
+            get(routes::serve_session_worktree_file),
         )
         .route(
             "/api/sessions/{id}/run-command",

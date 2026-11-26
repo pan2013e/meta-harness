@@ -8,6 +8,8 @@ pub enum SwitchError {
     Store(#[from] mh_store::StoreError),
     #[error("ACP error: {0}")]
     Acp(#[from] mh_acp::AcpError),
+    #[error("I/O error: {0}")]
+    Io(#[from] std::io::Error),
     #[error("not found: {0}")]
     NotFound(String),
     #[error("validation error: {0}")]

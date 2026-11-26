@@ -1,29 +1,24 @@
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import {
+  Archive,
+  ArchiveRestore,
   Check,
+  ChevronRight,
   ChevronsUpDown,
-  Crown,
   FolderGit2,
   FolderOpen,
-  FolderTree,
   GitBranch,
   Layers,
   MessageSquare,
   MessageSquarePlus,
+  MoreHorizontal,
   PanelLeftClose,
-  Plus,
-  RefreshCw,
+  Pencil,
+  Settings2,
+  Sparkles,
   Trash2,
-  UserPlus,
-  X,
 } from "lucide-react";
-import { api } from "../../api/client";
 import { useAppStore } from "../../store/useAppStore";
-import {
-  HarnessAvatar,
-  QuotaSnapshotSummary,
-  StatusDot,
-} from "../common/Badges";
 
 export function Sidebar() {
   const {
@@ -31,115 +26,103 @@ export function Sidebar() {
     activeProjectId,
     sessions,
     activeSession,
-    members,
-    memberStatuses,
-    adapters,
-    quotas,
     sidebarCollapsed,
     toggleSidebar,
     setFolderModalOpen,
-    openProjectWithNativeOrModal,
-    pickingFolder,
-    quotasRefreshing,
-    refreshQuotasLive,
     selectProject,
     gitInitActiveProject,
     selectSession,
     createAndSelectSession,
+    renameSession,
+    archiveSession,
     deleteSessionById,
     setSettingsOpen,
-    probes,
-    setError,
   } = useAppStore();
 
   const [projDropdownOpen, setProjDropdownOpen] = useState(false);
-  const [newSessionOpen, setNewSessionOpen] = useState(false);
-  const [personaOpen, setPersonaOpen] = useState(false);
+  const [archivedOpen, setArchivedOpen] = useState(false);
+  const [editingSessionId, setEditingSessionId] = useState<string | null>(null);
+  const [editingTitle, setEditingTitle] = useState("");
+  const [contextMenu, setContextMenu] = useState<{
+    sessionId: string;
+    x: number;
+    y: number;
+  } | null>(null);
+
+  useEffect(() => {
+    if (!contextMenu) return;
+    const onEscape = (e: KeyboardEvent) => {
+      if (e.key === "Escape") setContextMenu(null);
+    };
+    window.addEventListener("keydown", onEscape);
+    return () => window.removeEventListener("keydown", onEscape);
+  }, [contextMenu]);
 
   if (sidebarCollapsed) {
     return null;
   }
 
   const activeProject = projects.find((p) => p.id === activeProjectId) ?? null;
-  const availableAdapters = probes.filter((probe) => probe.installed).map((probe) => probe.adapter_id);
+  const activeSessions = sessions.filter((s) => s.archived_at == null);
+  const archivedSessions = sessions.filter((s) => s.archived_at != null);
+  const contextTarget = contextMenu
+    ? sessions.find((s) => s.id === contextMenu.sessionId) ?? null
+    : null;
 
-  const toggleOrchestrator = async (handle: string) => {
-    if (!activeSession) return;
-    const next = activeSession.orchestrator_member === handle ? null : handle;
-    try {
-      await api.patchSession(activeSession.id, { orchestrator_member: next });
-      if (useAppStore.getState().activeSession?.id === activeSession.id) {
-        await selectSession(activeSession.id);
-      }
-    } catch (e) {
-      setError(e instanceof Error ? e.message : String(e));
+  const startRename = (id: string, currentTitle: string) => {
+    setContextMenu(null);
+    setEditingSessionId(id);
+    setEditingTitle(currentTitle);
+  };
+
+  const commitRename = async () => {
+    const id = editingSessionId;
+    const next = editingTitle.trim();
+    setEditingSessionId(null);
+    if (id && next) {
+      await renameSession(id, next);
     }
   };
 
   return (
-    <aside className="fixed inset-y-0 left-0 z-40 w-[260px] max-w-[calc(100vw-2.5rem)] shrink-0 border-r border-line bg-panel flex flex-col h-full select-none shadow-xl lg:static lg:shadow-none">
+    <aside className="fixed inset-y-0 left-0 z-40 w-[248px] max-w-[calc(100vw-2.5rem)] shrink-0 border-r border-line bg-panel flex flex-col h-full select-none shadow-xl lg:static lg:shadow-none">
       {/* Brand Header */}
-      <div className="px-4 py-3 border-b border-line flex items-center justify-between gap-2">
+      <div className="px-4 h-14 border-b border-line flex items-center justify-between gap-2 shrink-0">
         <div className="flex items-center gap-2.5 min-w-0">
           <div className="w-7 h-7 rounded-lg bg-brand-soft border border-brand/35 flex items-center justify-center text-brand-ink shrink-0">
             <Layers className="w-4 h-4" />
           </div>
-          <div className="min-w-0">
-            <h1 className="text-[13px] font-semibold tracking-tight text-ink truncate">
-              Meta-Harness
-            </h1>
-          </div>
+          <h1 className="text-[13px] font-semibold tracking-tight text-ink truncate">
+            Meta-Harness
+          </h1>
         </div>
-        <div className="flex items-center gap-1">
-          <button
-            type="button"
-            title="Refresh live provider quotas"
-            onClick={() => void refreshQuotasLive()}
-            className="p-1.5 rounded-lg text-ink-muted hover:text-ink hover:bg-hover transition-colors"
-          >
-            <RefreshCw
-              className={`w-3.5 h-3.5 ${quotasRefreshing ? "animate-spin text-brand-ink" : ""}`}
-            />
-          </button>
-          <button
-            type="button"
-            title="Collapse sidebar (Ctrl+B)"
-            onClick={toggleSidebar}
-            className="p-1.5 rounded-lg text-ink-muted hover:text-ink hover:bg-hover transition-colors"
-          >
-            <PanelLeftClose className="w-3.5 h-3.5" />
-          </button>
-        </div>
+        <button
+          type="button"
+          title="Collapse sidebar (Ctrl+B)"
+          aria-label="Collapse sidebar"
+          onClick={toggleSidebar}
+          className="p-1.5 rounded-lg text-ink-muted hover:text-ink hover:bg-hover transition-colors"
+        >
+          <PanelLeftClose className="w-3.5 h-3.5" />
+        </button>
       </div>
 
       {/* Project Switcher */}
-      <div className="p-3 border-b border-line space-y-2">
+      <div className="p-3 border-b border-line space-y-2 shrink-0">
         <div className="flex items-center justify-between">
           <span className="text-[10.5px] uppercase tracking-wider font-semibold text-ink-muted">
             Project
           </span>
-          <div className="flex items-center gap-1">
-            <button
-              type="button"
-              title="Browse folders in modal"
-              onClick={() => setFolderModalOpen(true)}
-              className="p-1 rounded-md text-ink-muted hover:text-ink hover:bg-hover transition-colors"
-            >
-              <FolderTree className="w-3.5 h-3.5" />
-            </button>
-            <button
-              type="button"
-              disabled={pickingFolder}
-              onClick={() => void openProjectWithNativeOrModal()}
-              className="inline-flex items-center gap-1 px-2 py-0.5 rounded-md bg-brand-soft hover:bg-brand/25 text-[11px] font-medium text-brand-ink transition-colors disabled:opacity-50"
-            >
-              <FolderOpen className="w-3 h-3" />
-              <span>{pickingFolder ? "Opening..." : "Open"}</span>
-            </button>
-          </div>
+          <button
+            type="button"
+            onClick={() => setFolderModalOpen(true)}
+            className="inline-flex items-center gap-1 px-2 py-1 rounded-lg bg-brand-soft hover:bg-brand/25 border border-brand/25 text-[11px] font-medium text-brand-ink transition-colors"
+          >
+            <FolderOpen className="w-3.5 h-3.5" />
+            <span>Open</span>
+          </button>
         </div>
 
-        {/* Custom Project Dropdown */}
         <div className="relative">
           <button
             type="button"
@@ -147,9 +130,13 @@ export function Sidebar() {
             className="w-full flex items-center justify-between gap-2 rounded-xl bg-inset hover:bg-elevated border border-line px-3 py-2 text-xs text-ink transition-colors"
           >
             <span className="flex items-center gap-2 min-w-0">
-              <FolderGit2 className="w-3.5 h-3.5 text-brand-ink shrink-0" />
+              {activeProject ? (
+                <FolderGit2 className="w-3.5 h-3.5 text-brand-ink shrink-0" />
+              ) : (
+                <Sparkles className="w-3.5 h-3.5 text-brand-ink shrink-0" />
+              )}
               <span className="truncate font-medium">
-                {activeProject ? activeProject.name : "Select or open a project..."}
+                {activeProject ? activeProject.name : "Quick Sessions"}
               </span>
             </span>
             <ChevronsUpDown className="w-3.5 h-3.5 text-ink-muted shrink-0" />
@@ -162,495 +149,308 @@ export function Sidebar() {
                 onClick={() => setProjDropdownOpen(false)}
               />
               <div className="absolute left-0 right-0 mt-1.5 rounded-xl border border-line-strong bg-panel shadow-2xl p-1 z-40 max-h-60 overflow-y-auto space-y-0.5">
-                {projects.length === 0 ? (
-                  <div className="px-3 py-2 text-[11px] text-ink-muted">
-                    No projects opened yet
+                <button
+                  type="button"
+                  onClick={() => {
+                    setProjDropdownOpen(false);
+                    void selectProject(null);
+                  }}
+                  className={`w-full flex items-center justify-between gap-2 px-2.5 py-2 rounded-lg text-left text-xs transition-colors ${
+                    activeProjectId === null
+                      ? "bg-brand-soft text-ink"
+                      : "hover:bg-hover text-ink-soft"
+                  }`}
+                >
+                  <div className="min-w-0">
+                    <div className="font-medium truncate text-ink">Quick Sessions</div>
+                    <div className="text-[10px] font-mono text-ink-muted truncate">
+                      ~/.meta-harness/workspaces
+                    </div>
                   </div>
-                ) : (
-                  projects.map((p) => {
-                    const selected = p.id === activeProjectId;
-                    return (
-                      <button
-                        key={p.id}
-                        type="button"
-                        onClick={() => {
-                          setProjDropdownOpen(false);
-                          void selectProject(p.id);
-                        }}
-                        className={`w-full flex items-center justify-between gap-2 px-2.5 py-2 rounded-lg text-left text-xs transition-colors ${
-                          selected ? "bg-brand-soft text-ink" : "hover:bg-hover text-ink-soft"
-                        }`}
-                      >
-                        <div className="min-w-0">
-                          <div className="font-medium truncate text-ink">{p.name}</div>
-                          <div className="text-[10px] font-mono text-ink-muted truncate">
-                            {p.root_path}
-                          </div>
+                  {activeProjectId === null && (
+                    <Check className="w-3.5 h-3.5 text-brand-ink shrink-0" />
+                  )}
+                </button>
+
+                {projects.length > 0 && <div className="border-t border-line my-1" />}
+
+                {projects.map((p) => {
+                  const selected = p.id === activeProjectId;
+                  return (
+                    <button
+                      key={p.id}
+                      type="button"
+                      onClick={() => {
+                        setProjDropdownOpen(false);
+                        void selectProject(p.id);
+                      }}
+                      className={`w-full flex items-center justify-between gap-2 px-2.5 py-2 rounded-lg text-left text-xs transition-colors ${
+                        selected ? "bg-brand-soft text-ink" : "hover:bg-hover text-ink-soft"
+                      }`}
+                    >
+                      <div className="min-w-0">
+                        <div className="font-medium truncate text-ink">{p.name}</div>
+                        <div className="text-[10px] font-mono text-ink-muted truncate">
+                          {p.root_path}
                         </div>
-                        {selected && <Check className="w-3.5 h-3.5 text-brand-ink shrink-0" />}
-                      </button>
-                    );
-                  })
-                )}
+                      </div>
+                      {selected && <Check className="w-3.5 h-3.5 text-brand-ink shrink-0" />}
+                    </button>
+                  );
+                })}
               </div>
             </>
           )}
         </div>
 
-        {activeProject && (
-          <div className="space-y-1.5 px-0.5">
-            <div
-              className="text-[10.5px] text-ink-muted font-mono truncate"
-              title={activeProject.root_path}
+        {activeProject && !activeProject.is_git_repo && (
+          <div className="rounded-xl bg-warn-soft border border-warn/30 p-2.5 text-[11px] text-warn space-y-1.5">
+            <p>Not a Git repo — using shared-folder mode.</p>
+            <button
+              type="button"
+              onClick={() => void gitInitActiveProject()}
+              className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-lg bg-amber-500 text-zinc-950 font-semibold hover:bg-amber-400 transition-colors"
             >
-              {activeProject.root_path}
-            </div>
-            {!activeProject.is_git_repo && (
-              <div className="rounded-xl bg-warn-soft border border-warn/30 p-2.5 text-[11px] text-warn space-y-1.5">
-                <p>Not a Git repo — running in shared-folder mode.</p>
-                <button
-                  type="button"
-                  onClick={() => void gitInitActiveProject()}
-                  className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-lg bg-amber-500 text-zinc-950 font-semibold hover:bg-amber-400 transition-colors"
-                >
-                  <GitBranch className="w-3 h-3" />
-                  <span>Initialize Git for Worktrees</span>
-                </button>
+              <GitBranch className="w-3 h-3" />
+              <span>Initialize Git</span>
+            </button>
+          </div>
+        )}
+      </div>
+
+      {/* Sessions List */}
+      <div className="p-3 flex-1 overflow-y-auto space-y-2">
+        <div className="flex items-center justify-between">
+          <span className="text-[10.5px] uppercase tracking-wider font-semibold text-ink-muted">
+            Sessions
+          </span>
+          <button
+            type="button"
+            onClick={() => void createAndSelectSession("New session")}
+            className="inline-flex items-center gap-1 px-2 py-1 rounded-lg bg-brand-soft hover:bg-brand/25 border border-brand/25 text-[11px] font-medium text-brand-ink transition-colors"
+          >
+            <MessageSquarePlus className="w-3.5 h-3.5" />
+            <span>New</span>
+          </button>
+        </div>
+
+        <div className="space-y-1">
+          {activeSessions.map((s) => {
+            const active = s.id === activeSession?.id;
+            const isEditing = editingSessionId === s.id;
+            return (
+              <div
+                key={s.id}
+                onClick={() => {
+                  if (!isEditing) void selectSession(s.id);
+                }}
+                onDoubleClick={(e) => {
+                  e.stopPropagation();
+                  startRename(s.id, s.title);
+                }}
+                onContextMenu={(e) => {
+                  e.preventDefault();
+                  setContextMenu({ sessionId: s.id, x: e.clientX, y: e.clientY });
+                }}
+                className={`group flex items-center justify-between gap-1.5 rounded-xl px-2.5 py-2 text-xs cursor-pointer transition-colors ${
+                  active
+                    ? "bg-brand-soft text-ink border border-brand/30 font-medium"
+                    : "text-ink-soft hover:bg-hover hover:text-ink border border-transparent"
+                }`}
+              >
+                <span className="flex items-center gap-2 min-w-0 flex-1">
+                  <MessageSquare
+                    className={`w-3.5 h-3.5 shrink-0 ${
+                      active ? "text-brand-ink" : "text-ink-muted"
+                    }`}
+                  />
+                  {isEditing ? (
+                    <input
+                      type="text"
+                      aria-label="Session title"
+                      autoFocus
+                      value={editingTitle}
+                      onClick={(e) => e.stopPropagation()}
+                      onChange={(e) => setEditingTitle(e.target.value)}
+                      onBlur={() => void commitRename()}
+                      onKeyDown={(e) => {
+                        if (e.key === "Enter") {
+                          e.preventDefault();
+                          void commitRename();
+                        } else if (e.key === "Escape") {
+                          e.preventDefault();
+                          setEditingSessionId(null);
+                        }
+                      }}
+                      className="w-full rounded bg-inset border border-brand px-1.5 py-0.5 text-xs text-ink focus:outline-none"
+                    />
+                  ) : (
+                    <span className="truncate">{s.title}</span>
+                  )}
+                </span>
+
+                {!isEditing && (
+                  <button
+                    type="button"
+                    aria-label={`Session options for ${s.title}`}
+                    title="Rename, archive, or delete"
+                    onClick={(e) => {
+                      e.stopPropagation();
+                      const rect = e.currentTarget.getBoundingClientRect();
+                      setContextMenu({
+                        sessionId: s.id,
+                        x: rect.right,
+                        y: rect.bottom + 4,
+                      });
+                    }}
+                    className="opacity-0 group-hover:opacity-100 focus:opacity-100 text-ink-muted hover:text-ink p-0.5 transition-opacity"
+                  >
+                    <MoreHorizontal className="w-3.5 h-3.5" />
+                  </button>
+                )}
+              </div>
+            );
+          })}
+          {activeSessions.length === 0 && (
+            <p className="text-[11px] text-ink-muted px-1 py-2">
+              Send a message or click New to start a session.
+            </p>
+          )}
+        </div>
+
+        {archivedSessions.length > 0 && (
+          <div className="pt-2 border-t border-line/70 space-y-1">
+            <button
+              type="button"
+              onClick={() => setArchivedOpen((v) => !v)}
+              className="w-full flex items-center gap-1.5 px-1 py-1 text-[10.5px] font-medium text-ink-muted hover:text-ink transition-colors"
+            >
+              <ChevronRight
+                className={`w-3 h-3 transition-transform ${archivedOpen ? "rotate-90" : ""}`}
+              />
+              <span>Archived ({archivedSessions.length})</span>
+            </button>
+
+            {archivedOpen && (
+              <div className="space-y-1">
+                {archivedSessions.map((s) => (
+                  <div
+                    key={s.id}
+                    onContextMenu={(e) => {
+                      e.preventDefault();
+                      setContextMenu({ sessionId: s.id, x: e.clientX, y: e.clientY });
+                    }}
+                    className="group flex items-center justify-between gap-1.5 rounded-xl px-2.5 py-1.5 text-xs text-ink-muted hover:bg-hover hover:text-ink transition-colors"
+                  >
+                    <span className="flex items-center gap-2 min-w-0 flex-1 truncate">
+                      <Archive className="w-3 h-3 shrink-0 opacity-70" />
+                      <span className="truncate">{s.title}</span>
+                    </span>
+                    <button
+                      type="button"
+                      aria-label={`Session options for ${s.title}`}
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        const rect = e.currentTarget.getBoundingClientRect();
+                        setContextMenu({
+                          sessionId: s.id,
+                          x: rect.right,
+                          y: rect.bottom + 4,
+                        });
+                      }}
+                      className="opacity-0 group-hover:opacity-100 focus:opacity-100 text-ink-muted hover:text-ink p-0.5 transition-opacity"
+                    >
+                      <MoreHorizontal className="w-3.5 h-3.5" />
+                    </button>
+                  </div>
+                ))}
               </div>
             )}
           </div>
         )}
       </div>
 
-      {/* Sessions */}
-      <div className="p-3 border-b border-line space-y-2 max-h-48 overflow-y-auto">
-        <div className="flex items-center justify-between">
-          <span className="text-[10.5px] uppercase tracking-wider font-semibold text-ink-muted">
-            Sessions
-          </span>
-          {activeProject && (
-            <button
-              type="button"
-              onClick={() => setNewSessionOpen(true)}
-              className="inline-flex items-center gap-1 px-2 py-0.5 rounded-md hover:bg-hover text-[11px] font-medium text-brand-ink transition-colors"
-            >
-              <MessageSquarePlus className="w-3.5 h-3.5" />
-              <span>New</span>
-            </button>
-          )}
-        </div>
-
-        <div className="space-y-1">
-          {sessions.map((s) => {
-            const active = s.id === activeSession?.id;
-            return (
-              <div
-                key={s.id}
-                onClick={() => void selectSession(s.id)}
-                className={`group flex items-center justify-between gap-2 rounded-xl px-2.5 py-2 text-xs cursor-pointer transition-colors ${
-                  active
-                    ? "bg-brand-soft text-ink border border-brand/30 font-medium"
-                    : "text-ink-soft hover:bg-hover hover:text-ink border border-transparent"
-                }`}
-              >
-                <span className="flex items-center gap-2 min-w-0">
-                  <MessageSquare
-                    className={`w-3.5 h-3.5 shrink-0 ${
-                      active ? "text-brand-ink" : "text-ink-muted"
-                    }`}
-                  />
-                  <span className="truncate">{s.title}</span>
-                </span>
-                <button
-                  type="button"
-                  title="Delete session & prune worktrees"
-                  onClick={(e) => {
-                    e.stopPropagation();
-                    void deleteSessionById(s.id);
-                  }}
-                  className="opacity-0 group-hover:opacity-100 text-ink-muted hover:text-neg p-0.5 transition-opacity"
-                >
-                  <Trash2 className="w-3.5 h-3.5" />
-                </button>
-              </div>
-            );
-          })}
-          {activeProject && sessions.length === 0 && (
-            <p className="text-[11px] text-ink-muted px-1">
-              Click New to launch a group session.
-            </p>
-          )}
-        </div>
+      {/* Single Settings Button (when sidebar is visible) */}
+      <div className="p-3 border-t border-line shrink-0">
+        <button
+          type="button"
+          onClick={() => setSettingsOpen(true)}
+          className="w-full flex items-center gap-2 rounded-xl bg-elevated/70 hover:bg-hover border border-line px-3 py-2 text-xs text-ink font-medium transition-colors"
+        >
+          <Settings2 className="w-3.5 h-3.5 text-brand-ink" />
+          <span>Settings</span>
+        </button>
       </div>
 
-      {/* Group Roster + Live Quotas */}
-      <div className="p-3 flex-1 overflow-y-auto space-y-2.5">
-        <div className="flex items-center justify-between">
-          <button
-            type="button"
-            onClick={() => setSettingsOpen(true)}
-            className="text-[10.5px] uppercase tracking-wider font-semibold text-ink-muted hover:text-ink transition-colors"
+      {/* Right-Click / More Context Menu */}
+      {contextMenu && (
+        <>
+          <div
+            className="fixed inset-0 z-50"
+            onClick={() => setContextMenu(null)}
+            onContextMenu={(e) => {
+              e.preventDefault();
+              setContextMenu(null);
+            }}
+          />
+          <div
+            role="menu"
+            style={{
+              left: Math.min(contextMenu.x, Math.max(8, window.innerWidth - 170)),
+              top: Math.min(contextMenu.y, Math.max(8, window.innerHeight - 135)),
+            }}
+            className="fixed z-50 w-40 rounded-xl border border-line-strong bg-panel shadow-2xl p-1 space-y-0.5 text-xs"
           >
-            Harnesses
-          </button>
-          {activeSession && (
             <button
               type="button"
-              onClick={() => setPersonaOpen(true)}
-              className="inline-flex items-center gap-1 px-2 py-0.5 rounded-md hover:bg-hover text-[11px] font-medium text-brand-ink transition-colors"
+              role="menuitem"
+              onClick={() => {
+                if (contextTarget) startRename(contextTarget.id, contextTarget.title);
+              }}
+              className="w-full flex items-center gap-2 px-2.5 py-1.5 rounded-lg text-left text-ink hover:bg-hover transition-colors"
             >
-              <UserPlus className="w-3.5 h-3.5" />
-              <span>Persona</span>
+              <Pencil className="w-3.5 h-3.5 text-brand-ink" />
+              <span>Rename</span>
             </button>
-          )}
-        </div>
-
-        <div className="space-y-2">
-          {members.map((m) => {
-            const st = memberStatuses[m.handle];
-            const adapter = adapters[m.adapter_id];
-            const quota = quotas[m.adapter_id];
-            const isOrch = activeSession?.orchestrator_member === m.handle;
-            const probe = probes.find((item) => item.adapter_id === m.adapter_id);
-            const available = probe?.installed === true;
-            const accent = adapter?.accent_color ?? "#6366f1";
-
-            return (
-              <div
-                key={m.handle}
-                className="space-y-2 rounded-xl border border-line bg-elevated/50 p-2.5"
-              >
-                <div className="flex items-center justify-between gap-2">
-                  <div className="flex items-center gap-2.5 min-w-0">
-                    <HarnessAvatar
-                      handle={m.handle}
-                      accentColor={accent}
-                      status={st?.status}
-                      size="sm"
-                    />
-                    <div className="min-w-0">
-                      <div className="flex items-center gap-1.5">
-                        <span className="text-xs font-semibold text-ink truncate">
-                          @{m.handle}
-                        </span>
-                        {available && quota?.plan_label && (
-                          <span className="px-1.5 py-0.2 rounded bg-inset border border-line text-[9.5px] font-mono text-ink-muted">
-                            {quota.plan_label}
-                          </span>
-                        )}
-                      </div>
-                      <div className="text-[10px] text-ink-muted truncate font-mono">
-                        {m.active_model ?? m.display_name}
-                      </div>
-                    </div>
-                  </div>
-                  <button
-                    type="button"
-                    disabled={!available && !isOrch}
-                    aria-label={isOrch ? `Clear @${m.handle} as orchestrator` : `Set @${m.handle} as orchestrator`}
-                    title={
-                      isOrch
-                        ? "Session Orchestrator (click to clear)"
-                        : "Set as Session Orchestrator"
-                    }
-                    onClick={() => void toggleOrchestrator(m.handle)}
-                    className={`p-1.5 rounded-lg transition-colors ${
-                      isOrch
-                        ? "bg-warn-soft text-warn border border-warn/30"
-                        : "text-ink-muted hover:text-ink hover:bg-hover"
-                    }`}
-                  >
-                    <Crown className="w-3.5 h-3.5" />
-                  </button>
-                </div>
-
-                <div className="flex items-center justify-between gap-2">
-                  {available ? <StatusDot status={st?.status} /> : <span className="text-[11px] text-ink-muted" title={probe?.auth_hint}>Unavailable</span>}
-                  {available && m.worktree_branch && (
-                    <span
-                      className="text-[10px] font-mono text-ink-muted truncate max-w-[120px] px-1.5 py-0.5 rounded bg-inset"
-                      title={m.worktree_branch}
-                    >
-                      {m.worktree_branch.split("/").pop()}
-                    </span>
-                  )}
-                </div>
-
-                {available && quota && (
-                  <div className="pt-1.5 border-t border-line">
-                    <QuotaSnapshotSummary quota={quota} compact />
-                  </div>
-                )}
-              </div>
-            );
-          })}
-        </div>
-      </div>
-
-      {/* Modals */}
-      {newSessionOpen && (
-        <NewSessionModal
-          members={availableAdapters}
-          defaultOrch={availableAdapters.includes(activeSession?.orchestrator_member ?? "") ? activeSession?.orchestrator_member ?? "" : ""}
-          onClose={() => setNewSessionOpen(false)}
-          onCreate={async (title, orch) => {
-            await createAndSelectSession(title, orch);
-            setNewSessionOpen(false);
-          }}
-        />
-      )}
-
-      {personaOpen && activeSession && (
-        <AddPersonaModal
-          adapters={Object.keys(adapters)}
-          onClose={() => setPersonaOpen(false)}
-          onAdd={async (payload) => {
-            await api.upsertMember(activeSession.id, payload);
-            await selectSession(activeSession.id);
-            setPersonaOpen(false);
-          }}
-        />
+            <button
+              type="button"
+              role="menuitem"
+              onClick={() => {
+                const id = contextMenu.sessionId;
+                const isArchived = contextTarget?.archived_at != null;
+                setContextMenu(null);
+                void archiveSession(id, !isArchived);
+              }}
+              className="w-full flex items-center gap-2 px-2.5 py-1.5 rounded-lg text-left text-ink hover:bg-hover transition-colors"
+            >
+              {contextTarget?.archived_at != null ? (
+                <>
+                  <ArchiveRestore className="w-3.5 h-3.5 text-brand-ink" />
+                  <span>Unarchive</span>
+                </>
+              ) : (
+                <>
+                  <Archive className="w-3.5 h-3.5 text-ink-muted" />
+                  <span>Archive</span>
+                </>
+              )}
+            </button>
+            <button
+              type="button"
+              role="menuitem"
+              onClick={() => {
+                const id = contextMenu.sessionId;
+                setContextMenu(null);
+                void deleteSessionById(id);
+              }}
+              className="w-full flex items-center gap-2 px-2.5 py-1.5 rounded-lg text-left text-neg hover:bg-neg-soft transition-colors"
+            >
+              <Trash2 className="w-3.5 h-3.5" />
+              <span>Delete</span>
+            </button>
+          </div>
+        </>
       )}
     </aside>
-  );
-}
-
-function NewSessionModal({
-  members,
-  defaultOrch,
-  onClose,
-  onCreate,
-}: {
-  members: string[];
-  defaultOrch: string;
-  onClose: () => void;
-  onCreate: (title: string, orchestrator: string | null) => Promise<void>;
-}) {
-  const [title, setTitle] = useState("Feature Discussion");
-  const [orch, setOrch] = useState(defaultOrch);
-  const [err, setErr] = useState<string | null>(null);
-  const [saving, setSaving] = useState(false);
-
-  const submit = async () => {
-    setSaving(true);
-    setErr(null);
-    try {
-      await onCreate(title.trim() || "Group Session", orch.trim() || null);
-    } catch (e) {
-      setErr(e instanceof Error ? e.message : String(e));
-    } finally {
-      setSaving(false);
-    }
-  };
-
-  return (
-    <div className="fixed inset-0 z-50 bg-black/70 backdrop-blur-xs flex items-center justify-center p-4">
-      <div className="w-full max-w-sm rounded-2xl border border-line-strong bg-panel shadow-2xl p-5 space-y-4">
-        <div className="flex items-center justify-between">
-          <h2 className="text-sm font-semibold text-ink">New Group Session</h2>
-          <button
-            type="button"
-            onClick={onClose}
-            className="text-ink-muted hover:text-ink"
-          >
-            <X className="w-4 h-4" />
-          </button>
-        </div>
-
-        <div className="space-y-3 text-xs">
-          <div>
-            <label className="block text-ink-soft font-medium mb-1">Session Title</label>
-            <input
-              type="text"
-              value={title}
-              onChange={(e) => setTitle(e.target.value)}
-              className="w-full rounded-xl bg-inset border border-line focus:border-brand px-3 py-2 text-ink focus:outline-none"
-            />
-          </div>
-          <div>
-            <label className="block text-ink-soft font-medium mb-1.5">
-              Session Orchestrator
-            </label>
-            <div className="flex flex-wrap gap-1.5">
-              {members.map((m) => (
-                <button
-                  key={m}
-                  type="button"
-                  onClick={() => setOrch(m)}
-                  className={`px-2.5 py-1 rounded-lg border font-mono text-[11px] transition-colors ${
-                    orch === m
-                      ? "bg-brand-soft border-brand text-brand-ink font-semibold"
-                      : "bg-inset border-line text-ink-soft hover:bg-hover"
-                  }`}
-                >
-                  @{m}
-                </button>
-              ))}
-              <button
-                type="button"
-                onClick={() => setOrch("")}
-                className={`px-2.5 py-1 rounded-lg border text-[11px] transition-colors ${
-                  orch === ""
-                    ? "bg-brand-soft border-brand text-brand-ink font-semibold"
-                    : "bg-inset border-line text-ink-soft hover:bg-hover"
-                }`}
-              >
-                Automatic
-              </button>
-            </div>
-          </div>
-        </div>
-
-        {err && <p className="text-xs text-neg">{err}</p>}
-
-        <div className="flex justify-end gap-2 pt-1">
-          <button
-            type="button"
-            onClick={onClose}
-            className="text-xs text-ink-soft hover:text-ink px-3 py-1.5"
-          >
-            Cancel
-          </button>
-          <button
-            type="button"
-            disabled={saving}
-            onClick={() => void submit()}
-            className="px-4 py-1.5 rounded-lg bg-brand hover:bg-brand-hover disabled:opacity-50 text-xs font-medium text-white"
-          >
-            {saving ? "Creating..." : "Create"}
-          </button>
-        </div>
-      </div>
-    </div>
-  );
-}
-
-function AddPersonaModal({
-  adapters,
-  onClose,
-  onAdd,
-}: {
-  adapters: string[];
-  onClose: () => void;
-  onAdd: (payload: {
-    handle: string;
-    adapter_id: string;
-    display_name: string;
-    persona_prompt: string;
-  }) => Promise<void>;
-}) {
-  const [handle, setHandle] = useState("codex-reviewer");
-  const [adapterId, setAdapterId] = useState(adapters[0] ?? "codex");
-  const [displayName, setDisplayName] = useState("Codex Reviewer");
-  const [prompt, setPrompt] = useState(
-    "Focus strictly on security, race conditions, and test coverage."
-  );
-  const [err, setErr] = useState<string | null>(null);
-  const [saving, setSaving] = useState(false);
-
-  const submit = async () => {
-    setSaving(true);
-    setErr(null);
-    try {
-      await onAdd({
-        handle,
-        adapter_id: adapterId,
-        display_name: displayName,
-        persona_prompt: prompt,
-      });
-    } catch (e) {
-      setErr(e instanceof Error ? e.message : String(e));
-    } finally {
-      setSaving(false);
-    }
-  };
-
-  return (
-    <div className="fixed inset-0 z-50 bg-black/70 backdrop-blur-xs flex items-center justify-center p-4">
-      <div className="w-full max-w-md rounded-2xl border border-line-strong bg-panel shadow-2xl p-5 space-y-4">
-        <div className="flex items-center justify-between">
-          <h2 className="text-sm font-semibold text-ink">Add Member Persona</h2>
-          <button
-            type="button"
-            onClick={onClose}
-            className="text-ink-muted hover:text-ink"
-          >
-            <X className="w-4 h-4" />
-          </button>
-        </div>
-
-        <div className="space-y-3 text-xs">
-          <div>
-            <label className="block text-ink-soft font-medium mb-1">@handle</label>
-            <input
-              type="text"
-              value={handle}
-              onChange={(e) => setHandle(e.target.value)}
-              className="w-full rounded-xl bg-inset border border-line focus:border-brand px-3 py-2 font-mono text-ink focus:outline-none"
-            />
-          </div>
-          <div>
-            <label className="block text-ink-soft font-medium mb-1.5">
-              Harness Adapter (shared quota pool)
-            </label>
-            <div className="flex flex-wrap gap-1.5">
-              {adapters.map((a) => (
-                <button
-                  key={a}
-                  type="button"
-                  onClick={() => setAdapterId(a)}
-                  className={`px-2.5 py-1 rounded-lg border font-mono text-[11px] transition-colors ${
-                    adapterId === a
-                      ? "bg-brand-soft border-brand text-brand-ink font-semibold"
-                      : "bg-inset border-line text-ink-soft hover:bg-hover"
-                  }`}
-                >
-                  {a}
-                </button>
-              ))}
-            </div>
-          </div>
-          <div>
-            <label className="block text-ink-soft font-medium mb-1">Display Name</label>
-            <input
-              type="text"
-              value={displayName}
-              onChange={(e) => setDisplayName(e.target.value)}
-              className="w-full rounded-xl bg-inset border border-line focus:border-brand px-3 py-2 text-ink focus:outline-none"
-            />
-          </div>
-          <div>
-            <label className="block text-ink-soft font-medium mb-1">Persona Prompt</label>
-            <textarea
-              rows={3}
-              value={prompt}
-              onChange={(e) => setPrompt(e.target.value)}
-              className="w-full rounded-xl bg-inset border border-line focus:border-brand px-3 py-2 text-ink focus:outline-none"
-            />
-          </div>
-        </div>
-
-        {err && <p className="text-xs text-neg">{err}</p>}
-
-        <div className="flex justify-end gap-2 pt-1">
-          <button
-            type="button"
-            onClick={onClose}
-            className="text-xs text-ink-soft hover:text-ink px-3 py-1.5"
-          >
-            Cancel
-          </button>
-          <button
-            type="button"
-            disabled={saving}
-            onClick={() => void submit()}
-            className="inline-flex items-center gap-1.5 px-4 py-1.5 rounded-lg bg-brand hover:bg-brand-hover disabled:opacity-50 text-xs font-medium text-white"
-          >
-            <Plus className="w-3.5 h-3.5" />
-            <span>{saving ? "Adding..." : "Add Member"}</span>
-          </button>
-        </div>
-      </div>
-    </div>
   );
 }

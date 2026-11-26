@@ -29,6 +29,8 @@ clap = { workspace = true }
 rust-embed = { workspace = true }
 dunce = { workspace = true }
 dirs = { workspace = true }
+which = { workspace = true }
+portable-pty = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }

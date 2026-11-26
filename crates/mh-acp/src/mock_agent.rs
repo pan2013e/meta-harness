@@ -222,6 +222,39 @@ async fn handle_prompt(
 
     let directive_text = strip_context_blocks(&prompt_text);
 
+    if prompt_text.contains("<session_title_request>") {
+        let user_line = prompt_text
+            .lines()
+            .rev()
+            .find(|l| !l.trim().is_empty() && !l.trim_start().starts_with('<'))
+            .unwrap_or("Mock Session");
+        let words: Vec<&str> = user_line.split_whitespace().take(4).collect();
+        let title = if words.is_empty() {
+            "Mock Session Title".to_string()
+        } else {
+            words.join(" ")
+        };
+        emit_update(
+            &stdout,
+            &sid,
+            "agent_message_chunk",
+            json!({ "type": "text", "text": title }),
+        )
+        .await;
+        if let Some(id) = id {
+            write_json(
+                &stdout,
+                json!({
+                    "jsonrpc": "2.0",
+                    "id": id,
+                    "result": { "stopReason": "end_turn" }
+                }),
+            )
+            .await;
+        }
+        return;
+    }
+
     if directive_text.contains("[MOCK:429]") {
         if let Some(id) = id {
             write_json(

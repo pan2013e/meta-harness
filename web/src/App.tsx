@@ -1,8 +1,9 @@
 import { useEffect, useState } from "react";
 import { KeyRound, Loader2, X } from "lucide-react";
 import { ChatPane } from "./components/chat/ChatPane";
-import { InspectorDrawer } from "./components/drawer/InspectorDrawer";
+import { DiffReviewModal } from "./components/modals/DiffReviewModal";
 import { FolderPickerModal } from "./components/modals/FolderPickerModal";
+import { MemoryModal } from "./components/modals/MemoryModal";
 import { SettingsDialog } from "./components/modals/SettingsDialog";
 import { Sidebar } from "./components/sidebar/Sidebar";
 import { useAppStore } from "./store/useAppStore";
@@ -15,8 +16,12 @@ export function App() {
     errorBanner,
     folderModalOpen,
     settingsOpen,
+    memoryModalOpen,
+    diffModalOpen,
     setSettingsOpen,
     setFolderModalOpen,
+    setMemoryModalOpen,
+    setDiffModalOpen,
     createAndSelectProject,
     toggleSidebar,
     clearError,
@@ -30,7 +35,6 @@ export function App() {
     void init();
   }, [init]);
 
-  // Ctrl+B / Cmd+B shortcut to toggle sidebar cleanly
   useEffect(() => {
     const onKeyDown = (e: KeyboardEvent) => {
       if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === "b") {
@@ -62,7 +66,11 @@ export function App() {
           <p className="text-xs text-ink-muted leading-relaxed">
             Enter the pairing bearer token printed in the Meta-Harness server terminal.
           </p>
-          {errorBanner && <p role="alert" className="text-xs text-neg">{errorBanner}</p>}
+          {errorBanner && (
+            <p role="alert" className="text-xs text-neg">
+              {errorBanner}
+            </p>
+          )}
           <input
             type="password"
             value={tokenInput}
@@ -100,7 +108,6 @@ export function App() {
       <div className="flex-1 flex min-h-0">
         <Sidebar />
         <ChatPane />
-        <InspectorDrawer />
       </div>
 
       {folderModalOpen && (
@@ -112,6 +119,8 @@ export function App() {
         />
       )}
       {settingsOpen && <SettingsDialog onClose={() => setSettingsOpen(false)} />}
+      {memoryModalOpen && <MemoryModal onClose={() => setMemoryModalOpen(false)} />}
+      {diffModalOpen && <DiffReviewModal onClose={() => setDiffModalOpen(false)} />}
     </div>
   );
 }

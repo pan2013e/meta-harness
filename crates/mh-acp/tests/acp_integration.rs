@@ -52,8 +52,13 @@ struct CollectingListener {
 
 #[async_trait]
 impl TurnStreamListener for CollectingListener {
-    async fn on_text_delta(&self, _turn_id: &str, delta: String) {
-        self.text.lock().await.push_str(&delta);
+    async fn on_text_delta(&self, _turn_id: &str, delta: String, replace: bool) {
+        let mut g = self.text.lock().await;
+        if replace {
+            *g = delta;
+        } else {
+            g.push_str(&delta);
+        }
     }
 
     async fn on_thought_delta(&self, _turn_id: &str, delta: String) {
@@ -129,7 +134,7 @@ async fn acp_config_options_diff_capture_and_cancel() {
         thoughts: Mutex::new(String::new()),
     });
 
-    let (_, reply) = managed
+    let (_, output) = managed
         .client
         .prompt(
             "turn_1",
@@ -140,7 +145,7 @@ async fn acp_config_options_diff_capture_and_cancel() {
         .unwrap();
     *managed.active_turn_id.write().await = None;
 
-    assert!(reply.contains("mock-pro:high"));
+    assert!(output.final_text.contains("mock-pro:high"));
     assert!(wt.join("src/main.rs").exists());
     assert!(
         cb.events

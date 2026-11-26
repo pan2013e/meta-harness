@@ -283,6 +283,58 @@ pub fn parse_config_options(raw_options: &[Value]) -> Vec<DiscoveredConfigOption
     parsed
 }
 
+/// Combines `session/new.configOptions` with fallback `session/new.models` state if present.
+pub fn parse_new_session_options(res: &NewSessionResult) -> Vec<DiscoveredConfigOption> {
+    let mut opts = parse_config_options(&res.config_options);
+    let has_model = opts.iter().any(|o| {
+        o.category
+            .as_deref()
+            .is_some_and(|c| c.eq_ignore_ascii_case("model"))
+            || o.id.eq_ignore_ascii_case("model")
+    });
+    if !has_model && let Some(models_val) = res.models.as_ref() {
+        let current_value = models_val
+            .get("currentModelId")
+            .or_else(|| models_val.get("current"))
+            .and_then(|v| v.as_str())
+            .map(str::to_string);
+        let mut choices = Vec::new();
+        if let Some(arr) = models_val
+            .get("availableModels")
+            .or_else(|| models_val.get("models"))
+            .and_then(|v| v.as_array())
+        {
+            for item in arr {
+                if let Some(id) = item
+                    .get("modelId")
+                    .or_else(|| item.get("id"))
+                    .and_then(|v| v.as_str())
+                {
+                    let label = item
+                        .get("name")
+                        .or_else(|| item.get("label"))
+                        .and_then(|v| v.as_str())
+                        .unwrap_or(id);
+                    choices.push(ConfigOptionChoice {
+                        value: id.to_string(),
+                        label: label.to_string(),
+                    });
+                }
+            }
+        }
+        if current_value.is_some() || !choices.is_empty() {
+            opts.push(DiscoveredConfigOption {
+                id: "model".into(),
+                category: Some("model".into()),
+                label: Some("Model".into()),
+                current_value,
+                choices,
+            });
+        }
+    }
+    opts
+}
+
 /// Extracts text from heterogeneous ACP `session/update` content shapes
 /// (`"text"`, `{ "type": "text", "text": "..." }`, or `[ { "type": "text", ... } ]`).
 pub fn extract_update_text(content: Option<&Value>) -> String {

@@ -1,20 +1,84 @@
 import { useState, type ReactNode } from "react";
-import { Check, Copy } from "lucide-react";
+import { Check, ChevronRight, Copy, ExternalLink, FileCode2 } from "lucide-react";
+import { sessionFileUrl } from "../../api/client";
+import { useAppStore } from "../../store/useAppStore";
+
+function extractWorktreeRelativePath(rawHref: string, projectRoot?: string | null): string | null {
+  let clean = rawHref.trim();
+  if (clean.startsWith("file:///")) clean = clean.slice(8);
+  else if (clean.startsWith("file://")) clean = clean.slice(7);
+  clean = clean.replace(/\\/g, "/");
+
+  const wtMarker = ".meta-harness/worktrees/";
+  const idx = clean.toLowerCase().indexOf(wtMarker);
+  if (idx !== -1) {
+    const rest = clean.slice(idx + wtMarker.length);
+    const parts = rest.split("/");
+    if (parts.length >= 3) {
+      return parts.slice(2).join("/");
+    }
+  }
+
+  if (projectRoot) {
+    const normRoot = projectRoot.replace(/\\/g, "/").replace(/\/+$/, "");
+    if (clean.toLowerCase().startsWith(`${normRoot.toLowerCase()}/`)) {
+      return clean.slice(normRoot.length + 1);
+    }
+  }
+
+  if (clean.startsWith("./")) return clean.slice(2);
+  if (!/^[a-zA-Z]+:/.test(clean) && !clean.startsWith("/") && clean.length > 0) {
+    return clean;
+  }
+  return null;
+}
 
 /**
  * Rich zero-dependency Markdown renderer supporting fenced code/diff blocks,
- * headings, lists, blockquotes, pipe tables, inline code, links, emphasis, and @mentions.
+ * `<details><summary>` disclosure blocks, headings, lists, blockquotes,
+ * pipe tables, local worktree preview links, inline code, emphasis, and @mentions.
  */
-export function MarkdownBlock({ content }: { content: string }) {
-  const segments = splitFencedBlocks(content);
+export function MarkdownBlock({
+  content,
+  sessionId: explicitSessionId,
+}: {
+  content: string;
+  sessionId?: string | null;
+}) {
+  const storeSessionId = useAppStore((s) => s.activeSession?.id ?? null);
+  const activeProjectRoot = useAppStore((s) => {
+    const p = s.projects.find((item) => item.id === s.activeProjectId);
+    return p?.root_path ?? null;
+  });
+  const sid = explicitSessionId !== undefined ? explicitSessionId : storeSessionId;
+
+  const segments = splitFencesAndDetails(content);
 
   return (
     <div className="space-y-2.5 text-[13.5px] leading-relaxed text-ink break-words">
       {segments.map((seg, idx) =>
         seg.kind === "code" ? (
           <CodeFence key={idx} lang={seg.lang} code={seg.text} />
+        ) : seg.kind === "details" ? (
+          <details
+            key={idx}
+            className="rounded-xl border border-line bg-elevated/45 px-3 py-2 text-xs"
+          >
+            <summary className="cursor-pointer list-none flex items-center gap-1.5 font-medium text-ink-soft hover:text-ink [&::-webkit-details-marker]:hidden">
+              <ChevronRight className="w-3.5 h-3.5 text-ink-muted shrink-0 details-chevron" />
+              <span>{seg.summary}</span>
+            </summary>
+            <div className="mt-2 pt-2 border-t border-line text-ink-soft">
+              <MarkdownProse text={seg.body} sessionId={sid} projectRoot={activeProjectRoot} />
+            </div>
+          </details>
         ) : (
-          <MarkdownProse key={idx} text={seg.text} />
+          <MarkdownProse
+            key={idx}
+            text={seg.text}
+            sessionId={sid}
+            projectRoot={activeProjectRoot}
+          />
         )
       )}
     </div>
@@ -78,32 +142,64 @@ function CodeFence({ lang, code }: { lang: string; code: string }) {
   );
 }
 
-function splitFencedBlocks(
-  text: string
-): Array<{ kind: "text"; text: string } | { kind: "code"; lang: string; text: string }> {
-  const parts: Array<
-    { kind: "text"; text: string } | { kind: "code"; lang: string; text: string }
-  > = [];
-  const regex = /```([a-zA-Z0-9_-]*)\r?\n([\s\S]*?)```/g;
+type BlockSegment =
+  | { kind: "text"; text: string }
+  | { kind: "code"; lang: string; text: string }
+  | { kind: "details"; summary: string; body: string };
+
+function splitFencesAndDetails(text: string): BlockSegment[] {
+  const out: BlockSegment[] = [];
+  const fenceRegex = /```([a-zA-Z0-9_-]*)\r?\n([\s\S]*?)```/g;
   let last = 0;
   let m: RegExpExecArray | null;
-  while ((m = regex.exec(text)) !== null) {
-    if (m.index > last) {
-      parts.push({ kind: "text", text: text.slice(last, m.index) });
+
+  const pushProseWithDetails = (chunk: string) => {
+    if (!chunk) return;
+    const detailsRegex =
+      /<details(?:\s+open)?>\s*<summary>([\s\S]*?)<\/summary>([\s\S]*?)<\/details>/gi;
+    let dLast = 0;
+    let dm: RegExpExecArray | null;
+    while ((dm = detailsRegex.exec(chunk)) !== null) {
+      if (dm.index > dLast) {
+        out.push({ kind: "text", text: chunk.slice(dLast, dm.index) });
+      }
+      out.push({
+        kind: "details",
+        summary: dm[1].trim() || "Details",
+        body: dm[2].trim(),
+      });
+      dLast = dm.index + dm[0].length;
     }
-    parts.push({ kind: "code", lang: m[1] || "", text: m[2].replace(/\r?\n$/, "") });
+    if (dLast < chunk.length) {
+      out.push({ kind: "text", text: chunk.slice(dLast) });
+    }
+  };
+
+  while ((m = fenceRegex.exec(text)) !== null) {
+    if (m.index > last) {
+      pushProseWithDetails(text.slice(last, m.index));
+    }
+    out.push({ kind: "code", lang: m[1] || "", text: m[2].replace(/\r?\n$/, "") });
     last = m.index + m[0].length;
   }
   if (last < text.length) {
-    parts.push({ kind: "text", text: text.slice(last) });
+    pushProseWithDetails(text.slice(last));
   }
-  if (parts.length === 0) {
-    parts.push({ kind: "text", text });
+  if (out.length === 0) {
+    out.push({ kind: "text", text });
   }
-  return parts;
+  return out;
 }
 
-function MarkdownProse({ text }: { text: string }) {
+function MarkdownProse({
+  text,
+  sessionId,
+  projectRoot,
+}: {
+  text: string;
+  sessionId: string | null;
+  projectRoot: string | null;
+}) {
   const lines = text.split(/\r?\n/);
   const nodes: ReactNode[] = [];
   let i = 0;
@@ -116,14 +212,12 @@ function MarkdownProse({ text }: { text: string }) {
       continue;
     }
 
-    // Horizontal rule
     if (/^\s*(?:---|\*\*\*|___)\s*$/.test(line)) {
       nodes.push(<hr key={i} className="border-line my-2" />);
       i += 1;
       continue;
     }
 
-    // Headings (#, ##, ###)
     const headingMatch = line.match(/^(#{1,3})\s+(.+)$/);
     if (headingMatch) {
       const level = headingMatch[1].length;
@@ -135,14 +229,13 @@ function MarkdownProse({ text }: { text: string }) {
             : "text-[13.5px] font-semibold text-ink-soft mt-1";
       nodes.push(
         <div key={i} className={cls}>
-          {renderInline(headingMatch[2])}
+          {renderInline(headingMatch[2], sessionId, projectRoot)}
         </div>
       );
       i += 1;
       continue;
     }
 
-    // Blockquote
     if (line.trimStart().startsWith("> ")) {
       const quoteLines: string[] = [];
       while (i < lines.length && lines[i].trimStart().startsWith("> ")) {
@@ -155,14 +248,13 @@ function MarkdownProse({ text }: { text: string }) {
           className="border-l-2 border-brand pl-3 py-0.5 text-ink-soft italic space-y-1"
         >
           {quoteLines.map((q, qi) => (
-            <div key={qi}>{renderInline(q)}</div>
+            <div key={qi}>{renderInline(q, sessionId, projectRoot)}</div>
           ))}
         </blockquote>
       );
       continue;
     }
 
-    // Pipe Table
     if (
       line.includes("|") &&
       i + 1 < lines.length &&
@@ -189,7 +281,7 @@ function MarkdownProse({ text }: { text: string }) {
               <tr>
                 {headers.map((h, hi) => (
                   <th key={hi} className="px-2.5 py-1.5 font-semibold">
-                    {renderInline(h)}
+                    {renderInline(h, sessionId, projectRoot)}
                   </th>
                 ))}
               </tr>
@@ -199,7 +291,7 @@ function MarkdownProse({ text }: { text: string }) {
                 <tr key={ri} className="hover:bg-hover/40">
                   {headers.map((_, ci) => (
                     <td key={ci} className="px-2.5 py-1.5 text-ink-soft">
-                      {renderInline(r[ci] ?? "")}
+                      {renderInline(r[ci] ?? "", sessionId, projectRoot)}
                     </td>
                   ))}
                 </tr>
@@ -211,7 +303,6 @@ function MarkdownProse({ text }: { text: string }) {
       continue;
     }
 
-    // Unordered list
     if (/^\s*[-*]\s+/.test(line)) {
       const items: string[] = [];
       while (i < lines.length && /^\s*[-*]\s+/.test(lines[i])) {
@@ -221,14 +312,13 @@ function MarkdownProse({ text }: { text: string }) {
       nodes.push(
         <ul key={i} className="list-disc pl-5 space-y-1 text-ink">
           {items.map((it, ii) => (
-            <li key={ii}>{renderInline(it)}</li>
+            <li key={ii}>{renderInline(it, sessionId, projectRoot)}</li>
           ))}
         </ul>
       );
       continue;
     }
 
-    // Ordered list
     if (/^\s*\d+\.\s+/.test(line)) {
       const items: string[] = [];
       while (i < lines.length && /^\s*\d+\.\s+/.test(lines[i])) {
@@ -238,14 +328,13 @@ function MarkdownProse({ text }: { text: string }) {
       nodes.push(
         <ol key={i} className="list-decimal pl-5 space-y-1 text-ink">
           {items.map((it, ii) => (
-            <li key={ii}>{renderInline(it)}</li>
+            <li key={ii}>{renderInline(it, sessionId, projectRoot)}</li>
           ))}
         </ol>
       );
       continue;
     }
 
-    // Paragraph (gather contiguous normal lines)
     const para: string[] = [];
     while (
       i < lines.length &&
@@ -261,7 +350,7 @@ function MarkdownProse({ text }: { text: string }) {
     }
     nodes.push(
       <div key={i} className="whitespace-pre-wrap">
-        {renderInline(para.join("\n"))}
+        {renderInline(para.join("\n"), sessionId, projectRoot)}
       </div>
     );
   }
@@ -269,8 +358,11 @@ function MarkdownProse({ text }: { text: string }) {
   return <div className="space-y-2">{nodes}</div>;
 }
 
-function renderInline(text: string): ReactNode[] {
-  // 1. Split inline code spans first so @mentions or ** inside code aren't parsed
+function renderInline(
+  text: string,
+  sessionId: string | null,
+  projectRoot: string | null
+): ReactNode[] {
   const chunks = text.split(/(`[^`]+`)/g);
   return chunks.map((chunk, i) => {
     if (chunk.startsWith("`") && chunk.endsWith("`") && chunk.length >= 2) {
@@ -284,9 +376,8 @@ function renderInline(text: string): ReactNode[] {
       );
     }
 
-    // 2. Parse bold, links, and @mentions outside code spans
     const richRegex =
-      /(\*\*[^*\n]+\*\*|\[[^\]]+\]\((?:https?:\/\/|file:\/\/)[^)\s]+\)|\B@[a-zA-Z0-9_-]+(?:\[[a-zA-Z0-9._:-]+\])?)/g;
+      /(\*\*[^*\n]+\*\*|\[[^\]]+\]\([^)\s]+\)|\B@[a-zA-Z0-9_-]+(?:\[[a-zA-Z0-9._:-]+\])?)/g;
     const parts = chunk.split(richRegex);
     return (
       <span key={i}>
@@ -299,18 +390,48 @@ function renderInline(text: string): ReactNode[] {
               </strong>
             );
           }
-          const linkMatch = tok.match(/^\[([^\]]+)\]\(((?:https?:\/\/|file:\/\/)[^)\s]+)\)$/);
+          const linkMatch = tok.match(/^\[([^\]]+)\]\(([^)\s]+)\)$/);
           if (linkMatch) {
+            const [, label, rawHref] = linkMatch;
+            if (/^https?:\/\//i.test(rawHref)) {
+              return (
+                <a
+                  key={j}
+                  href={rawHref}
+                  target="_blank"
+                  rel="noreferrer"
+                  className="text-brand-ink underline decoration-brand/40 hover:decoration-brand"
+                >
+                  {label}
+                </a>
+              );
+            }
+            const rel = extractWorktreeRelativePath(rawHref, projectRoot);
+            if (rel && sessionId) {
+              return (
+                <a
+                  key={j}
+                  href={sessionFileUrl(sessionId, rel)}
+                  target="_blank"
+                  rel="noreferrer"
+                  title={rawHref}
+                  className="inline-flex items-center gap-1 px-1.5 py-0.2 rounded-md bg-brand-soft text-brand-ink hover:underline font-medium text-[12.5px]"
+                >
+                  <FileCode2 className="w-3 h-3 shrink-0" />
+                  <span>{label}</span>
+                  <ExternalLink className="w-2.5 h-2.5 shrink-0 opacity-75" />
+                </a>
+              );
+            }
             return (
-              <a
+              <span
                 key={j}
-                href={linkMatch[2]}
-                target="_blank"
-                rel="noreferrer"
-                className="text-brand-ink underline decoration-brand/40 hover:decoration-brand"
+                title={rawHref}
+                className="inline-flex items-center gap-1 px-1.5 py-0.2 rounded-md bg-elevated border border-line text-ink-soft font-mono text-[11.5px]"
               >
-                {linkMatch[1]}
-              </a>
+                <FileCode2 className="w-3 h-3 shrink-0" />
+                <span>{label}</span>
+              </span>
             );
           }
           if (tok.startsWith("@")) {

@@ -269,10 +269,19 @@ export function QuotaSnapshotSummary({
         <div className="flex items-center justify-between gap-2 text-[10px] text-ink-muted pt-0.5">
           {quota.status_note && <span className="truncate">{quota.status_note}</span>}
           {quota.credits_label && (
-            <span className="font-mono text-ink-soft shrink-0">{quota.credits_label}</span>
+            <span className="font-mono text-ink-soft shrink-0">
+              {formatCreditsDisplay(quota.credits_label)}
+            </span>
           )}
         </div>
       )}
     </div>
   );
+}
+
+export function formatCreditsDisplay(raw: string): string {
+  return raw.replace(/Credits:\s*(-?\d+(?:\.\d+)?)/i, (_, num) => {
+    const parsed = Number(num);
+    return Number.isFinite(parsed) ? `Credits: ${Math.round(parsed)}` : `Credits: ${num}`;
+  });
 }

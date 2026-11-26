@@ -27,6 +27,19 @@ export const asRecord = (value: unknown): Record<string, unknown> =>
 
 const asText = (value: unknown) => typeof value === "string" ? value : undefined;
 
+export function cleanWorktreePath(raw: string): string {
+  const slash = raw.replace(/\\/g, "/");
+  const idx = slash.toLowerCase().indexOf(".meta-harness/worktrees/");
+  if (idx !== -1) {
+    const rest = slash.slice(idx + ".meta-harness/worktrees/".length);
+    const parts = rest.split("/");
+    if (parts.length >= 3) {
+      return parts.slice(2).join("/");
+    }
+  }
+  return slash;
+}
+
 /** Groups ACP tool patches, including Codex's terminal metadata in previously saved turns. */
 export function groupTrajectoryEvents(events: TrajectoryEvent[]): TrajectoryEntry[] {
   const entries: TrajectoryEntry[] = [];
@@ -85,7 +98,10 @@ export function groupTrajectoryEvents(events: TrajectoryEvent[]): TrajectoryEntr
     }
 
     if (kind === "diff" && typeof payload.diff === "string") {
-      tool.edits.push({ path: asText(payload.path) ?? "File edit", diff: payload.diff });
+      tool.edits.push({
+        path: cleanWorktreePath(asText(payload.path) ?? "File edit"),
+        diff: payload.diff,
+      });
     }
     if (Array.isArray(payload.content)) {
       const content: string[] = [];
@@ -94,7 +110,11 @@ export function groupTrajectoryEvents(events: TrajectoryEvent[]): TrajectoryEntr
         const text = asText(asRecord(block.content).text ?? block.text);
         if (text) content.push(text);
         if (block.type === "diff" && typeof block.path === "string") {
-          tool.edits.push({ path: block.path, before: asText(block.oldText), after: asText(block.newText) });
+          tool.edits.push({
+            path: cleanWorktreePath(block.path),
+            before: asText(block.oldText),
+            after: asText(block.newText),
+          });
         }
       }
       tool.content = content;

@@ -286,11 +286,19 @@ pub async fn ensure_session_integration_worktree(
             tokio::fs::create_dir_all(parent).await?;
         }
         let wt_str = dunce::simplified(&wt_path).to_string_lossy().into_owned();
-        let (ok, _, err) = run_git(
-            project_root,
-            &["worktree", "add", "-B", &branch, &wt_str, &base_sha],
-        )
-        .await?;
+        let branch_ref = format!("refs/heads/{branch}");
+        let branch_exists = run_git(project_root, &["rev-parse", "--verify", &branch_ref])
+            .await
+            .is_ok_and(|(ok, _, _)| ok);
+        let (ok, _, err) = if branch_exists {
+            run_git(project_root, &["worktree", "add", &wt_str, &branch]).await?
+        } else {
+            run_git(
+                project_root,
+                &["worktree", "add", "-B", &branch, &wt_str, &base_sha],
+            )
+            .await?
+        };
         if !ok {
             return Err(AcpError::Git(format!(
                 "failed to create integration worktree: {err}"
@@ -498,12 +506,91 @@ pub async fn compute_numstat_between(
     (stat, files)
 }
 
+/// Auto-commits any uncommitted changes in `wt_path` and returns the resulting commit SHA,
+/// cumulative diff stats against the prior HEAD, and list of touched files.
+pub async fn commit_worktree_if_dirty(
+    wt_path: &Path,
+    handle: &str,
+    summary: &str,
+) -> Result<Option<(String, DiffStat, Vec<String>)>, AcpError> {
+    let (ok, dirty, _) = run_git(wt_path, &["status", "--porcelain"]).await?;
+    if !ok || dirty.is_empty() {
+        return Ok(None);
+    }
+
+    let _ = ensure_git_exclude(wt_path).await;
+    let prev_sha = get_head_sha(wt_path).await;
+
+    let (add_ok, _, add_err) = run_git(wt_path, &["add", "-A"]).await?;
+    if !add_ok {
+        return Err(AcpError::Git(format!("git add failed: {add_err}")));
+    }
+
+    let short_sum: String = summary
+        .lines()
+        .next()
+        .unwrap_or("worktree updates")
+        .chars()
+        .take(64)
+        .collect();
+    let commit_msg = if short_sum.trim().is_empty() {
+        format!("mh({handle}): turn updates")
+    } else {
+        format!("mh({handle}): {short_sum}")
+    };
+
+    let (commit_ok, _, commit_err) =
+        run_git_with_author(wt_path, &["commit", "-m", &commit_msg]).await?;
+    if !commit_ok {
+        if commit_err.contains("nothing to commit") {
+            return Ok(None);
+        }
+        return Err(AcpError::Git(format!("git commit failed: {commit_err}")));
+    }
+
+    let new_sha = get_head_sha(wt_path).await.unwrap_or_default();
+    let (stat, files) = if let Some(prev) = prev_sha.as_deref()
+        && !new_sha.is_empty()
+    {
+        compute_numstat_between(wt_path, prev, &new_sha).await
+    } else {
+        (DiffStat::default(), Vec::new())
+    };
+
+    Ok(Some((new_sha, stat, files)))
+}
+
+/// Resets an integration worktree to match a newly promoted commit SHA so subsequent
+/// session diffs measure cleanly from the promoted state.
+pub async fn reset_worktree_to_sha(wt_path: &Path, sha: &str) -> Result<(), AcpError> {
+    let (ok, _, err) = run_git(wt_path, &["reset", "--hard", sha]).await?;
+    if !ok {
+        return Err(AcpError::Git(format!(
+            "failed to reset worktree to {sha}: {err}"
+        )));
+    }
+    Ok(())
+}
+
 pub async fn get_session_diff(
+    project_root: &Path,
     integration_wt: &Path,
-    base_branch_or_sha: &str,
+    base_branch: Option<&str>,
+    base_commit_sha: Option<&str>,
     integration_branch: &str,
 ) -> Result<SessionDiffReport, AcpError> {
-    let range = format!("{base_branch_or_sha}..{integration_branch}");
+    // Prefer the current tip of `base_branch` in `project_root` so promotions/commits on `main`
+    // immediately update the comparison baseline.
+    let resolved_base_sha = if let Some(br) = base_branch {
+        match run_git(project_root, &["rev-parse", "--verify", br]).await {
+            Ok((true, sha, _)) if !sha.is_empty() => sha,
+            _ => base_commit_sha.unwrap_or("HEAD").to_string(),
+        }
+    } else {
+        base_commit_sha.unwrap_or("HEAD").to_string()
+    };
+
+    let range = format!("{resolved_base_sha}..{integration_branch}");
     let (cnt_ok, cnt_out, _) = run_git(integration_wt, &["rev-list", "--count", &range]).await?;
     let ahead_commits: u32 = if cnt_ok {
         cnt_out.parse().unwrap_or(0)
@@ -511,9 +598,8 @@ pub async fn get_session_diff(
         0
     };
 
-    let (diff_stat, _) =
-        compute_numstat_between(integration_wt, base_branch_or_sha, integration_branch).await;
-    let output = git_output(integration_wt, &["diff", &range, "--"]).await?;
+    let (diff_stat, _) = compute_numstat_vs_wt(integration_wt, &resolved_base_sha).await;
+    let output = git_output(integration_wt, &["diff", &resolved_base_sha, "--"]).await?;
     if !output.status.success() {
         return Err(AcpError::Git(
             String::from_utf8_lossy(&output.stderr).into_owned(),
@@ -531,12 +617,39 @@ pub async fn get_session_diff(
 
     Ok(SessionDiffReport {
         integration_branch: integration_branch.to_string(),
-        base_branch: base_branch_or_sha.to_string(),
+        base_branch: base_branch.unwrap_or(&resolved_base_sha).to_string(),
         ahead_commits,
         diff_stat,
         unified_diff,
         truncated,
     })
+}
+
+async fn compute_numstat_vs_wt(repo_dir: &Path, base_ref: &str) -> (DiffStat, Vec<String>) {
+    let Ok((ok, out, _)) = run_git(repo_dir, &["diff", "--numstat", base_ref, "--"]).await else {
+        return (DiffStat::default(), Vec::new());
+    };
+    if !ok {
+        return (DiffStat::default(), Vec::new());
+    }
+    parse_numstat_lines(&out)
+}
+
+fn parse_numstat_lines(out: &str) -> (DiffStat, Vec<String>) {
+    let mut stat = DiffStat::default();
+    let mut files = Vec::new();
+    for line in out.lines() {
+        let parts: Vec<&str> = line.split('\t').collect();
+        if parts.len() == 3 {
+            let ins = parts[0].parse::<u32>().unwrap_or(0);
+            let del = parts[1].parse::<u32>().unwrap_or(0);
+            stat.files_changed += 1;
+            stat.insertions += ins;
+            stat.deletions += del;
+            files.push(parts[2].to_string());
+        }
+    }
+    (stat, files)
 }
 
 pub async fn promote_session(
@@ -666,7 +779,9 @@ pub async fn promote_session(
     }
 }
 
-pub async fn prune_session_worktrees(
+/// Removes `.meta-harness/worktrees/<sid>` checkouts on disk while preserving
+/// session Git branches (`refs/heads/mh/<sid>/*`) so archived sessions can be restored.
+pub async fn prune_session_worktree_checkouts(
     project_root: &Path,
     session_id: &str,
 ) -> Result<(), AcpError> {
@@ -704,7 +819,20 @@ pub async fn prune_session_worktrees(
     }
 
     let _ = run_git(project_root, &["worktree", "prune"]).await;
+    Ok(())
+}
 
+pub async fn prune_session_worktrees(
+    project_root: &Path,
+    session_id: &str,
+) -> Result<(), AcpError> {
+    prune_session_worktree_checkouts(project_root, session_id).await?;
+    let status = inspect_repo(project_root).await;
+    if !status.is_git_repo {
+        return Ok(());
+    }
+
+    let sid = sanitize_ref_component(session_id);
     let ref_prefix = format!("refs/heads/mh/{sid}/");
     if let Ok((ok, branches, _)) = run_git(
         project_root,
@@ -743,9 +871,15 @@ mod tests {
                 .0
         );
 
-        let diff = get_session_diff(&int.path, &int.base_commit_sha, &int.branch)
-            .await
-            .unwrap();
+        let diff = get_session_diff(
+            root,
+            &int.path,
+            Some(base),
+            Some(&int.base_commit_sha),
+            &int.branch,
+        )
+        .await
+        .unwrap();
         assert!(diff.unified_diff.ends_with("+new value \n"));
 
         assert!(run_git(root, &["checkout", "-b", "other"]).await.unwrap().0);
@@ -896,5 +1030,57 @@ mod tests {
 
         prune_session_worktrees(root, "s_test1").await.unwrap();
         assert!(!root.join(".meta-harness/worktrees/s_test1").exists());
+    }
+
+    #[tokio::test]
+    async fn dirty_commit_and_squash_promote_reset_clears_diff() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::write(root.join("README.md"), "# Init\n").unwrap();
+        init_git_repo(root).await.unwrap();
+
+        let int = ensure_session_integration_worktree(root, "s_orch")
+            .await
+            .unwrap();
+        let base = int.base_branch.as_deref().unwrap_or("main");
+
+        // Orchestrator writes directly inside `_integration`
+        std::fs::write(int.path.join("index.html"), "<h1>Hi</h1>\n").unwrap();
+        let committed = commit_worktree_if_dirty(&int.path, "codex", "Build index page")
+            .await
+            .unwrap();
+        assert!(committed.is_some());
+
+        let before = get_session_diff(
+            root,
+            &int.path,
+            Some(base),
+            Some(&int.base_commit_sha),
+            &int.branch,
+        )
+        .await
+        .unwrap();
+        assert_eq!(before.ahead_commits, 1);
+        assert_eq!(before.diff_stat.files_changed, 1);
+        assert!(before.unified_diff.contains("index.html"));
+
+        let promoted = promote_session(
+            root,
+            base,
+            &int.base_commit_sha,
+            &int.branch,
+            PromoteMode::Squash,
+        )
+        .await
+        .unwrap();
+        let new_sha = promoted.new_head_sha.unwrap();
+        reset_worktree_to_sha(&int.path, &new_sha).await.unwrap();
+
+        let after = get_session_diff(root, &int.path, Some(base), Some(&new_sha), &int.branch)
+            .await
+            .unwrap();
+        assert_eq!(after.ahead_commits, 0);
+        assert_eq!(after.diff_stat.files_changed, 0);
+        assert!(after.unified_diff.trim().is_empty());
     }
 }

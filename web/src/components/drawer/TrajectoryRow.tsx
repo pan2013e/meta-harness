@@ -54,10 +54,11 @@ export const TrajectoryRow = memo(function TrajectoryRow({ entry }: { entry: Tra
   const { payload } = event;
   if (event.event_kind === "diff" && typeof payload.diff === "string") return <DiffViewer diffText={payload.diff} />;
   const plan = event.event_kind === "plan" && Array.isArray(payload.entries) ? payload.entries.map(asRecord) : null;
+  const label = payload.kind === "narration" ? "Progress note" : event.event_kind.replaceAll("_", " ");
   return (
-    <div className="space-y-2 rounded-xl border border-line bg-elevated/40 px-3 py-2.5 text-xs">
+    <div className="space-y-1.5 rounded-xl border border-line bg-elevated/40 px-3 py-2 text-xs">
       <div className="flex items-center justify-between gap-2 text-ink-muted">
-        <span className="font-medium capitalize">{event.event_kind.replaceAll("_", " ")}</span>
+        <span className="font-medium capitalize">{label}</span>
         <time className="text-[10px]">{new Date(event.created_at).toLocaleTimeString()}</time>
       </div>
       {plan ? (

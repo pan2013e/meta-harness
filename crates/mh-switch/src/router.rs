@@ -10,16 +10,20 @@ use tracing::warn;
 
 use mh_acp::{
     AcpError, AcpSupervisor, BrokerCallbacks, MemberSpawnSpec, MergeOutcome, PermissionResolution,
-    QuotaTracker, TurnStreamListener, build_mcp_bridge_spec, ensure_member_worktree,
-    ensure_session_integration_worktree, get_head_sha, integrate_member_turn,
-    probe_installed_adapters, sync_member_worktree,
+    QuotaTracker, TurnStreamListener, build_mcp_bridge_spec, builtin_adapter_catalog,
+    commit_worktree_if_dirty, ensure_member_worktree, ensure_session_integration_worktree,
+    get_head_sha, get_session_diff, init_git_repo, integrate_member_turn, probe_installed_adapters,
+    sync_member_worktree,
 };
 use mh_core::{
-    AppConfig, ChatMessage, DiffStat, DiscoveredConfigOption, DispatchTaskSpec, IsolationMode,
-    MemberRole, MemberStatus, MessageKind, PendingPermissionView, SenderKind, Session,
-    SessionMember, TrajectoryEventKind, TurnStatus, WaitForGraph, WsEvent, parse_mentions,
+    AppConfig, AppPaths, ChatMessage, DiffStat, DiscoveredConfigOption, DispatchTaskSpec,
+    IsolationMode, MemberContextBreakdown, MemberRole, MemberStatus, MessageKind,
+    PendingPermissionView, SenderKind, Session, SessionContextReport, SessionMember,
+    TrajectoryEventKind, TurnStatus, WaitForGraph, WsEvent, parse_mentions,
 };
-use mh_store::{NewMessageParams, RecordEpisodicJobParams, StartTrajectoryParams, Store};
+use mh_store::{
+    NewMessageParams, PatchSessionParams, RecordEpisodicJobParams, StartTrajectoryParams, Store,
+};
 
 use crate::SwitchError;
 use crate::orchestrator::{
@@ -115,6 +119,7 @@ pub struct SwitchEngine {
     pub self_exe: PathBuf,
     pub internal_mcp_url: RwLock<String>,
     pub bridge_token: String,
+    pub app_paths: AppPaths,
     runtimes: Mutex<HashMap<String, Arc<SessionRuntime>>>,
 }
 
@@ -128,6 +133,29 @@ impl SwitchEngine {
         internal_mcp_url: String,
         bridge_token: String,
     ) -> Arc<Self> {
+        Self::new_with_paths(
+            config,
+            store,
+            supervisor,
+            quota,
+            self_exe,
+            internal_mcp_url,
+            bridge_token,
+            AppPaths::resolve(),
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_with_paths(
+        config: AppConfig,
+        store: Store,
+        supervisor: Arc<AcpSupervisor>,
+        quota: Arc<QuotaTracker>,
+        self_exe: PathBuf,
+        internal_mcp_url: String,
+        bridge_token: String,
+        app_paths: AppPaths,
+    ) -> Arc<Self> {
         let (events_tx, _) = broadcast::channel(1024);
         Arc::new(Self {
             config: RwLock::new(config),
@@ -138,8 +166,17 @@ impl SwitchEngine {
             self_exe,
             internal_mcp_url: RwLock::new(internal_mcp_url),
             bridge_token,
+            app_paths,
             runtimes: Mutex::new(HashMap::new()),
         })
+    }
+
+    pub fn resolve_session_repo_root(&self, session: &Session) -> Result<PathBuf, SwitchError> {
+        if let Some(ref pid) = session.project_id {
+            Ok(PathBuf::from(&self.store.get_project(pid)?.root_path))
+        } else {
+            Ok(self.app_paths.standalone_session_root(&session.id))
+        }
     }
 
     pub async fn set_internal_mcp_url(&self, url: String) {
@@ -211,6 +248,17 @@ impl SwitchEngine {
         session_id: &str,
         content: String,
     ) -> Result<ChatMessage, SwitchError> {
+        self.handle_user_message_with_overrides(session_id, content, None, None)
+            .await
+    }
+
+    pub async fn handle_user_message_with_overrides(
+        self: &Arc<Self>,
+        session_id: &str,
+        content: String,
+        model_override: Option<String>,
+        effort_override: Option<String>,
+    ) -> Result<ChatMessage, SwitchError> {
         let session = self.store.get_session(session_id)?;
         let members = self.store.list_members(session_id)?;
         if members.is_empty() {
@@ -218,6 +266,17 @@ impl SwitchEngine {
                 "session has no active members".into(),
             ));
         }
+
+        let clean_model = model_override
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string);
+        let clean_effort = effort_override
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string);
 
         let valid_handles: HashSet<String> = members.iter().map(|m| m.handle.clone()).collect();
         let parsed = parse_mentions(&content, &valid_handles);
@@ -259,6 +318,27 @@ impl SwitchEngine {
         }
         validate_available_targets(recipients.iter().map(String::as_str), &available)?;
 
+        let (slash_cmds, cleaned_body) = extract_workflow_slash_commands(&content);
+        if slash_cmds.iter().any(|c| c == "compact") {
+            let notice = self.compact_session(session_id).await?;
+            if cleaned_body.trim().is_empty() {
+                return Ok(notice);
+            }
+        }
+        let directive_prefix = build_slash_directive_prefix(&slash_cmds);
+        let dispatch_content = if directive_prefix.is_empty() {
+            content.clone()
+        } else {
+            format!("{directive_prefix}\n{content}")
+        };
+
+        let is_first_user_msg = self
+            .store
+            .list_messages(session_id, None, 20)
+            .map(|msgs| !msgs.iter().any(|m| m.sender_kind == SenderKind::User))
+            .unwrap_or(false);
+        let should_auto_title = is_first_user_msg && session.title == "New session";
+
         let user_msg = self.store.append_message(NewMessageParams {
             id: None,
             session_id: session_id.to_string(),
@@ -291,12 +371,22 @@ impl SwitchEngine {
         let tasks: Vec<(DispatchTaskSpec, TurnPurpose)> =
             if parsed.has_orchestrator || parsed.is_unmentioned() {
                 if let Some(orch) = orchestrator {
+                    let brief = if clean_model.is_some() || clean_effort.is_some() {
+                        format!(
+                            "<user_model_preference model=\"{}\" effort=\"{}\"/>\n{}",
+                            clean_model.as_deref().unwrap_or("default"),
+                            clean_effort.as_deref().unwrap_or("default"),
+                            dispatch_content
+                        )
+                    } else {
+                        dispatch_content.clone()
+                    };
                     vec![(
                         DispatchTaskSpec {
                             target: orch.clone(),
-                            model: None,
-                            effort: None,
-                            task_brief: content,
+                            model: clean_model.clone(),
+                            effort: clean_effort.clone(),
+                            task_brief: brief,
                             mode: "parallel".into(),
                         },
                         TurnPurpose::OrchestratorTriage,
@@ -305,9 +395,9 @@ impl SwitchEngine {
                     vec![(
                         DispatchTaskSpec {
                             target: recipients[0].clone(),
-                            model: None,
-                            effort: None,
-                            task_brief: content,
+                            model: clean_model.clone(),
+                            effort: clean_effort.clone(),
+                            task_brief: dispatch_content.clone(),
                             mode: "parallel".into(),
                         },
                         TurnPurpose::Normal,
@@ -320,9 +410,9 @@ impl SwitchEngine {
                         (
                             DispatchTaskSpec {
                                 target: r,
-                                model: None,
-                                effort: None,
-                                task_brief: content.clone(),
+                                model: clean_model.clone(),
+                                effort: clean_effort.clone(),
+                                task_brief: dispatch_content.clone(),
                                 mode: "parallel".into(),
                             },
                             TurnPurpose::Normal,
@@ -337,9 +427,9 @@ impl SwitchEngine {
                         (
                             DispatchTaskSpec {
                                 target: t.handle,
-                                model: t.model_override,
-                                effort: t.effort_override,
-                                task_brief: content.clone(),
+                                model: t.model_override.or_else(|| clean_model.clone()),
+                                effort: t.effort_override.or_else(|| clean_effort.clone()),
+                                task_brief: dispatch_content.clone(),
                                 mode: "parallel".into(),
                             },
                             TurnPurpose::Normal,
@@ -347,6 +437,15 @@ impl SwitchEngine {
                     })
                     .collect()
             };
+
+        if should_auto_title {
+            let engine = Arc::clone(self);
+            let sid = session_id.to_string();
+            let raw_prompt = content;
+            tokio::spawn(async move {
+                engine.trigger_auto_session_title(&sid, &raw_prompt).await;
+            });
+        }
 
         for (task, purpose) in tasks {
             let engine = Arc::clone(self);
@@ -941,7 +1040,11 @@ impl SwitchEngine {
                 return Err(SwitchError::Cancelled);
             }
 
-            let project = self.store.get_project(&session.project_id)?;
+            let project_root = self.resolve_session_repo_root(&session)?;
+            if session.project_id.is_none() && !project_root.join(".git").exists() {
+                tokio::fs::create_dir_all(&project_root).await?;
+                let _ = init_git_repo(&project_root).await;
+            }
             let mut member = self.store.get_member(session_id, &task.target)?;
             let previous_cwd = member.worktree_path.clone();
             let cfg = self.config.read().await.clone();
@@ -963,7 +1066,6 @@ impl SwitchEngine {
                     | TurnPurpose::MemoryCuration
             );
 
-            let project_root = PathBuf::from(&project.root_path);
             let (work_cwd, work_branch) = self
                 .prepare_member_cwd(
                     &session,
@@ -1072,10 +1174,31 @@ impl SwitchEngine {
 
             *managed.active_turn_id.write().await = Some(turn_id.clone());
 
-            let wanted_model = task.model.as_deref().or(member.active_model.as_deref());
+            let adapter_pref = self
+                .store
+                .get_adapter_model_pref(&member.adapter_id)
+                .ok()
+                .flatten();
+            let wanted_model = task
+                .model
+                .as_deref()
+                .or(member.active_model.as_deref())
+                .or_else(|| {
+                    adapter_pref
+                        .as_ref()
+                        .and_then(|p| p.default_model.as_deref())
+                });
             let wanted_effort = match &purpose {
                 TurnPurpose::MemoryCuration => Some("low"),
-                _ => task.effort.as_deref().or(member.active_effort.as_deref()),
+                _ => task
+                    .effort
+                    .as_deref()
+                    .or(member.active_effort.as_deref())
+                    .or_else(|| {
+                        adapter_pref
+                            .as_ref()
+                            .and_then(|p| p.default_effort.as_deref())
+                    }),
             };
 
             let (applied_model, applied_effort) = managed
@@ -1084,12 +1207,17 @@ impl SwitchEngine {
                 .await;
 
             let new_acp_sid = managed.client.acp_session_id.read().await.clone();
+            let saved_effort = if matches!(purpose, TurnPurpose::MemoryCuration) {
+                None
+            } else {
+                applied_effort.as_deref().or(wanted_effort)
+            };
             let _ = self.store.update_member_runtime(
                 session_id,
                 &member.handle,
                 new_acp_sid.as_deref(),
                 applied_model.as_deref().or(wanted_model),
-                applied_effort.as_deref().or(wanted_effort),
+                saved_effort,
                 work_branch.as_deref(),
                 Some(dunce::simplified(&work_cwd).to_string_lossy().as_ref()),
             );
@@ -1162,6 +1290,7 @@ impl SwitchEngine {
                 callbacks: Arc::clone(&callbacks),
             });
 
+            let pre_head_sha = get_head_sha(&work_cwd).await;
             let prompt_res = managed
                 .client
                 .prompt(&turn_id, &full_prompt, stream_listener)
@@ -1173,7 +1302,9 @@ impl SwitchEngine {
                 .advance_member_last_seen(session_id, &member.handle, max_seen_seq);
 
             match prompt_res {
-                Ok((_, reply_text)) => {
+                Ok((_, prompt_output)) => {
+                    let reply_text = prompt_output.final_text;
+                    let intermediate_notes = prompt_output.intermediate_notes;
                     let approx_tokens = ((full_prompt.len() + reply_text.len()) / 4).max(20) as u64;
                     self.quota
                         .record_turn_tokens(&member.adapter_id, approx_tokens)
@@ -1218,6 +1349,7 @@ impl SwitchEngine {
                                 "model": applied_model.as_deref().or(wanted_model),
                                 "effort": applied_effort.as_deref().or(wanted_effort),
                                 "streaming": false,
+                                "intermediate_notes": intermediate_notes,
                             })),
                         )?;
                         let _ = self
@@ -1228,6 +1360,7 @@ impl SwitchEngine {
                     self.set_member_status(session_id, &member.handle, MemberStatus::Idle, None)
                         .await;
 
+                    let commit_changed = pre_head_sha != head_sha;
                     self.handle_post_turn_effects(
                         &session,
                         &project_root,
@@ -1240,8 +1373,10 @@ impl SwitchEngine {
                         &reply_text,
                         &touched,
                         &purpose,
+                        commit_changed,
                     )
                     .await;
+                    self.publish_session_context(session_id).await;
 
                     Ok((turn_id, reply_text))
                 }
@@ -1406,6 +1541,13 @@ impl SwitchEngine {
             ));
         }
 
+        if !session.working_summary.trim().is_empty() {
+            buf.push_str(&format!(
+                "<session_compacted_summary>\n{}\n</session_compacted_summary>\n",
+                session.working_summary.trim()
+            ));
+        }
+
         if !unseen.is_empty() {
             buf.push_str(&format!(
                 "<group_chat_updates session=\"{}\" your_handle=\"@{}\">\n",
@@ -1439,7 +1581,7 @@ impl SwitchEngine {
                     &self.store,
                     &cfg,
                     &self.quota,
-                    &session.project_id,
+                    session.project_id.as_deref(),
                     &members,
                     &opts,
                     task_brief,
@@ -1485,6 +1627,7 @@ impl SwitchEngine {
         reply_text: &str,
         touched_files: &[String],
         purpose: &TurnPurpose,
+        integration_committed_in_turn: bool,
     ) {
         if matches!(
             purpose,
@@ -1495,6 +1638,47 @@ impl SwitchEngine {
 
         let mut merged_files = touched_files.to_vec();
         let mut conflict_triggered = false;
+
+        // Orchestrator or conflict resolution edits directly inside `_integration` -> auto-commit & refresh diff
+        if matches!(
+            purpose,
+            TurnPurpose::OrchestratorTriage | TurnPurpose::ConflictResolution { .. }
+        ) && session.isolation_mode == IsolationMode::WorktreePerMember
+            && let (Some(int_br), Some(int_wt_str)) = (
+                session.integration_branch.as_deref(),
+                session.integration_wt_path.as_deref(),
+            )
+        {
+            let int_wt = PathBuf::from(int_wt_str);
+            let rt = self.runtime(&session.id).await;
+            let _merge_guard = rt.git_merge_lock.lock().await;
+            let mut committed_dirty = false;
+            if let Ok(Some((_, _, files))) =
+                commit_worktree_if_dirty(&int_wt, &member.handle, task_brief).await
+            {
+                committed_dirty = true;
+                if !files.is_empty() {
+                    merged_files = files;
+                }
+            }
+            if (committed_dirty || integration_committed_in_turn)
+                && let Ok(report) = get_session_diff(
+                    project_root,
+                    &int_wt,
+                    session.base_branch.as_deref(),
+                    session.base_commit_sha.as_deref(),
+                    int_br,
+                )
+                .await
+            {
+                let _ = self.events_tx.send(WsEvent::GitBranchUpdated {
+                    session_id: session.id.clone(),
+                    integration_branch: int_br.to_string(),
+                    ahead_commits: report.ahead_commits,
+                    diff_stat: report.diff_stat,
+                });
+            }
+        }
 
         // Executor turn in isolated worktree -> zero-token clean merge first
         if !matches!(
@@ -1559,11 +1743,23 @@ impl SwitchEngine {
                             .events_tx
                             .send(WsEvent::ChatMessageCreated { message: m });
                     }
+                    let (ahead_commits, total_stat) = match get_session_diff(
+                        project_root,
+                        &int_wt,
+                        session.base_branch.as_deref(),
+                        session.base_commit_sha.as_deref(),
+                        int_br,
+                    )
+                    .await
+                    {
+                        Ok(report) => (report.ahead_commits, report.diff_stat),
+                        Err(_) => (1, diff_stat),
+                    };
                     let _ = self.events_tx.send(WsEvent::GitBranchUpdated {
                         session_id: session.id.clone(),
                         integration_branch: int_br.to_string(),
-                        ahead_commits: 1,
-                        diff_stat,
+                        ahead_commits,
+                        diff_stat: total_stat,
                     });
 
                     // Fast-forward idle peer worktrees if enabled
@@ -1633,8 +1829,24 @@ impl SwitchEngine {
             }
         }
 
-        // Trigger Orchestrator LLM memory curation pass (or deterministic fallback)
-        if !conflict_triggered && !matches!(purpose, TurnPurpose::OrchestratorTriage) {
+        // Check whether Orchestrator already dispatched via MCP `orchestrator_dispatch`
+        let rt = self.runtime(&session.id).await;
+        let skip_mention_routing = if matches!(purpose, TurnPurpose::OrchestratorTriage) {
+            rt.orchestrator_dispatched_turn
+                .lock()
+                .await
+                .remove(chain_id)
+        } else {
+            false
+        };
+
+        // Trigger Orchestrator LLM memory curation pass (with guaranteed deterministic fallback)
+        // both for Executor turns AND substantive direct Orchestrator turns.
+        let should_curate = !conflict_triggered
+            && (!matches!(purpose, TurnPurpose::OrchestratorTriage)
+                || (!skip_mention_routing
+                    && (!merged_files.is_empty() || reply_text.chars().count() >= 80)));
+        if should_curate {
             self.trigger_post_job_memory_curation(
                 session,
                 member,
@@ -1647,17 +1859,6 @@ impl SwitchEngine {
             )
             .await;
         }
-
-        // If Orchestrator already dispatched via MCP `orchestrator_dispatch`, do not double-dispatch from its summary text
-        let rt = self.runtime(&session.id).await;
-        let skip_mention_routing = if matches!(purpose, TurnPurpose::OrchestratorTriage) {
-            rt.orchestrator_dispatched_turn
-                .lock()
-                .await
-                .remove(chain_id)
-        } else {
-            false
-        };
 
         if !skip_mention_routing && !matches!(purpose, TurnPurpose::ConflictResolution { .. }) {
             let members = self.store.list_members(&session.id).unwrap_or_default();
@@ -1681,8 +1882,6 @@ impl SwitchEngine {
                     .await;
             }
         }
-
-        let _ = project_root;
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1697,11 +1896,28 @@ impl SwitchEngine {
         touched_files: &[String],
         purpose: &TurnPurpose,
     ) {
+        let Some(ref project_id) = session.project_id else {
+            return;
+        };
         let curation_mode = self.config.read().await.memory.curation_mode.clone();
 
         // If this was ConflictResolution, Orchestrator already had `memory_curate_job` in its prompt;
-        // fallback deterministically only if Orchestrator didn't record a job.
-        if matches!(purpose, TurnPurpose::ConflictResolution { .. }) {
+        // ensure a deterministic fallback record lands if `memory_curate_job` was skipped.
+        if let TurnPurpose::ConflictResolution { source_turn_id, .. } = purpose {
+            if !self.store.has_job_for_turn(source_turn_id).unwrap_or(false)
+                && !self.store.has_job_for_turn(turn_id).unwrap_or(false)
+            {
+                self.record_job_with_summary(
+                    project_id,
+                    &session.id,
+                    turn_id,
+                    member,
+                    task_brief,
+                    reply_text,
+                    touched_files,
+                    "system",
+                );
+            }
             return;
         }
 
@@ -1720,17 +1936,19 @@ impl SwitchEngine {
             });
             let engine = Arc::clone(self);
             let sid = session.id.clone();
-            let pid = session.project_id.clone();
+            let pid = project_id.clone();
             let cid = chain_id.to_string();
             let m_clone = member.clone();
             let tid = turn_id.to_string();
             let brief = task_brief.to_string();
             let reply = reply_text.to_string();
             let files = touched_files.to_vec();
+            let orch_handle = orch.clone();
 
             tokio::spawn(async move {
-                let res = engine
-                    .execute_member_turn(
+                let res = tokio::time::timeout(
+                    Duration::from_secs(25),
+                    engine.execute_member_turn(
                         &sid,
                         &cid,
                         DispatchTaskSpec {
@@ -1741,38 +1959,63 @@ impl SwitchEngine {
                             mode: "parallel".into(),
                         },
                         TurnPurpose::MemoryCuration,
-                    )
-                    .await;
-                if res.is_err() {
-                    engine.record_deterministic_job(
-                        &pid, &sid, &tid, &m_clone, &brief, &reply, &files,
-                    );
+                    ),
+                )
+                .await;
+
+                if engine.store.has_job_for_turn(&tid).unwrap_or(false) {
+                    return;
+                }
+
+                match res {
+                    Ok(Ok((_, llm_summary)))
+                        if !llm_summary.trim().is_empty()
+                            && !llm_summary.trim_start().starts_with('[') =>
+                    {
+                        engine.record_job_with_summary(
+                            &pid,
+                            &sid,
+                            &tid,
+                            &m_clone,
+                            &brief,
+                            llm_summary.trim(),
+                            &files,
+                            &orch_handle,
+                        );
+                    }
+                    _ => {
+                        engine.record_job_with_summary(
+                            &pid, &sid, &tid, &m_clone, &brief, &reply, &files, "system",
+                        );
+                    }
                 }
             });
             return;
         }
 
-        self.record_deterministic_job(
-            &session.project_id,
+        self.record_job_with_summary(
+            project_id,
             &session.id,
             turn_id,
             member,
             task_brief,
             reply_text,
             touched_files,
+            "system",
         );
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn record_deterministic_job(
+    fn record_job_with_summary(
         &self,
         project_id: &str,
         session_id: &str,
         turn_id: &str,
         member: &SessionMember,
         task_brief: &str,
-        reply_text: &str,
+        curated_summary: &str,
         touched_files: &[String],
+        curated_by: &str,
     ) {
         if let Ok(job) = self.store.record_curated_job(RecordEpisodicJobParams {
             project_id: project_id.to_string(),
@@ -1783,10 +2026,10 @@ impl SwitchEngine {
             model: member.active_model.clone(),
             effort: member.active_effort.clone(),
             task_brief: truncate_str(task_brief, 240),
-            curated_summary: truncate_str(reply_text, 400),
+            curated_summary: truncate_str(curated_summary, 400),
             touched_modules: touched_files.to_vec(),
             outcome: "completed".into(),
-            curated_by: "system".into(),
+            curated_by: curated_by.to_string(),
             pinned: false,
         }) {
             let _ = self.events_tx.send(WsEvent::MemoryJobCurated { job });
@@ -1871,6 +2114,359 @@ impl SwitchEngine {
             active_effort: member.as_ref().and_then(|m| m.active_effort.clone()),
             turn_id,
         });
+    }
+
+    pub async fn compute_session_context(
+        &self,
+        session_id: &str,
+    ) -> Result<SessionContextReport, SwitchError> {
+        let session = self.store.get_session(session_id)?;
+        let members = self.store.list_members(session_id)?;
+        let available = self.available_members(&members).await;
+        let messages = self.store.list_messages(session_id, None, 200)?;
+        let trajectories = self.store.list_trajectories(session_id, None, 40)?;
+        let jobs = session
+            .project_id
+            .as_deref()
+            .and_then(|pid| self.store.recall_jobs(pid, None, 6).ok())
+            .unwrap_or_default();
+        let facts = session
+            .project_id
+            .as_deref()
+            .and_then(|pid| self.store.list_facts(pid, 10).ok())
+            .unwrap_or_default();
+
+        let memory_base_tokens: u64 = jobs
+            .iter()
+            .map(|j| ((j.task_brief.len() + j.curated_summary.len()) / 4) as u64)
+            .sum::<u64>()
+            + facts
+                .iter()
+                .map(|f| (f.summary.len() / 4) as u64)
+                .sum::<u64>();
+
+        let active_msgs_slice = match messages
+            .iter()
+            .rposition(|m| m.metadata.get("compacted_context") == Some(&json!(true)))
+        {
+            Some(idx) => &messages[idx + 1..],
+            None => &messages[..],
+        };
+        let chat_history_tokens: u64 = active_msgs_slice
+            .iter()
+            .map(|m| ((m.content.len() + m.sender_id.len()) / 4).max(1) as u64)
+            .sum();
+
+        let summary_tokens = (session.working_summary.len() / 4) as u64;
+        let mut breakdowns = Vec::new();
+        for m in members {
+            if !available.contains(&m.handle) {
+                continue;
+            }
+            let adapter_pref = self
+                .store
+                .get_adapter_model_pref(&m.adapter_id)
+                .ok()
+                .flatten();
+            let effective_model = m
+                .active_model
+                .clone()
+                .or_else(|| adapter_pref.and_then(|p| p.default_model));
+            let is_orch = session.orchestrator_member.as_deref() == Some(m.handle.as_str());
+            let system_and_persona_tokens =
+                280 + summary_tokens + (m.persona_prompt.len() / 4) as u64;
+            let memory_and_telemetry_tokens = memory_base_tokens + if is_orch { 320 } else { 80 };
+
+            let mut agent_and_tool_tokens = 0u64;
+            for t in trajectories
+                .iter()
+                .filter(|t| t.member_handle == m.handle && t.started_at >= session.created_at)
+            {
+                agent_and_tool_tokens += (t.summary.len() / 4) as u64;
+                if let Ok(ev_page) = self.store.list_trajectory_events(&t.turn_id) {
+                    let chars: usize = ev_page
+                        .iter()
+                        .take(30)
+                        .map(|e| e.payload.to_string().len().min(600))
+                        .sum();
+                    agent_and_tool_tokens += (chars / 4) as u64;
+                }
+            }
+
+            let catalog = builtin_adapter_catalog(&m.adapter_id);
+            let live_usage = self
+                .supervisor
+                .get_latest_usage(session_id, &m.handle)
+                .await;
+            let (is_exact, used_tokens, context_window) = match live_usage {
+                Some((used, size)) => (true, used, size),
+                None => (
+                    false,
+                    system_and_persona_tokens
+                        + memory_and_telemetry_tokens
+                        + chat_history_tokens
+                        + agent_and_tool_tokens,
+                    catalog.default_context_window,
+                ),
+            };
+
+            breakdowns.push(MemberContextBreakdown {
+                handle: m.handle,
+                adapter_id: m.adapter_id,
+                model: effective_model,
+                used_tokens,
+                context_window,
+                is_exact,
+                system_and_persona_tokens,
+                memory_and_telemetry_tokens,
+                chat_history_tokens,
+                agent_and_tool_tokens,
+            });
+        }
+
+        Ok(SessionContextReport {
+            session_id: session_id.to_string(),
+            members: breakdowns,
+        })
+    }
+
+    pub async fn compact_session(&self, session_id: &str) -> Result<ChatMessage, SwitchError> {
+        let session = self.store.get_session(session_id)?;
+        let messages = self.store.list_messages(session_id, None, 100)?;
+        let mut lines = Vec::new();
+        if !session.working_summary.trim().is_empty() {
+            lines.push(format!("Prior summary: {}", session.working_summary.trim()));
+        }
+        for m in messages.iter().rev().take(24).rev() {
+            if matches!(m.kind, MessageKind::Text | MessageKind::ConsultThread)
+                && !m.content.trim().is_empty()
+            {
+                lines.push(format!(
+                    "{}: {}",
+                    m.sender_id,
+                    truncate_str(m.content.trim(), 160)
+                ));
+            }
+        }
+        let summary = truncate_chars(&lines.join("\n"), 1500);
+        let updated = self.store.patch_session(
+            session_id,
+            PatchSessionParams {
+                working_summary: Some(summary),
+                ..Default::default()
+            },
+        )?;
+        let _ = self.store.clear_session_acp_ids(session_id);
+        self.supervisor.reset_session_clients(session_id).await;
+
+        let notice = self.store.append_message(NewMessageParams {
+            id: None,
+            session_id: session_id.to_string(),
+            chain_id: format!("ch_compact_{}", uuid::Uuid::new_v4().simple()),
+            parent_msg_id: None,
+            sender_kind: SenderKind::System,
+            sender_id: "switch".into(),
+            recipients: Vec::new(),
+            kind: MessageKind::SystemNotice,
+            content: "Context compacted — active harness sessions reset with a concise summary."
+                .into(),
+            turn_id: None,
+            metadata: json!({ "compacted_context": true }),
+        })?;
+        let _ = self.events_tx.send(WsEvent::ChatMessageCreated {
+            message: notice.clone(),
+        });
+        let _ = self
+            .events_tx
+            .send(WsEvent::SessionUpdated { session: updated });
+        self.publish_session_context(session_id).await;
+        Ok(notice)
+    }
+
+    async fn publish_session_context(&self, session_id: &str) {
+        if let Ok(report) = self.compute_session_context(session_id).await {
+            let _ = self.events_tx.send(WsEvent::ContextUpdated {
+                session_id: session_id.to_string(),
+                report,
+            });
+        }
+    }
+
+    async fn trigger_auto_session_title(self: &Arc<Self>, session_id: &str, user_prompt: &str) {
+        let Ok(session) = self.store.get_session(session_id) else {
+            return;
+        };
+        if session.title != "New session" {
+            return;
+        }
+        let Ok(repo_root) = self.resolve_session_repo_root(&session) else {
+            return;
+        };
+        let Ok(members) = self.store.list_members(session_id) else {
+            return;
+        };
+        let available = self.available_members(&members).await;
+        let picker = session
+            .orchestrator_member
+            .as_deref()
+            .filter(|h| available.contains(*h))
+            .and_then(|h| members.iter().find(|m| m.handle == h))
+            .or_else(|| members.iter().find(|m| available.contains(&m.handle)));
+
+        let cfg = self.config.read().await.clone();
+        let generated = if let Some(target_member) = picker
+            && let Some(adapter_cfg) = cfg.adapters.get(&target_member.adapter_id)
+        {
+            let cwd = session
+                .integration_wt_path
+                .as_deref()
+                .map(PathBuf::from)
+                .filter(|p| p.is_dir())
+                .filter(|_| repo_root.exists())
+                .unwrap_or_else(|| {
+                    if repo_root.is_dir() {
+                        repo_root.clone()
+                    } else {
+                        std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))
+                    }
+                });
+            let prompt = format!(
+                "<session_title_request>\n\
+                 Write a concise 3 to 6 word title (plain text only, no quotes, no trailing period) \
+                 summarizing a coding session that starts with this user message:\n\
+                 {}\n\
+                 </session_title_request>",
+                truncate_str(user_prompt, 500)
+            );
+            self.supervisor
+                .run_ephemeral_prompt(
+                    adapter_cfg,
+                    &cwd,
+                    Some("low"),
+                    &prompt,
+                    Duration::from_secs(20),
+                )
+                .await
+                .ok()
+        } else {
+            None
+        };
+
+        let title = generated
+            .as_deref()
+            .and_then(clean_generated_title)
+            .unwrap_or_else(|| fallback_title_from_prompt(user_prompt));
+
+        if let Ok(curr) = self.store.get_session(session_id)
+            && curr.title == "New session"
+            && let Ok(updated) = self.store.patch_session(
+                session_id,
+                PatchSessionParams {
+                    title: Some(title),
+                    ..Default::default()
+                },
+            )
+        {
+            let _ = self
+                .events_tx
+                .send(WsEvent::SessionUpdated { session: updated });
+        }
+    }
+}
+
+fn extract_workflow_slash_commands(raw: &str) -> (Vec<String>, String) {
+    let mut cmds = Vec::new();
+    let mut remaining = Vec::new();
+    let mut in_fence = false;
+    for line in raw.lines() {
+        let trimmed = line.trim_start();
+        if trimmed.starts_with("```") {
+            in_fence = !in_fence;
+            remaining.push(line.to_string());
+            continue;
+        }
+        if in_fence {
+            remaining.push(line.to_string());
+            continue;
+        }
+        let mut kept_words = Vec::new();
+        for tok in line.split_whitespace() {
+            let lower = tok.to_ascii_lowercase();
+            let stripped = lower.trim_end_matches(|c: char| ",.;:!?".contains(c));
+            if matches!(
+                stripped,
+                "/plan" | "/review" | "/test" | "/fix" | "/compact"
+            ) {
+                let name = stripped.trim_start_matches('/').to_string();
+                if !cmds.contains(&name) {
+                    cmds.push(name);
+                }
+            } else {
+                kept_words.push(tok);
+            }
+        }
+        remaining.push(kept_words.join(" "));
+    }
+    (cmds, remaining.join("\n"))
+}
+
+fn build_slash_directive_prefix(cmds: &[String]) -> String {
+    let mut parts = Vec::new();
+    for cmd in cmds {
+        match cmd.as_str() {
+            "plan" => parts.push("Slash command `/plan`: Analyze the codebase carefully and present an explicit step-by-step plan before modifying files."),
+            "review" => parts.push("Slash command `/review`: Review recent changes critically for bugs, race conditions, security flaws, and test coverage."),
+            "test" => parts.push("Slash command `/test`: Write or run tests covering the requested functionality and verify all cases pass."),
+            "fix" => parts.push("Slash command `/fix`: Identify the root cause cleanly and apply a targeted, verified fix."),
+            _ => {}
+        }
+    }
+    if parts.is_empty() {
+        String::new()
+    } else {
+        format!("<slash_commands>\n{}\n</slash_commands>", parts.join("\n"))
+    }
+}
+
+fn clean_generated_title(raw: &str) -> Option<String> {
+    let line = raw
+        .lines()
+        .map(str::trim)
+        .find(|l| !l.is_empty())?
+        .trim_matches(|c| matches!(c, '"' | '\'' | '`' | '*' | '#' | '.'))
+        .trim();
+    if line.is_empty() || line.eq_ignore_ascii_case("New session") {
+        return None;
+    }
+    let words: Vec<&str> = line.split_whitespace().take(8).collect();
+    let joined = words.join(" ");
+    if joined.is_empty() {
+        None
+    } else {
+        Some(truncate_chars(&joined, 60))
+    }
+}
+
+fn fallback_title_from_prompt(raw: &str) -> String {
+    let words: Vec<&str> = raw
+        .split_whitespace()
+        .filter(|w| !w.starts_with('@') && !w.starts_with('/'))
+        .take(5)
+        .collect();
+    if words.is_empty() {
+        "Quick session".into()
+    } else {
+        truncate_chars(&words.join(" "), 60)
+    }
+}
+
+fn truncate_chars(s: &str, max_chars: usize) -> String {
+    if s.chars().count() <= max_chars {
+        s.to_string()
+    } else {
+        let mut out: String = s.chars().take(max_chars).collect();
+        out.push_str("...");
+        out
     }
 }
 
@@ -2064,7 +2660,7 @@ struct SwitchStreamListener {
 
 #[async_trait]
 impl TurnStreamListener for SwitchStreamListener {
-    async fn on_text_delta(&self, turn_id: &str, delta: String) {
+    async fn on_text_delta(&self, turn_id: &str, delta: String, replace: bool) {
         if let Some(msg_id) = &self.message_id
             && let Some(engine) = self.engine.upgrade()
         {
@@ -2074,6 +2670,7 @@ impl TurnStreamListener for SwitchStreamListener {
                 turn_id: turn_id.to_string(),
                 member_handle: self.member_handle.clone(),
                 delta,
+                replace,
             });
         }
     }

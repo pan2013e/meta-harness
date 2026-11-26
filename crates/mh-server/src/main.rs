@@ -119,25 +119,12 @@ async fn main() -> anyhow::Result<()> {
             .configure_adapter(id, None, acfg.exact_quota_probe_opt_in, None, None)
             .await;
     }
-    if let Ok(prefs) = store.list_adapter_quota_prefs() {
-        for p in prefs {
-            quota
-                .configure_adapter(
-                    &p.adapter_id,
-                    p.plan_label,
-                    p.exact_probe_opt_in,
-                    p.manual_5h_pct,
-                    p.manual_weekly_pct,
-                )
-                .await;
-        }
-    }
 
     let supervisor = AcpSupervisor::new(cfg.switch.idle_process_ttl_secs);
     let self_exe = std::env::current_exe()?;
     let bridge_token = generate_random_hex_token();
 
-    let switch = SwitchEngine::new(
+    let switch = SwitchEngine::new_with_paths(
         cfg,
         store,
         Arc::clone(&supervisor),
@@ -145,6 +132,7 @@ async fn main() -> anyhow::Result<()> {
         self_exe,
         String::new(),
         bridge_token,
+        paths,
     );
 
     let auth = AuthConfig::from_bind_and_flag(&bind, auth_token);

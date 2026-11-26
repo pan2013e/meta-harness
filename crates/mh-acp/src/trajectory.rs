@@ -5,6 +5,23 @@ use mh_core::TrajectoryEventKind;
 
 pub(crate) type TrajectoryUpdate = (TrajectoryEventKind, Value);
 
+/// Strips Meta-Harness internal worktree path prefixes (`.../.meta-harness/worktrees/<sid>/_integration/`)
+/// so filenames in diffs and trajectories stay compact and readable across OSes.
+pub fn clean_worktree_display_path(raw: &str) -> String {
+    let slash = raw.replace('\\', "/");
+    if let Some((_, rest)) = slash.split_once(".meta-harness/worktrees/") {
+        let mut parts = rest.splitn(3, '/');
+        let _sid = parts.next();
+        let _wt_dir = parts.next();
+        if let Some(rel) = parts.next()
+            && !rel.is_empty()
+        {
+            return rel.to_string();
+        }
+    }
+    slash
+}
+
 /// ACP tool updates are patches to an existing tool call. Codex additionally streams
 /// terminal output through ACP metadata, using the same tool call ID for each chunk.
 pub(crate) fn parse_tool_update(update: &Value, is_new: bool) -> Vec<TrajectoryUpdate> {
@@ -90,7 +107,8 @@ fn parse_diff(item: &Value, tool_call_id: Option<&str>) -> Option<Value> {
     if item.get("type").and_then(Value::as_str) != Some("diff") {
         return None;
     }
-    let path = item.get("path")?.as_str()?;
+    let raw_path = item.get("path")?.as_str()?;
+    let path = clean_worktree_display_path(raw_path);
     let old = item
         .get("oldText")
         .and_then(Value::as_str)
@@ -101,10 +119,11 @@ fn parse_diff(item: &Value, tool_call_id: Option<&str>) -> Option<Value> {
         .unwrap_or_default();
     let from = format!("a/{path}");
     let to = format!("b/{path}");
-    let diff = TextDiff::from_lines(old, new)
+    let body = TextDiff::from_lines(old, new)
         .unified_diff()
         .header(&from, &to)
         .to_string();
+    let diff = format!("diff --git {from} {to}\n{body}");
     Some(json!({"tool_call_id": tool_call_id, "path": path, "diff": diff}))
 }
 

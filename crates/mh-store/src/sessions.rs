@@ -9,7 +9,7 @@ use crate::{Store, StoreError, now_millis};
 #[derive(Debug, Clone)]
 pub struct CreateSessionParams {
     pub id: Option<String>,
-    pub project_id: String,
+    pub project_id: Option<String>,
     pub title: String,
     pub base_branch: Option<String>,
     pub base_commit_sha: Option<String>,
@@ -30,6 +30,7 @@ pub struct PatchSessionParams {
     pub max_hops: Option<u32>,
     pub permission_policy: Option<PermissionPolicy>,
     pub working_summary: Option<String>,
+    pub archived_at: Option<Option<i64>>,
 }
 
 #[derive(Debug, Clone)]
@@ -56,8 +57,8 @@ impl Store {
                 id, project_id, title, base_branch, base_commit_sha,
                 integration_branch, integration_wt_path, isolation_mode,
                 orchestrator_member, confirm_before_dispatch, max_hops,
-                permission_policy, working_summary, created_at, updated_at
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, '', ?13, ?14)",
+                permission_policy, working_summary, archived_at, created_at, updated_at
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, '', NULL, ?13, ?14)",
             params![
                 id,
                 params_in.project_id,
@@ -85,7 +86,7 @@ impl Store {
             "SELECT id, project_id, title, base_branch, base_commit_sha,
                     integration_branch, integration_wt_path, isolation_mode,
                     orchestrator_member, confirm_before_dispatch, max_hops,
-                    permission_policy, working_summary, created_at, updated_at
+                    permission_policy, working_summary, archived_at, created_at, updated_at
              FROM sessions WHERE id = ?1",
             params![id],
             map_session_row,
@@ -94,16 +95,58 @@ impl Store {
         .ok_or_else(|| StoreError::NotFound(format!("session {id}")))
     }
 
-    pub fn list_sessions(&self, project_id: &str) -> Result<Vec<Session>, StoreError> {
+    pub fn list_sessions(
+        &self,
+        project_id: Option<&str>,
+        include_archived: bool,
+    ) -> Result<Vec<Session>, StoreError> {
         let conn = self.conn()?;
-        let mut stmt = conn.prepare(
+        let arch_filter = if include_archived {
+            ""
+        } else {
+            " AND archived_at IS NULL"
+        };
+        if let Some(pid) = project_id {
+            let sql = format!(
+                "SELECT id, project_id, title, base_branch, base_commit_sha,
+                        integration_branch, integration_wt_path, isolation_mode,
+                        orchestrator_member, confirm_before_dispatch, max_hops,
+                        permission_policy, working_summary, archived_at, created_at, updated_at
+                 FROM sessions WHERE project_id = ?1{arch_filter} ORDER BY updated_at DESC"
+            );
+            let mut stmt = conn.prepare(&sql)?;
+            let rows = stmt.query_map(params![pid], map_session_row)?;
+            rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+        } else {
+            let sql = format!(
+                "SELECT id, project_id, title, base_branch, base_commit_sha,
+                        integration_branch, integration_wt_path, isolation_mode,
+                        orchestrator_member, confirm_before_dispatch, max_hops,
+                        permission_policy, working_summary, archived_at, created_at, updated_at
+                 FROM sessions WHERE project_id IS NULL{arch_filter} ORDER BY updated_at DESC"
+            );
+            let mut stmt = conn.prepare(&sql)?;
+            let rows = stmt.query_map([], map_session_row)?;
+            rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+        }
+    }
+
+    pub fn list_all_sessions(&self, include_archived: bool) -> Result<Vec<Session>, StoreError> {
+        let conn = self.conn()?;
+        let where_clause = if include_archived {
+            ""
+        } else {
+            " WHERE archived_at IS NULL"
+        };
+        let sql = format!(
             "SELECT id, project_id, title, base_branch, base_commit_sha,
                     integration_branch, integration_wt_path, isolation_mode,
                     orchestrator_member, confirm_before_dispatch, max_hops,
-                    permission_policy, working_summary, created_at, updated_at
-             FROM sessions WHERE project_id = ?1 ORDER BY updated_at DESC",
-        )?;
-        let rows = stmt.query_map(params![project_id], map_session_row)?;
+                    permission_policy, working_summary, archived_at, created_at, updated_at
+             FROM sessions{where_clause} ORDER BY updated_at DESC"
+        );
+        let mut stmt = conn.prepare(&sql)?;
+        let rows = stmt.query_map([], map_session_row)?;
         rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
     }
 
@@ -131,14 +174,17 @@ impl Store {
         if let Some(ws) = patch.working_summary {
             current.working_summary = ws;
         }
+        if let Some(arch) = patch.archived_at {
+            current.archived_at = arch;
+        }
         let now = now_millis();
 
         let conn = self.conn()?;
         conn.execute(
             "UPDATE sessions
              SET title = ?1, orchestrator_member = ?2, confirm_before_dispatch = ?3,
-                 max_hops = ?4, permission_policy = ?5, working_summary = ?6, updated_at = ?7
-             WHERE id = ?8",
+                 max_hops = ?4, permission_policy = ?5, working_summary = ?6, archived_at = ?7, updated_at = ?8
+             WHERE id = ?9",
             params![
                 current.title,
                 current.orchestrator_member,
@@ -146,12 +192,39 @@ impl Store {
                 current.max_hops,
                 current.permission_policy.as_str(),
                 current.working_summary,
+                current.archived_at,
                 now,
                 id,
             ],
         )?;
         drop(conn);
         self.get_session(id)
+    }
+
+    pub fn delete_archived_sessions(&self) -> Result<Vec<Session>, StoreError> {
+        let archived: Vec<Session> = self
+            .list_all_sessions(true)?
+            .into_iter()
+            .filter(|s| s.archived_at.is_some())
+            .collect();
+        let conn = self.conn()?;
+        conn.execute("DELETE FROM sessions WHERE archived_at IS NOT NULL", [])?;
+        Ok(archived)
+    }
+
+    pub fn clear_session_acp_ids(&self, session_id: &str) -> Result<(), StoreError> {
+        let conn = self.conn()?;
+        conn.execute(
+            "UPDATE session_members SET acp_session_id = NULL WHERE session_id = ?1",
+            params![session_id],
+        )?;
+        Ok(())
+    }
+
+    pub fn vacuum(&self) -> Result<(), StoreError> {
+        let conn = self.conn()?;
+        conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE); VACUUM;")?;
+        Ok(())
     }
 
     pub fn update_session_git_state(
@@ -297,6 +370,42 @@ impl Store {
         Ok(())
     }
 
+    pub fn update_member_model_effort(
+        &self,
+        session_id: &str,
+        handle: &str,
+        active_model: Option<Option<&str>>,
+        active_effort: Option<Option<&str>>,
+    ) -> Result<SessionMember, StoreError> {
+        let mut member = self.get_member(session_id, handle)?;
+        if let Some(m) = active_model {
+            member.active_model = m
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_string);
+        }
+        if let Some(e) = active_effort {
+            member.active_effort = e
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_string);
+        }
+        let conn = self.conn()?;
+        conn.execute(
+            "UPDATE session_members
+             SET active_model = ?1, active_effort = ?2
+             WHERE session_id = ?3 AND handle = ?4",
+            params![
+                member.active_model,
+                member.active_effort,
+                session_id,
+                handle
+            ],
+        )?;
+        drop(conn);
+        self.get_member(session_id, handle)
+    }
+
     pub fn advance_member_last_seen(
         &self,
         session_id: &str,
@@ -385,8 +494,9 @@ fn map_session_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Session> {
         max_hops: row.get(10)?,
         permission_policy: PermissionPolicy::parse(&row.get::<_, String>(11)?),
         working_summary: row.get(12)?,
-        created_at: row.get(13)?,
-        updated_at: row.get(14)?,
+        archived_at: row.get(13)?,
+        created_at: row.get(14)?,
+        updated_at: row.get(15)?,
     })
 }
 

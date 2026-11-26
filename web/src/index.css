@@ -22,8 +22,8 @@
   --color-neg: var(--mh-neg);
   --color-neg-soft: var(--mh-neg-soft);
 
-  --font-sans: "Inter", "Plus Jakarta Sans", -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif;
-  --font-mono: "JetBrains Mono", "Cascadia Code", "Fira Code", ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  --font-sans: "Plus Jakarta Sans Variable", "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei UI", "Noto Sans CJK SC", system-ui, -apple-system, sans-serif;
+  --font-mono: "JetBrains Mono Variable", "Cascadia Mono", "Sarasa Mono SC", "Microsoft YaHei UI", ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
 }
 
 /* 1. Obsidian Studio (default dark) */
@@ -131,6 +131,18 @@ body {
   font-family: var(--font-sans);
   background-color: var(--mh-app);
   color: var(--mh-ink);
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+code,
+pre,
+kbd,
+samp,
+.font-mono,
+.xterm {
+  font-family: var(--font-mono);
+  font-variant-ligatures: contextual;
 }
 
 @layer base {
@@ -164,4 +176,8 @@ body {
 
 ::-webkit-scrollbar-thumb:hover {
   background: var(--mh-ink-muted);
+}
+
+details[open] > summary .details-chevron {
+  transform: rotate(90deg);
 }

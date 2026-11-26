@@ -684,9 +684,13 @@ fn parse_codex_app_server_result(result: &Value, _now: i64) -> Option<LiveProbeO
         if credits.get("unlimited").and_then(Value::as_bool) == Some(true) {
             out.credits_label = Some("Unlimited credits".into());
         } else if credits.get("hasCredits").and_then(Value::as_bool) == Some(true)
-            && let Some(bal) = credits.get("balance").and_then(Value::as_str)
+            && let Some(bal) = credits.get("balance").and_then(|v| {
+                v.as_str()
+                    .and_then(|s| s.trim().parse::<f64>().ok())
+                    .or_else(|| v.as_f64())
+            })
         {
-            out.credits_label = Some(format!("Credits: {bal}"));
+            out.credits_label = Some(format!("Credits: {}", bal.round() as i64));
         }
     }
 
@@ -1176,6 +1180,20 @@ mod tests {
         assert_eq!(parsed.windows.len(), 1);
         assert_eq!(parsed.windows[0].label, "Weekly");
         assert_eq!(parsed.windows[0].resets_at, Some(1776000000i64 * 1000));
+    }
+
+    #[test]
+    fn rounds_codex_credit_balance_to_integer() {
+        let payload = json!({
+            "rateLimits": {
+                "limitId": "codex",
+                "planType": "prolite",
+                "primary": { "resetsAt": 1776000000i64, "usedPercent": 0, "windowDurationMins": 10080 },
+                "credits": { "hasCredits": true, "unlimited": false, "balance": "60002.0775370000" }
+            }
+        });
+        let parsed = parse_codex_app_server_result(&payload, 1000).unwrap();
+        assert_eq!(parsed.credits_label.as_deref(), Some("Credits: 60002"));
     }
 
     #[test]

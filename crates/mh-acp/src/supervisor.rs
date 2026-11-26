@@ -1,17 +1,25 @@
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::process::Stdio;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use async_trait::async_trait;
+use mh_core::{
+    AdapterConfig, AdapterModelCatalog, ConfigOptionChoice, DiscoveredConfigOption,
+    ModelChoiceDetail, PendingPermissionView, PermissionPolicy, PermissionRule,
+    TrajectoryEventKind,
+};
+use serde_json::Value;
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::process::Command;
 use tokio::sync::{Mutex, RwLock};
 use tracing::{debug, info};
 
-use mh_core::{AdapterConfig, DiscoveredConfigOption, PermissionPolicy, PermissionRule};
-
 use crate::AcpError;
-use crate::broker::{BrokerCallbacks, MemberBrokerContext};
-use crate::client::AcpClient;
-use crate::platform::find_cli_binary;
+use crate::broker::{BrokerCallbacks, MemberBrokerContext, PermissionResolution};
+use crate::client::{AcpClient, TurnStreamListener};
+use crate::platform::{ProcessTreeGuard, find_cli_binary, prepare_isolated_command};
 use crate::protocol::{McpEnvVar, McpServerSpec};
 
 #[derive(Debug, Clone)]
@@ -45,6 +53,7 @@ type ClientMap = HashMap<(String, String), Arc<ManagedMemberClient>>;
 pub struct AcpSupervisor {
     clients: Arc<Mutex<ClientMap>>,
     closed_sessions: Arc<RwLock<HashSet<String>>>,
+    catalog_cache: Mutex<HashMap<String, (Instant, AdapterModelCatalog)>>,
     idle_ttl: Duration,
 }
 
@@ -53,6 +62,7 @@ impl AcpSupervisor {
         let sup = Arc::new(Self {
             clients: Arc::new(Mutex::new(HashMap::new())),
             closed_sessions: Arc::new(RwLock::new(HashSet::new())),
+            catalog_cache: Mutex::new(HashMap::new()),
             idle_ttl: Duration::from_secs(idle_process_ttl_secs.max(30)),
         });
 
@@ -197,6 +207,83 @@ impl AcpSupervisor {
         }
     }
 
+    pub async fn get_latest_usage(
+        &self,
+        session_id: &str,
+        member_handle: &str,
+    ) -> Option<(u64, u64)> {
+        let guard = self.clients.lock().await;
+        if let Some(m) = guard.get(&(session_id.to_string(), member_handle.to_string())) {
+            *m.client.latest_usage.read().await
+        } else {
+            None
+        }
+    }
+
+    pub async fn apply_member_config(
+        &self,
+        session_id: &str,
+        member_handle: &str,
+        model: Option<&str>,
+        effort: Option<&str>,
+    ) -> Option<(Option<String>, Option<String>)> {
+        let client = {
+            let guard = self.clients.lock().await;
+            guard
+                .get(&(session_id.to_string(), member_handle.to_string()))
+                .map(|m| Arc::clone(&m.client))
+        };
+        if let Some(c) = client
+            && c.is_alive().await
+        {
+            return Some(c.apply_model_and_effort(model, effort).await);
+        }
+        None
+    }
+
+    /// Runs a short-lived ephemeral ACP turn (used for low-effort utility passes such as
+    /// automatic session title generation) without disturbing active conversation clients.
+    pub async fn run_ephemeral_prompt(
+        &self,
+        adapter: &AdapterConfig,
+        cwd: &Path,
+        effort: Option<&str>,
+        prompt_text: &str,
+        timeout_dur: Duration,
+    ) -> Result<String, AcpError> {
+        let (command, args) = resolve_adapter_command(adapter)?;
+        let active_turn_id = Arc::new(RwLock::new(Some("ephemeral_title".to_string())));
+        let broker_ctx = MemberBrokerContext {
+            session_id: "ephemeral".into(),
+            member_handle: "orchestrator".into(),
+            project_root: cwd.to_path_buf(),
+            member_worktree: cwd.to_path_buf(),
+            permission_policy: PermissionPolicy::Strict,
+            active_turn_id,
+            rules: Arc::new(RwLock::new(Vec::new())),
+        };
+        let callbacks = Arc::new(EphemeralCallbacks);
+        let client = AcpClient::spawn(&command, &args, cwd, &[], broker_ctx, callbacks).await?;
+        let listener = Arc::new(NoopStreamListener);
+        let res = tokio::time::timeout(timeout_dur, async {
+            client.initialize().await?;
+            client.new_session(cwd, Vec::new()).await?;
+            if effort.is_some() {
+                let _ = client.apply_model_and_effort(None, effort).await;
+            }
+            let (_, out) = client
+                .prompt("ephemeral_title", prompt_text, listener)
+                .await?;
+            Ok::<String, AcpError>(out.final_text)
+        })
+        .await;
+        client.shutdown().await;
+        match res {
+            Ok(inner) => inner,
+            Err(_) => Err(AcpError::Timeout("ephemeral prompt timed out".into())),
+        }
+    }
+
     pub async fn cancel_session(&self, session_id: &str) {
         let targets: Vec<Arc<ManagedMemberClient>> = {
             let guard = self.clients.lock().await;
@@ -216,6 +303,12 @@ impl AcpSupervisor {
             .write()
             .await
             .insert(session_id.to_string());
+        self.reset_session_clients(session_id).await;
+    }
+
+    /// Shuts down active ACP child processes for `session_id` without marking the
+    /// session permanently closed (used for context compaction and archiving).
+    pub async fn reset_session_clients(&self, session_id: &str) {
         let removed: Vec<Arc<ManagedMemberClient>> = {
             let mut guard = self.clients.lock().await;
             let keys: Vec<(String, String)> = guard
@@ -228,6 +321,64 @@ impl AcpSupervisor {
         for m in removed {
             m.client.shutdown().await;
         }
+    }
+
+    /// Resolves live model + reasoning effort metadata for an adapter (querying
+    /// `codex app-server --stdio` `model/list` on Codex and caching for 10 minutes),
+    /// falling back cleanly to `builtin_adapter_catalog`.
+    pub async fn resolve_adapter_catalog(
+        &self,
+        adapter_id: &str,
+        adapter: &AdapterConfig,
+    ) -> AdapterModelCatalog {
+        {
+            let cache = self.catalog_cache.lock().await;
+            if let Some((ts, cat)) = cache.get(adapter_id)
+                && ts.elapsed() < Duration::from_secs(600)
+            {
+                return cat.clone();
+            }
+        }
+
+        let mut catalog = builtin_adapter_catalog(adapter_id);
+        if adapter_id == "codex"
+            && adapter.quota_provider != "manual"
+            && let Some(codex_bin) = find_cli_binary("codex")
+            && let Some(live) = probe_codex_models(&codex_bin).await
+        {
+            catalog = live;
+            if let Some(cfg_model) = read_codex_configured_model()
+                && !catalog
+                    .models
+                    .iter()
+                    .any(|m| m.value.eq_ignore_ascii_case(&cfg_model))
+            {
+                catalog.models.insert(
+                    0,
+                    ConfigOptionChoice {
+                        value: cfg_model.clone(),
+                        label: cfg_model.clone(),
+                    },
+                );
+                catalog.model_details.insert(
+                    0,
+                    ModelChoiceDetail {
+                        value: cfg_model.clone(),
+                        label: cfg_model,
+                        description: "Configured in ~/.codex/config.toml".into(),
+                        is_default: false,
+                        default_effort: None,
+                        supported_efforts: catalog.efforts.clone(),
+                    },
+                );
+            }
+        }
+
+        self.catalog_cache
+            .lock()
+            .await
+            .insert(adapter_id.to_string(), (Instant::now(), catalog.clone()));
+        catalog
     }
 
     pub async fn shutdown_all(&self) {
@@ -268,6 +419,379 @@ impl AcpSupervisor {
             m.client.shutdown().await;
         }
     }
+}
+
+fn format_effort_label(val: &str) -> String {
+    match val.to_ascii_lowercase().as_str() {
+        "low" => "Low".into(),
+        "medium" => "Medium".into(),
+        "high" => "High".into(),
+        "xhigh" => "Extra High".into(),
+        "max" => "Max".into(),
+        "ultra" => "Ultra".into(),
+        other => other.to_string(),
+    }
+}
+
+async fn probe_codex_models(codex_bin: &Path) -> Option<AdapterModelCatalog> {
+    let mut cmd = Command::new(codex_bin);
+    cmd.args(["app-server", "--stdio"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .kill_on_drop(true);
+    prepare_isolated_command(&mut cmd);
+
+    let mut child = cmd.spawn().ok()?;
+    let mut guard = ProcessTreeGuard::attach(&child);
+    let mut stdin = child.stdin.take()?;
+    let stdout = child.stdout.take()?;
+
+    let rpc_fut = async {
+        stdin
+            .write_all(
+                br#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"clientInfo":{"name":"meta-harness","version":"0.1.0"},"capabilities":{"experimentalApi":true}}}
+"#,
+            )
+            .await
+            .ok()?;
+        stdin.flush().await.ok()?;
+
+        let mut lines = BufReader::new(stdout).lines();
+        for _ in 0..8 {
+            let line = lines.next_line().await.ok().flatten()?;
+            if let Ok(val) = serde_json::from_str::<Value>(&line)
+                && val.get("id").and_then(Value::as_i64) == Some(1)
+            {
+                break;
+            }
+        }
+
+        stdin
+            .write_all(
+                br#"{"jsonrpc":"2.0","method":"initialized"}
+{"jsonrpc":"2.0","id":2,"method":"model/list","params":{}}
+"#,
+            )
+            .await
+            .ok()?;
+        stdin.flush().await.ok()?;
+
+        for _ in 0..24 {
+            let line = lines.next_line().await.ok().flatten()?;
+            if let Ok(val) = serde_json::from_str::<Value>(&line)
+                && val.get("id").and_then(Value::as_i64) == Some(2)
+            {
+                return val.get("result").and_then(parse_codex_models_result);
+            }
+        }
+        None
+    };
+
+    let catalog = tokio::time::timeout(Duration::from_secs(5), rpc_fut)
+        .await
+        .ok()
+        .flatten();
+
+    guard.kill_tree();
+    let _ = tokio::time::timeout(Duration::from_millis(200), child.wait()).await;
+    catalog
+}
+
+fn parse_codex_models_result(result: &Value) -> Option<AdapterModelCatalog> {
+    let data = result.get("data")?.as_array()?;
+    let mut models = Vec::new();
+    let mut model_details = Vec::new();
+    let mut effort_union: Vec<ConfigOptionChoice> = Vec::new();
+    let mut seen_efforts: HashSet<String> = HashSet::new();
+
+    for entry in data {
+        if entry.get("hidden").and_then(Value::as_bool) == Some(true) {
+            continue;
+        }
+        let id = entry
+            .get("id")
+            .or_else(|| entry.get("model"))
+            .and_then(Value::as_str)?
+            .to_string();
+        let display = entry
+            .get("displayName")
+            .and_then(Value::as_str)
+            .filter(|s| !s.is_empty())
+            .unwrap_or(&id)
+            .to_string();
+        let description = entry
+            .get("description")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string();
+        let is_default = entry
+            .get("isDefault")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        let default_effort = entry
+            .get("defaultReasoningEffort")
+            .and_then(Value::as_str)
+            .map(str::to_string);
+
+        let mut supported = Vec::new();
+        if let Some(arr) = entry
+            .get("supportedReasoningEfforts")
+            .and_then(Value::as_array)
+        {
+            for e in arr {
+                if let Some(val) = e.get("reasoningEffort").and_then(Value::as_str) {
+                    let ch = ConfigOptionChoice {
+                        value: val.to_string(),
+                        label: format_effort_label(val),
+                    };
+                    if seen_efforts.insert(val.to_string()) {
+                        effort_union.push(ch.clone());
+                    }
+                    supported.push(ch);
+                }
+            }
+        }
+
+        models.push(ConfigOptionChoice {
+            value: id.clone(),
+            label: display.clone(),
+        });
+        model_details.push(ModelChoiceDetail {
+            value: id,
+            label: display,
+            description,
+            is_default,
+            default_effort,
+            supported_efforts: supported,
+        });
+    }
+
+    if models.is_empty() {
+        return None;
+    }
+    if effort_union.is_empty() {
+        effort_union = ["low", "medium", "high", "xhigh", "max", "ultra"]
+            .into_iter()
+            .map(|e| ConfigOptionChoice {
+                value: e.into(),
+                label: format_effort_label(e),
+            })
+            .collect();
+    }
+
+    Some(AdapterModelCatalog {
+        adapter_id: "codex".into(),
+        models,
+        model_details,
+        efforts: effort_union,
+        default_context_window: 200_000,
+    })
+}
+
+pub fn builtin_adapter_catalog(adapter_id: &str) -> AdapterModelCatalog {
+    let codex_efforts: Vec<ConfigOptionChoice> = ["low", "medium", "high", "xhigh", "max", "ultra"]
+        .into_iter()
+        .map(|v| ConfigOptionChoice {
+            value: v.into(),
+            label: format_effort_label(v),
+        })
+        .collect();
+
+    let (mut models, mut model_details, efforts) = match adapter_id {
+        "codex" => {
+            let entries = [
+                ("gpt-6-astra", "GPT-6-Astra", true, Some("medium")),
+                ("gpt-5.6-sol", "GPT-5.6-Sol", false, Some("low")),
+                ("gpt-5.6-terra", "GPT-5.6-Terra", false, Some("medium")),
+                ("gpt-5.6-luna", "GPT-5.6-Luna", false, Some("medium")),
+            ];
+            let m = entries
+                .iter()
+                .map(|(v, l, _, _)| ConfigOptionChoice {
+                    value: (*v).into(),
+                    label: (*l).into(),
+                })
+                .collect();
+            let d = entries
+                .iter()
+                .map(|(v, l, def, de)| ModelChoiceDetail {
+                    value: (*v).into(),
+                    label: (*l).into(),
+                    description: String::new(),
+                    is_default: *def,
+                    default_effort: de.map(str::to_string),
+                    supported_efforts: codex_efforts.clone(),
+                })
+                .collect();
+            (m, d, codex_efforts)
+        }
+        "claude" => {
+            let effs: Vec<ConfigOptionChoice> = ["low", "medium", "high"]
+                .into_iter()
+                .map(|v| ConfigOptionChoice {
+                    value: v.into(),
+                    label: format_effort_label(v),
+                })
+                .collect();
+            let entries = [
+                ("claude-sonnet-4-6", "Claude Sonnet 4.6", true),
+                ("claude-opus-4-6", "Claude Opus 4.6", false),
+                ("claude-haiku-4-5", "Claude Haiku 4.5", false),
+            ];
+            let m = entries
+                .iter()
+                .map(|(v, l, _)| ConfigOptionChoice {
+                    value: (*v).into(),
+                    label: (*l).into(),
+                })
+                .collect();
+            let d = entries
+                .iter()
+                .map(|(v, l, def)| ModelChoiceDetail {
+                    value: (*v).into(),
+                    label: (*l).into(),
+                    description: String::new(),
+                    is_default: *def,
+                    default_effort: Some("medium".into()),
+                    supported_efforts: effs.clone(),
+                })
+                .collect();
+            (m, d, effs)
+        }
+        "antigravity" => {
+            let effs: Vec<ConfigOptionChoice> = ["low", "medium", "high", "xhigh", "max"]
+                .into_iter()
+                .map(|v| ConfigOptionChoice {
+                    value: v.into(),
+                    label: format_effort_label(v),
+                })
+                .collect();
+            let entries = [
+                ("gemini-2.5-pro", "Gemini 2.5 Pro", true),
+                ("gemini-2.5-flash", "Gemini 2.5 Flash", false),
+            ];
+            let m = entries
+                .iter()
+                .map(|(v, l, _)| ConfigOptionChoice {
+                    value: (*v).into(),
+                    label: (*l).into(),
+                })
+                .collect();
+            let d = entries
+                .iter()
+                .map(|(v, l, def)| ModelChoiceDetail {
+                    value: (*v).into(),
+                    label: (*l).into(),
+                    description: String::new(),
+                    is_default: *def,
+                    default_effort: Some("medium".into()),
+                    supported_efforts: effs.clone(),
+                })
+                .collect();
+            (m, d, effs)
+        }
+        _ => (Vec::new(), Vec::new(), Vec::new()),
+    };
+
+    if adapter_id == "codex"
+        && let Some(cfg_model) = read_codex_configured_model()
+        && !models
+            .iter()
+            .any(|m| m.value.eq_ignore_ascii_case(&cfg_model))
+    {
+        models.insert(
+            0,
+            ConfigOptionChoice {
+                value: cfg_model.clone(),
+                label: cfg_model.clone(),
+            },
+        );
+        model_details.insert(
+            0,
+            ModelChoiceDetail {
+                value: cfg_model.clone(),
+                label: cfg_model,
+                description: "Configured in ~/.codex/config.toml".into(),
+                is_default: false,
+                default_effort: None,
+                supported_efforts: efforts.clone(),
+            },
+        );
+    }
+
+    let default_context_window = match adapter_id {
+        "antigravity" => 1_000_000,
+        _ => 200_000,
+    };
+
+    AdapterModelCatalog {
+        adapter_id: adapter_id.to_string(),
+        models,
+        model_details,
+        efforts,
+        default_context_window,
+    }
+}
+
+fn read_codex_configured_model() -> Option<String> {
+    let codex_dir = std::env::var_os("CODEX_HOME")
+        .map(PathBuf::from)
+        .or_else(|| dirs::home_dir().map(|h| h.join(".codex")))?;
+    let raw = std::fs::read_to_string(codex_dir.join("config.toml")).ok()?;
+    let val: toml::Value = toml::from_str(&raw).ok()?;
+    val.get("model")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+}
+
+struct EphemeralCallbacks;
+
+#[async_trait]
+impl BrokerCallbacks for EphemeralCallbacks {
+    async fn request_user_permission(
+        &self,
+        prompt: PendingPermissionView,
+    ) -> Result<PermissionResolution, AcpError> {
+        let reject_id = prompt
+            .options
+            .iter()
+            .find(|o| o.kind.starts_with("reject"))
+            .map(|o| o.option_id.clone())
+            .unwrap_or_else(|| "reject_once".into());
+        Ok(PermissionResolution::Selected {
+            option_id: reject_id,
+            allow_pattern: None,
+        })
+    }
+
+    async fn record_trajectory_event(
+        &self,
+        _turn_id: &str,
+        _kind: TrajectoryEventKind,
+        _payload: Value,
+    ) {
+    }
+
+    async fn record_touched_file(&self, _turn_id: &str, _rel_path: String) {}
+}
+
+struct NoopStreamListener;
+
+#[async_trait]
+impl TurnStreamListener for NoopStreamListener {
+    async fn on_text_delta(&self, _turn_id: &str, _delta: String, _replace: bool) {}
+    async fn on_thought_delta(&self, _turn_id: &str, _delta: String) {}
+    async fn on_trajectory_event(
+        &self,
+        _turn_id: &str,
+        _kind: TrajectoryEventKind,
+        _payload: Value,
+    ) {
+    }
+    async fn on_config_options_updated(&self, _options: Vec<DiscoveredConfigOption>) {}
 }
 
 pub fn resolve_adapter_command(adapter: &AdapterConfig) -> Result<(String, Vec<String>), AcpError> {

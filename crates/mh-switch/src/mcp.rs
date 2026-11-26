@@ -304,13 +304,17 @@ pub async fn execute_mcp_tool(
         "memory_recall" => {
             let query = args.get("query").and_then(|v| v.as_str());
             let limit = args.get("limit").and_then(|v| v.as_u64()).unwrap_or(10) as u32;
-            let jobs = engine
-                .store
-                .recall_jobs(&session.project_id, query, limit)?;
-            let facts = engine.store.list_facts(&session.project_id, 20)?;
+            let Some(ref project_id) = session.project_id else {
+                return Ok(json!({ "jobs": [], "facts": [] }));
+            };
+            let jobs = engine.store.recall_jobs(project_id, query, limit)?;
+            let facts = engine.store.list_facts(project_id, 20)?;
             Ok(json!({ "jobs": jobs, "facts": facts }))
         }
         "memory_record_fact" => {
+            let Some(ref project_id) = session.project_id else {
+                return Ok(json!({ "skipped": "standalone session has no project memory" }));
+            };
             let category = args
                 .get("category")
                 .and_then(|v| v.as_str())
@@ -321,7 +325,7 @@ pub async fn execute_mcp_tool(
                 .ok_or_else(|| SwitchError::Validation("missing `summary`".into()))?;
             let fact = engine
                 .store
-                .record_fact(&session.project_id, category, summary, caller)?;
+                .record_fact(project_id, category, summary, caller)?;
             Ok(json!({ "fact": fact }))
         }
         "quota_get_status" => {
@@ -408,13 +412,16 @@ pub async fn execute_mcp_tool(
                 .unwrap_or("completed")
                 .to_string();
 
+            let Some(ref project_id) = session.project_id else {
+                return Ok(json!({ "skipped": "standalone session has no project memory" }));
+            };
             let member = engine.store.get_member(session_id, &member_handle).ok();
             let traj = turn_id
                 .as_deref()
                 .and_then(|tid| engine.store.get_trajectory(tid).ok());
 
             let job = engine.store.record_curated_job(RecordEpisodicJobParams {
-                project_id: session.project_id.clone(),
+                project_id: project_id.clone(),
                 session_id: Some(session_id.to_string()),
                 turn_id,
                 member_handle: member_handle.clone(),
@@ -441,10 +448,9 @@ pub async fn execute_mcp_tool(
             if let Some(fact_text) = args.get("project_fact").and_then(|v| v.as_str())
                 && !fact_text.trim().is_empty()
             {
-                let _ =
-                    engine
-                        .store
-                        .record_fact(&session.project_id, "ownership", fact_text, caller);
+                let _ = engine
+                    .store
+                    .record_fact(project_id, "ownership", fact_text, caller);
             }
 
             let _ = engine

@@ -72,7 +72,7 @@ mod tests {
         let sess = store
             .create_session(CreateSessionParams {
                 id: None,
-                project_id: proj.id.clone(),
+                project_id: Some(proj.id.clone()),
                 title: "Auth work".into(),
                 base_branch: Some("main".into()),
                 base_commit_sha: Some("abc123".into()),
@@ -201,5 +201,39 @@ mod tests {
             .unwrap();
         assert_eq!(found.len(), 1);
         assert_eq!(found[0].member_handle, "codex");
+
+        // Standalone quick sessions + archive/unarchive lifecycle
+        let standalone = store
+            .create_session(CreateSessionParams {
+                id: None,
+                project_id: None,
+                title: "Quick Chat".into(),
+                base_branch: None,
+                base_commit_sha: None,
+                integration_branch: None,
+                integration_wt_path: None,
+                isolation_mode: IsolationMode::SharedCwd,
+                orchestrator_member: None,
+                confirm_before_dispatch: false,
+                max_hops: 6,
+                permission_policy: PermissionPolicy::WorktreeSmart,
+            })
+            .unwrap();
+        assert!(standalone.project_id.is_none());
+        assert_eq!(store.list_sessions(None, false).unwrap().len(), 1);
+
+        store
+            .patch_session(
+                &standalone.id,
+                PatchSessionParams {
+                    archived_at: Some(Some(12345)),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(store.list_sessions(None, false).unwrap().len(), 0);
+        assert_eq!(store.list_sessions(None, true).unwrap().len(), 1);
+        assert_eq!(store.delete_archived_sessions().unwrap().len(), 1);
+        assert_eq!(store.list_sessions(None, true).unwrap().len(), 0);
     }
 }

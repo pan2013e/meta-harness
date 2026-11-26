@@ -190,7 +190,7 @@ impl Default for AppConfig {
                 accent_color: "#4285f4".to_string(),
                 enabled: true,
                 command: "agy".to_string(),
-                args: vec!["--acp".into()],
+                args: vec!["acp".into()],
                 fallback_commands: vec![AdapterFallbackCommand {
                     command: "gemini".to_string(),
                     args: vec!["--acp".into()],

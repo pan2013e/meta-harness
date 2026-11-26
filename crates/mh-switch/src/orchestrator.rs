@@ -8,29 +8,34 @@ pub async fn build_orchestrator_telemetry_block(
     store: &Store,
     config: &AppConfig,
     quota: &QuotaTracker,
-    project_id: &str,
+    project_id: Option<&str>,
     members: &[SessionMember],
     discovered_options: &[(String, Vec<DiscoveredConfigOption>)],
     user_query: &str,
 ) -> String {
     let snapshots = quota.cached_snapshots(config).await;
     let probes = probe_installed_adapters(config);
-    let jobs = store
-        .recall_jobs(project_id, Some(user_query), 5)
+    let jobs = project_id
+        .and_then(|pid| store.recall_jobs(pid, Some(user_query), 5).ok())
         .unwrap_or_default();
-    let facts = store.list_facts(project_id, 5).unwrap_or_default();
+    let facts = project_id
+        .and_then(|pid| store.list_facts(pid, 5).ok())
+        .unwrap_or_default();
 
     let mut out = String::from("<orchestrator_telemetry>\n");
 
     out.push_str("  <members>\n");
     for m in members {
+        if !probes
+            .iter()
+            .any(|p| p.adapter_id == m.adapter_id && p.installed)
+        {
+            continue;
+        }
         out.push_str(&format!(
-            "    - handle=@{} adapter={} available={} role={:?} model={} effort={}\n",
+            "    - handle=@{} adapter={} available=true role={:?} model={} effort={}\n",
             m.handle,
             m.adapter_id,
-            probes
-                .iter()
-                .any(|p| p.adapter_id == m.adapter_id && p.installed),
             m.role,
             m.active_model.as_deref().unwrap_or("default"),
             m.active_effort.as_deref().unwrap_or("default"),
@@ -152,12 +157,13 @@ pub struct MemoryCurationPromptInput<'a> {
 pub fn build_memory_curation_prompt(input: MemoryCurationPromptInput<'_>) -> String {
     format!(
         "<memory_curation_request>\n\
-         A job by @{} (adapter={}, model={}, effort={}, turn_id={}) completed and merged cleanly.\n\
+         A job by @{} (adapter={}, model={}, effort={}, turn_id={}) completed.\n\
          Task brief: {}\n\
          Touched modules: {}\n\
-         Executor reply excerpt: {}\n\
-         Call `memory_curate_job` once with a crisp 1-2 sentence `curated_summary` capturing who did what job, \
-         which modules changed, and any notable model/harness outcome (and optionally `project_fact`).\n\
+         Summary excerpt: {}\n\
+         Call `memory_curate_job` with turn_id=\"{}\", member_handle=\"{}\", touched_modules, \
+         and a crisp 1-2 sentence `curated_summary` capturing who did what job, \
+         which modules changed, and any notable outcome (plus optional `project_fact`).\n\
          </memory_curation_request>",
         input.member_handle,
         input.adapter_id,
@@ -171,6 +177,8 @@ pub fn build_memory_curation_prompt(input: MemoryCurationPromptInput<'_>) -> Str
             input.touched_modules.join(", ")
         },
         truncate_str(input.reply_summary, 400),
+        input.turn_id,
+        input.member_handle,
     )
 }
 

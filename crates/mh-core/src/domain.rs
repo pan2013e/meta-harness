@@ -64,7 +64,7 @@ impl PermissionPolicy {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Session {
     pub id: String,
-    pub project_id: String,
+    pub project_id: Option<String>,
     pub title: String,
     pub base_branch: Option<String>,
     pub base_commit_sha: Option<String>,
@@ -76,6 +76,8 @@ pub struct Session {
     pub max_hops: u32,
     pub permission_policy: PermissionPolicy,
     pub working_summary: String,
+    #[serde(default)]
+    pub archived_at: Option<i64>,
     pub created_at: i64,
     pub updated_at: i64,
 }
@@ -454,6 +456,73 @@ pub struct DiscoveredConfigOption {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ModelChoiceDetail {
+    pub value: String,
+    pub label: String,
+    #[serde(default)]
+    pub description: String,
+    #[serde(default)]
+    pub is_default: bool,
+    #[serde(default)]
+    pub default_effort: Option<String>,
+    #[serde(default)]
+    pub supported_efforts: Vec<ConfigOptionChoice>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AdapterModelCatalog {
+    pub adapter_id: String,
+    pub models: Vec<ConfigOptionChoice>,
+    #[serde(default)]
+    pub model_details: Vec<ModelChoiceDetail>,
+    pub efforts: Vec<ConfigOptionChoice>,
+    pub default_context_window: u64,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct StorageSummary {
+    pub total_bytes: u64,
+    pub database_bytes: u64,
+    pub active_worktrees_bytes: u64,
+    pub active_worktrees_count: u32,
+    pub standalone_workspaces_bytes: u64,
+    pub standalone_count: u32,
+    pub archived_sessions_count: u32,
+    pub archived_bytes: u64,
+    pub cache_and_orphans_bytes: u64,
+    pub orphan_dirs_count: u32,
+    pub data_dir: String,
+    pub workspaces_dir: String,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct AdapterModelPref {
+    pub adapter_id: String,
+    pub default_model: Option<String>,
+    pub default_effort: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct MemberContextBreakdown {
+    pub handle: String,
+    pub adapter_id: String,
+    pub model: Option<String>,
+    pub used_tokens: u64,
+    pub context_window: u64,
+    pub is_exact: bool,
+    pub system_and_persona_tokens: u64,
+    pub memory_and_telemetry_tokens: u64,
+    pub chat_history_tokens: u64,
+    pub agent_and_tool_tokens: u64,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct SessionContextReport {
+    pub session_id: String,
+    pub members: Vec<MemberContextBreakdown>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PermissionPromptOption {
     pub option_id: String,
     pub label: String,
@@ -487,6 +556,8 @@ pub enum WsEvent {
         turn_id: String,
         member_handle: String,
         delta: String,
+        #[serde(default)]
+        replace: bool,
     },
     #[serde(rename = "chat.message_completed")]
     ChatMessageCompleted { message: ChatMessage },
@@ -565,4 +636,11 @@ pub enum WsEvent {
     QuotaUpdated { snapshot: QuotaSnapshot },
     #[serde(rename = "memory.job_curated")]
     MemoryJobCurated { job: EpisodicJob },
+    #[serde(rename = "session.updated")]
+    SessionUpdated { session: Session },
+    #[serde(rename = "context.updated")]
+    ContextUpdated {
+        session_id: String,
+        report: SessionContextReport,
+    },
 }

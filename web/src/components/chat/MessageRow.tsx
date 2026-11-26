@@ -5,7 +5,6 @@ import {
   ChevronRight,
   Crown,
   GitCommitHorizontal,
-  SearchCode,
   ShieldAlert,
   Sparkles,
 } from "lucide-react";
@@ -14,6 +13,7 @@ import { useAppStore } from "../../store/useAppStore";
 import type { ChatMessage, DispatchTaskSpec, PendingPermissionView } from "../../types/api";
 import { HarnessAvatar } from "../common/Badges";
 import { MarkdownBlock } from "../common/MarkdownBlock";
+import { TurnActivityTimeline } from "./TurnActivityTimeline";
 
 interface Props {
   message: ChatMessage;
@@ -21,8 +21,6 @@ interface Props {
 }
 
 export const MessageRow = memo(function MessageRow({ message, consultReplies }: Props) {
-  const inspectTurn = useAppStore((state) => state.inspectTurn);
-  const counters = useAppStore((state) => message.turn_id ? state.turnCounters[message.turn_id] : undefined);
   const accent = useAppStore((state) => {
     const member = state.members.find((m) => m.handle === message.sender_id);
     return (member && state.adapters[member.adapter_id]?.accent_color) || "#6366f1";
@@ -32,16 +30,10 @@ export const MessageRow = memo(function MessageRow({ message, consultReplies }: 
   if (message.kind === "activity_pill") {
     return (
       <div className="px-6 py-1 flex items-center justify-center">
-        <button
-          type="button"
-          onClick={() => {
-            if (message.turn_id) void inspectTurn(message.turn_id);
-          }}
-          className="inline-flex items-center gap-1.5 px-3 py-1 rounded-full bg-elevated border border-line text-[11px] text-ink-muted hover:text-ink hover:border-line-strong transition-colors"
-        >
+        <div className="inline-flex items-center gap-1.5 px-3 py-1 rounded-full bg-elevated border border-line text-[11px] text-ink-muted">
           <Activity className="w-3 h-3 text-brand-ink" />
           <span>{message.content}</span>
-        </button>
+        </div>
       </div>
     );
   }
@@ -49,7 +41,13 @@ export const MessageRow = memo(function MessageRow({ message, consultReplies }: 
   if (message.kind === "merge_notice" || message.kind === "system_notice") {
     return (
       <div className="px-6 py-1 flex items-center justify-center">
-        <div className={`inline-flex items-center gap-1.5 rounded-lg border px-3 py-1 text-xs ${message.metadata.error ? "border-neg/25 bg-neg-soft text-neg" : "border-line bg-elevated text-ink-soft"}`}>
+        <div
+          className={`inline-flex items-center gap-1.5 rounded-lg border px-3 py-1 text-xs ${
+            message.metadata.error
+              ? "border-neg/25 bg-neg-soft text-neg"
+              : "border-line bg-elevated text-ink-soft"
+          }`}
+        >
           <GitCommitHorizontal className="w-3.5 h-3.5" />
           <span>{message.content}</span>
         </div>
@@ -123,7 +121,7 @@ export const MessageRow = memo(function MessageRow({ message, consultReplies }: 
     const target = String(message.metadata.target ?? "peer");
     return (
       <div className="px-5 py-1.5">
-        <div className="rounded-xl border border-line-strong bg-elevated/70 p-3 text-xs space-y-2">
+        <div className="mx-auto max-w-[50rem] rounded-xl border border-line-strong bg-elevated/70 p-3 text-xs space-y-2">
           <button
             type="button"
             onClick={() => setConsultExpanded((v) => !v)}
@@ -153,7 +151,7 @@ export const MessageRow = memo(function MessageRow({ message, consultReplies }: 
                 <div className="text-[11px] font-semibold text-brand-ink">
                   @{r.sender_id} replied:
                 </div>
-                <MarkdownBlock content={r.content} />
+                <MarkdownBlock content={r.content} sessionId={message.session_id} />
               </div>
             ))}
         </div>
@@ -165,18 +163,27 @@ export const MessageRow = memo(function MessageRow({ message, consultReplies }: 
   const model = typeof message.metadata.model === "string" ? message.metadata.model : null;
   const effort = typeof message.metadata.effort === "string" ? message.metadata.effort : null;
   const streaming = message.metadata.streaming === true;
-  const time = new Date(message.created_at).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+  const intermediateNotes = Array.isArray(message.metadata.intermediate_notes)
+    ? message.metadata.intermediate_notes.filter((x): x is string => typeof x === "string")
+    : [];
+  const time = new Date(message.created_at).toLocaleTimeString([], {
+    hour: "2-digit",
+    minute: "2-digit",
+  });
 
   if (isUser) {
     return (
-      <article aria-label="Your message" className="mx-auto flex max-w-[50rem] justify-end px-4 py-3 sm:px-6">
+      <article
+        aria-label="Your message"
+        className="mx-auto flex max-w-[50rem] justify-end px-4 py-3 sm:px-6"
+      >
         <div className="min-w-0 max-w-[88%] sm:max-w-[78%]">
           <div className="mb-1.5 flex items-center justify-end gap-2 px-1 text-xs">
             <span className="text-ink-muted">{time}</span>
             <span className="font-medium text-ink-soft">You</span>
           </div>
           <div className="rounded-2xl rounded-tr-md border border-brand/25 bg-brand-soft px-4 py-2.5">
-            <MarkdownBlock content={message.content} />
+            <MarkdownBlock content={message.content} sessionId={message.session_id} />
           </div>
         </div>
       </article>
@@ -184,16 +191,11 @@ export const MessageRow = memo(function MessageRow({ message, consultReplies }: 
   }
 
   return (
-    <article className="mx-auto max-w-[50rem] px-4 py-3 sm:px-6">
+    <article className="mx-auto max-w-[50rem] px-4 py-3.5 sm:px-6">
       <div className="flex items-start gap-3">
-        <HarnessAvatar
-          handle={message.sender_id}
-          accentColor={accent}
-          size="sm"
-        />
+        <HarnessAvatar handle={message.sender_id} accentColor={accent} size="sm" />
 
-        <div className="flex-1 min-w-0 space-y-1.5">
-          {/* Sender Metadata Row */}
+        <div className="flex-1 min-w-0 space-y-2">
           <div className="flex items-center gap-2">
             <div className="flex items-center gap-2 flex-wrap">
               <span className="text-[13px] font-semibold text-ink">
@@ -206,46 +208,28 @@ export const MessageRow = memo(function MessageRow({ message, consultReplies }: 
                 </span>
               )}
               {model && (
-                <span className="text-[11px] text-ink-muted">
+                <span className="text-[11px] text-ink-muted font-mono">
                   {model}
                   {effort ? ` · ${effort}` : ""}
                 </span>
               )}
-              {streaming && (
-                <span className="inline-flex items-center gap-1 text-[10px] font-mono text-brand-ink">
-                  <span className="w-1.5 h-1.5 rounded-full bg-brand animate-ping" />
-                  <span>Working</span>
-                </span>
-              )}
             </div>
-            <span className="shrink-0 text-[11px] text-ink-muted">{time}</span>
+            <span className="shrink-0 text-[11px] text-ink-muted ml-auto">{time}</span>
           </div>
 
-          {/* Content */}
-          <MarkdownBlock
-            content={message.content || (streaming ? "_Thinking..._" : "")}
-          />
-
-          {/* Trajectory Footer Pill */}
           {message.turn_id && (
-            <div className="pt-1 flex items-center gap-3 text-[11px]">
-              <button
-                type="button"
-                onClick={() => {
-                  if (message.turn_id) void inspectTurn(message.turn_id);
-                }}
-                className="inline-flex items-center gap-1.5 rounded-lg px-2 py-1 text-ink-muted transition-colors hover:bg-hover hover:text-brand-ink"
-              >
-                <SearchCode className="w-3.5 h-3.5 text-brand-ink" />
-                <span>
-                  {counters
-                    ? `${counters.tool_calls} tools · ${counters.file_edits} edits`
-                    : streaming
-                      ? "Live trace"
-                      : "Inspect Trajectory"}
-                </span>
-              </button>
-            </div>
+            <TurnActivityTimeline
+              turnId={message.turn_id}
+              streaming={streaming}
+              intermediateNotes={intermediateNotes}
+            />
+          )}
+
+          {(message.content || streaming) && (
+            <MarkdownBlock
+              content={message.content || "_Thinking..._"}
+              sessionId={message.session_id}
+            />
           )}
         </div>
       </div>
@@ -266,17 +250,21 @@ function PermissionInlineCard({
   const setError = useAppStore((state) => state.setError);
   const allow = prompt.options.find((option) => option.kind === "allow_once");
   const deny = prompt.options.find((option) => option.kind === "reject_once");
-  const patternOption = allow ?? prompt.options.find((option) => option.kind === "allow_always");
+  const patternOption =
+    allow ?? prompt.options.find((option) => option.kind === "allow_always");
   const resolve = (optionId: string, pattern?: string) => {
-    void api.resolvePermission(sessionId, prompt.request_id, optionId, pattern)
-      .catch((error: unknown) => setError(error instanceof Error ? error.message : String(error)));
+    void api
+      .resolvePermission(sessionId, prompt.request_id, optionId, pattern)
+      .catch((error: unknown) =>
+        setError(error instanceof Error ? error.message : String(error))
+      );
   };
 
   if (!prompt?.request_id) return null;
 
   return (
     <div className="px-5 py-1.5">
-      <div className="max-w-4xl mx-auto rounded-xl border border-neg/40 bg-neg-soft p-3.5 space-y-2 text-xs">
+      <div className="mx-auto max-w-[50rem] rounded-xl border border-neg/40 bg-neg-soft p-3.5 space-y-2 text-xs">
         <div className="flex items-center justify-between">
           <div className="flex items-center gap-2 font-semibold text-neg">
             <ShieldAlert className="w-4 h-4" />
@@ -294,13 +282,15 @@ function PermissionInlineCard({
         )}
         {isPending ? (
           <div className="flex flex-wrap gap-2 pt-1">
-            {allow && <button
-              type="button"
-              onClick={() => resolve(allow.option_id)}
-              className="px-3 py-1.5 rounded-lg bg-emerald-600 hover:bg-emerald-500 text-white font-medium"
-            >
-              Allow Once (Alt+A)
-            </button>}
+            {allow && (
+              <button
+                type="button"
+                onClick={() => resolve(allow.option_id)}
+                className="px-3 py-1.5 rounded-lg bg-emerald-600 hover:bg-emerald-500 text-white font-medium"
+              >
+                Allow Once (Alt+A)
+              </button>
+            )}
             {patternOption && prompt.suggested_pattern && (
               <button
                 type="button"
@@ -312,13 +302,15 @@ function PermissionInlineCard({
                 Allow &ldquo;{prompt.suggested_pattern}&rdquo; for Session
               </button>
             )}
-            {deny && <button
-              type="button"
-              onClick={() => resolve(deny.option_id)}
-              className="px-3 py-1.5 rounded-lg bg-elevated hover:bg-hover border border-line text-ink-soft"
-            >
-              Deny (Alt+R)
-            </button>}
+            {deny && (
+              <button
+                type="button"
+                onClick={() => resolve(deny.option_id)}
+                className="px-3 py-1.5 rounded-lg bg-elevated hover:bg-hover border border-line text-ink-soft"
+              >
+                Deny (Alt+R)
+              </button>
+            )}
           </div>
         ) : (
           <div className="text-[11px] text-ink-muted">Permission resolved.</div>

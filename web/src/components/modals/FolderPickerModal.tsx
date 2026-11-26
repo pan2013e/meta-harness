@@ -4,8 +4,8 @@ import {
   ChevronRight,
   FolderGit2,
   FolderOpen,
-  FolderSearch,
   Loader2,
+  Search,
   X,
 } from "lucide-react";
 import { api } from "../../api/client";
@@ -64,9 +64,9 @@ export function FolderPickerModal({
   const [current, setCurrent] = useState("");
   const [parent, setParent] = useState<string | null>(null);
   const [entries, setEntries] = useState<FsEntry[]>([]);
+  const [filterQuery, setFilterQuery] = useState("");
   const [loading, setLoading] = useState(true);
   const [submitting, setSubmitting] = useState(false);
-  const [nativeBusy, setNativeBusy] = useState(false);
   const [manualPath, setManualPath] = useState("");
   const [selectedPath, setSelectedPath] = useState("");
   const [err, setErr] = useState<string | null>(null);
@@ -75,6 +75,7 @@ export function FolderPickerModal({
     const target = rawPath ? stripOuterQuotes(rawPath) : undefined;
     setLoading(true);
     setErr(null);
+    setFilterQuery("");
     try {
       const res = await api.listFs(target);
       setCurrent(res.current);
@@ -111,34 +112,24 @@ export function FolderPickerModal({
     }
   };
 
-  const handleNativeBrowse = async () => {
-    if (nativeBusy) return;
-    setNativeBusy(true);
-    setErr(null);
-    try {
-      const res = await api.pickFolderNative();
-      if (!res.supported) {
-        setErr("System file dialog unavailable on remote session — browse or paste path below.");
-        return;
-      }
-      if (!res.cancelled && res.path) {
-        setManualPath(res.path);
-        setSelectedPath(res.path);
-        await submitPath(res.path);
-      }
-    } catch (e) {
-      setErr(e instanceof Error ? e.message : String(e));
-    } finally {
-      setNativeBusy(false);
-    }
-  };
-
   const breadcrumbs = useMemo(() => splitBreadcrumbs(current), [current]);
+  const visibleEntries = useMemo(() => {
+    const q = filterQuery.trim().toLowerCase();
+    return q
+      ? entries.filter((item) => item.name.toLowerCase().includes(q))
+      : entries;
+  }, [entries, filterQuery]);
   const effectiveTarget = stripOuterQuotes(manualPath || selectedPath || current);
 
   return (
-    <div className="fixed inset-0 z-50 bg-black/70 backdrop-blur-xs flex items-center justify-center p-4">
-      <div className="w-full max-w-2xl rounded-2xl border border-line-strong bg-panel shadow-2xl overflow-hidden flex flex-col max-h-[88vh]">
+    <div
+      className="fixed inset-0 z-50 bg-black/70 backdrop-blur-xs flex items-center justify-center p-4"
+      onClick={onClose}
+    >
+      <div
+        className="w-full max-w-2xl rounded-2xl border border-line-strong bg-panel shadow-2xl overflow-hidden flex flex-col max-h-[88vh]"
+        onClick={(e) => e.stopPropagation()}
+      >
         {/* Header */}
         <div className="px-5 py-3.5 border-b border-line flex items-center justify-between bg-elevated/60">
           <div className="flex items-center gap-2.5">
@@ -148,32 +139,18 @@ export function FolderPickerModal({
             <div>
               <h2 className="text-sm font-semibold text-ink">Open Project Folder</h2>
               <p className="text-[11px] text-ink-muted">
-                Choose a local folder or Git repository for isolated agent worktrees
+                Browse directories or paste a local repository path
               </p>
             </div>
           </div>
-          <div className="flex items-center gap-2">
-            <button
-              type="button"
-              disabled={nativeBusy}
-              onClick={() => void handleNativeBrowse()}
-              className="inline-flex items-center gap-1.5 px-2.5 py-1.5 rounded-lg bg-elevated hover:bg-hover border border-line-strong text-xs font-medium text-ink transition-colors disabled:opacity-50"
-            >
-              {nativeBusy ? (
-                <Loader2 className="w-3.5 h-3.5 animate-spin" />
-              ) : (
-                <FolderSearch className="w-3.5 h-3.5 text-brand-ink" />
-              )}
-              <span>System Picker…</span>
-            </button>
-            <button
-              type="button"
-              onClick={onClose}
-              className="p-1.5 rounded-lg text-ink-muted hover:text-ink hover:bg-hover transition-colors"
-            >
-              <X className="w-4 h-4" />
-            </button>
-          </div>
+          <button
+            type="button"
+            aria-label="Close folder picker"
+            onClick={onClose}
+            className="p-1.5 rounded-lg text-ink-muted hover:text-ink hover:bg-hover transition-colors"
+          >
+            <X className="w-4 h-4" />
+          </button>
         </div>
 
         <div className="p-4 space-y-3 overflow-y-auto">
@@ -201,31 +178,46 @@ export function FolderPickerModal({
             </button>
           </div>
 
-          {/* Quick Breadcrumbs */}
-          <div className="flex items-center gap-1 flex-wrap text-[11px] text-ink-muted px-1">
-            <button
-              type="button"
-              onClick={() => void load("")}
-              className="px-1.5 py-0.5 rounded hover:bg-hover hover:text-ink transition-colors font-medium"
-            >
-              Locations
-            </button>
-            {breadcrumbs.map((b, idx) => (
-              <span key={b.path} className="inline-flex items-center gap-1">
-                <ChevronRight className="w-3 h-3 opacity-60" />
-                <button
-                  type="button"
-                  onClick={() => void load(b.path)}
-                  className={`px-1.5 py-0.5 rounded font-mono transition-colors ${
-                    idx === breadcrumbs.length - 1
-                      ? "text-ink bg-elevated font-medium"
-                      : "hover:bg-hover hover:text-ink"
-                  }`}
-                >
-                  {b.label}
-                </button>
-              </span>
-            ))}
+          {/* Quick Breadcrumbs & Subdirectory Filter */}
+          <div className="flex flex-wrap items-center justify-between gap-2 px-1">
+            <div className="flex items-center gap-1 flex-wrap text-[11px] text-ink-muted">
+              <button
+                type="button"
+                onClick={() => void load("")}
+                className="px-1.5 py-0.5 rounded hover:bg-hover hover:text-ink transition-colors font-medium"
+              >
+                Locations
+              </button>
+              {breadcrumbs.map((b, idx) => (
+                <span key={b.path} className="inline-flex items-center gap-1">
+                  <ChevronRight className="w-3 h-3 opacity-60" />
+                  <button
+                    type="button"
+                    onClick={() => void load(b.path)}
+                    className={`px-1.5 py-0.5 rounded font-mono transition-colors ${
+                      idx === breadcrumbs.length - 1
+                        ? "text-ink bg-elevated font-medium"
+                        : "hover:bg-hover hover:text-ink"
+                    }`}
+                  >
+                    {b.label}
+                  </button>
+                </span>
+              ))}
+            </div>
+
+            {entries.length > 5 && (
+              <div className="relative w-44">
+                <Search className="w-3 h-3 text-ink-muted absolute left-2.5 top-1/2 -translate-y-1/2" />
+                <input
+                  type="text"
+                  value={filterQuery}
+                  onChange={(e) => setFilterQuery(e.target.value)}
+                  placeholder="Filter folders…"
+                  className="w-full rounded-lg bg-inset border border-line focus:border-brand pl-7 pr-2 py-1 text-[11px] text-ink focus:outline-none"
+                />
+              </div>
+            )}
           </div>
 
           {/* Recent Projects */}
@@ -273,12 +265,14 @@ export function FolderPickerModal({
                 <Loader2 className="w-4 h-4 animate-spin" />
                 <span>Reading directories...</span>
               </div>
-            ) : entries.length === 0 ? (
-              <div className="h-48 flex items-center justify-center text-xs text-ink-muted">
-                No subdirectories here — click &ldquo;Open Project&rdquo; below to use this folder.
+            ) : visibleEntries.length === 0 ? (
+              <div className="h-48 flex items-center justify-center text-xs text-ink-muted px-4 text-center">
+                {entries.length === 0
+                  ? 'No subdirectories here — click "Open Project" below to use this folder.'
+                  : "No folders match your filter."}
               </div>
             ) : (
-              entries.map((entry) => {
+              visibleEntries.map((entry) => {
                 const isSelected = selectedPath === entry.path;
                 return (
                   <div

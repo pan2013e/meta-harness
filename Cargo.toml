@@ -43,3 +43,4 @@ reqwest = { version = "0.12", default-features = false, features = ["json", "rus
 clap = { version = "4", features = ["derive"] }
 rust-embed = { version = "8", features = ["interpolate-folder-path"] }
 tempfile = "3"
+portable-pty = "0.9"

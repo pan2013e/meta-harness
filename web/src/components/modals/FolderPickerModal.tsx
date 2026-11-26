@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   ArrowUp,
   ChevronRight,
@@ -58,7 +58,7 @@ export function FolderPickerModal({
   onSelect,
 }: {
   onClose: () => void;
-  onSelect: (path: string) => Promise<void>;
+  onSelect: (path: string, signal: AbortSignal) => Promise<void>;
 }) {
   const { projects } = useAppStore();
   const [current, setCurrent] = useState("");
@@ -70,14 +70,22 @@ export function FolderPickerModal({
   const [manualPath, setManualPath] = useState("");
   const [selectedPath, setSelectedPath] = useState("");
   const [err, setErr] = useState<string | null>(null);
+  const browseRequest = useRef<AbortController | null>(null);
+  const openRequest = useRef<AbortController | null>(null);
 
   const load = useCallback(async (rawPath?: string) => {
     const target = rawPath ? stripOuterQuotes(rawPath) : undefined;
+    browseRequest.current?.abort();
+    const request = new AbortController();
+    browseRequest.current = request;
+    const timeout = AbortSignal.timeout(10_000);
+    const signal = AbortSignal.any([request.signal, timeout]);
     setLoading(true);
     setErr(null);
     setFilterQuery("");
     try {
-      const res = await api.listFs(target);
+      const res = await api.listFs(target, signal);
+      if (signal.aborted) return;
       setCurrent(res.current);
       setParent(res.parent);
       setEntries(res.entries);
@@ -88,27 +96,40 @@ export function FolderPickerModal({
         setSelectedPath("");
       }
     } catch (e) {
-      setErr(e instanceof Error ? e.message : String(e));
+      if (!request.signal.aborted) {
+        const message = e instanceof Error ? e.message : String(e);
+        setErr(timeout.aborted ? "Reading folders timed out. Try entering the folder path directly." : message);
+      }
     } finally {
-      setLoading(false);
+      if (browseRequest.current === request) {
+        browseRequest.current = null;
+        if (!request.signal.aborted) setLoading(false);
+      }
     }
   }, []);
 
   useEffect(() => {
     void load();
+    return () => {
+      browseRequest.current?.abort();
+      openRequest.current?.abort();
+    };
   }, [load]);
 
   const submitPath = async (raw: string) => {
     const cleaned = stripOuterQuotes(raw);
-    if (!cleaned || submitting) return;
+    if (!cleaned || openRequest.current) return;
+    const request = new AbortController();
+    openRequest.current = request;
     setSubmitting(true);
     setErr(null);
     try {
-      await onSelect(cleaned);
+      await onSelect(cleaned, request.signal);
     } catch (e) {
-      setErr(e instanceof Error ? e.message : String(e));
+      if (!request.signal.aborted) setErr(e instanceof Error ? e.message : String(e));
     } finally {
-      setSubmitting(false);
+      openRequest.current = null;
+      if (!request.signal.aborted) setSubmitting(false);
     }
   };
 
@@ -242,7 +263,7 @@ export function FolderPickerModal({
           )}
 
           {err && (
-            <div className="rounded-xl bg-neg-soft border border-neg/30 px-3 py-2 text-xs text-neg">
+            <div role="alert" className="rounded-xl bg-neg-soft border border-neg/30 px-3 py-2 text-xs text-neg">
               {err}
             </div>
           )}

@@ -110,9 +110,10 @@ export const api = {
       method: "POST",
       body: JSON.stringify({ token }),
     }),
-  listFs: (path?: string) =>
+  listFs: (path?: string, signal?: AbortSignal) =>
     apiFetch<{ current: string; parent: string | null; entries: FsEntry[] }>(
-      `/api/fs/list${path ? `?path=${encodeURIComponent(path)}` : ""}`
+      `/api/fs/list${path ? `?path=${encodeURIComponent(path)}` : ""}`,
+      { signal },
     ),
   listAdapters: (refresh = false, summary = false) =>
     apiFetch<{
@@ -246,10 +247,11 @@ export const api = {
     ),
 
   listProjects: () => apiFetch<{ projects: Project[] }>("/api/projects"),
-  createProject: (root_path: string, name?: string) =>
+  createProject: (root_path: string, name?: string, signal?: AbortSignal) =>
     apiFetch<{ project: Project }>("/api/projects", {
       method: "POST",
       body: JSON.stringify({ root_path, name }),
+      signal,
     }),
   gitInitProject: (projectId: string) =>
     apiFetch<{ project: Project }>(

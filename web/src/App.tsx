@@ -147,9 +147,7 @@ function AppContent() {
       {folderModalOpen && (
         <FolderPickerModal
           onClose={() => setFolderModalOpen(false)}
-          onSelect={async (path) => {
-            await createAndSelectProject(path);
-          }}
+          onSelect={(path, signal) => createAndSelectProject(path, undefined, signal)}
         />
       )}
       {settingsOpen && <SettingsDialog onClose={() => setSettingsOpen(false)} />}

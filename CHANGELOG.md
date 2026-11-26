@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+## 0.7.1
+
+- Fix project folders hanging when opened in the Windows desktop app. Time out stalled folder-picker requests and allow navigation to continue.
+
 ## 0.7.0
 
 - Refuse privileged launches in the desktop app and standalone CLI. Close browser-authenticated sockets at session expiry.

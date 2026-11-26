@@ -165,7 +165,7 @@ interface AppState {
   setError: (msg: string) => void;
 
   selectProject: (projectId: string | null) => Promise<void>;
-  createAndSelectProject: (rootPath: string, name?: string) => Promise<void>;
+  createAndSelectProject: (rootPath: string, name?: string, signal?: AbortSignal) => Promise<void>;
   gitInitActiveProject: () => Promise<void>;
 
   selectSession: (sessionId: string) => Promise<void>;
@@ -497,14 +497,23 @@ export const useAppStore = create<AppState>((set, get) => {
       }
     },
 
-    createAndSelectProject: async (rootPath: string, name?: string) => {
+    createAndSelectProject: async (rootPath, name, signal) => {
       const cleaned = cleanUserPath(rootPath);
       if (!cleaned) {
         throw new Error("Please select or enter a valid folder path.");
       }
-      const { project } = await api.createProject(cleaned, name);
-      const { projects } = await api.listProjects();
-      set({ projects, folderModalOpen: false, errorBanner: null });
+      const timeout = AbortSignal.timeout(15_000);
+      const request = signal ? AbortSignal.any([signal, timeout]) : timeout;
+      const { project } = await api.createProject(cleaned, name, request).catch((error: unknown) => {
+        if (timeout.aborted && !signal?.aborted) throw new Error("Opening this folder timed out. Try again.");
+        throw error;
+      });
+      request.throwIfAborted();
+      set((state) => ({
+        projects: [project, ...state.projects.filter((existing) => existing.id !== project.id)],
+        folderModalOpen: false,
+        errorBanner: null,
+      }));
       await get().selectProject(project.id);
     },
 

@@ -81,6 +81,8 @@ pub fn sanitize_ref_component(raw: &str) -> String {
 
 fn workspace_git(dir: &Path, args: &[&str]) -> tokio::process::Command {
     let mut command = crate::platform::background_command("git");
+    // The desktop launcher holds the server's stdin open for shutdown signaling.
+    command.stdin(std::process::Stdio::null());
     command.arg("-C").arg(dunce::simplified(dir)).args([
         "-c",
         "core.hooksPath=/dev/null",

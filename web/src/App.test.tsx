@@ -10,6 +10,7 @@ import { MentionEditor, serializeMentionDom } from "./components/chat/MentionEdi
 import { MessageRow } from "./components/chat/MessageRow";
 import { DiffReviewModal } from "./components/modals/DiffReviewModal";
 import { FilePreviewModal } from "./components/modals/FilePreviewModal";
+import { FolderPickerModal } from "./components/modals/FolderPickerModal";
 import { MemoryModal } from "./components/modals/MemoryModal";
 import { SettingsDialog } from "./components/modals/SettingsDialog";
 import { AboutUpdates } from "./components/modals/AboutUpdates";
@@ -27,6 +28,40 @@ afterEach(() => {
   vi.restoreAllMocks();
   vi.unstubAllGlobals();
   useAppStore.setState(useAppStore.getInitialState(), true);
+});
+
+describe("Opening project folders", () => {
+  it("replaces a pending locations request when browsing to a typed path", async () => {
+    const listing = vi.spyOn(api, "listFs")
+      .mockImplementationOnce((_path, signal) => new Promise((_, reject) => {
+        signal?.addEventListener("abort", () => reject(signal.reason), { once: true });
+      }))
+      .mockResolvedValueOnce({ current: "/workspace", parent: "/", entries: [] });
+    render(<FolderPickerModal onClose={vi.fn()} onSelect={vi.fn()} />);
+    expect(screen.getByText("Reading directories...")).toBeTruthy();
+
+    fireEvent.change(screen.getByRole("textbox"), { target: { value: "/workspace" } });
+    fireEvent.click(screen.getByRole("button", { name: "Go" }));
+
+    await screen.findByText(/No subdirectories here/);
+    expect(listing.mock.calls[0][1]?.aborted).toBe(true);
+    expect(listing.mock.calls[1][0]).toBe("/workspace");
+    expect(screen.queryByRole("alert")).toBeNull();
+  });
+
+  it("selects the opened project without reloading the project list", async () => {
+    const project = { id: "p_1", name: "workspace", root_path: "/workspace", is_git_repo: false, created_at: 0, last_opened_at: 1 };
+    const refresh = vi.spyOn(api, "listProjects");
+    vi.spyOn(api, "createProject").mockResolvedValue({ project });
+    const selectProject = vi.fn().mockResolvedValue(undefined);
+    useAppStore.setState({ folderModalOpen: true, selectProject });
+
+    await useAppStore.getState().createAndSelectProject(project.root_path);
+
+    expect(refresh).not.toHaveBeenCalled();
+    expect(selectProject).toHaveBeenCalledWith(project.id);
+    expect(useAppStore.getState()).toMatchObject({ projects: [project], folderModalOpen: false });
+  });
 });
 
 describe("Startup and file previews", () => {

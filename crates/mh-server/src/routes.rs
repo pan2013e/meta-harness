@@ -10,12 +10,13 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 use mh_acp::{
-    commit_worktree_if_dirty, ensure_session_integration_worktree, get_session_diff, init_git_repo,
-    inspect_repo, probe_installed_adapters, promote_session, prune_session_worktree_checkouts,
-    prune_session_worktrees, reset_worktree_to_sha, sync_member_worktree,
+    checkpoint_session_worktrees, commit_worktree_if_dirty, ensure_session_integration_worktree,
+    get_session_diff, init_git_repo, inspect_repo, probe_installed_adapters, promote_session,
+    prune_session_worktree_checkouts, prune_session_worktrees, reset_worktree_to_sha,
+    sync_member_worktree,
 };
 use mh_core::{
-    DiffStat, IsolationMode, MemberRole, MemberStatus, PermissionPolicy, PromoteMode,
+    DiffStat, IsolationMode, MemberRole, MemberStatus, PermissionPolicy, PromoteMode, Session,
     StorageSummary, WsEvent, expand_user_path, is_path_within, normalize_path,
 };
 use mh_store::{CreateSessionParams, PatchSessionParams, UpsertMemberParams};
@@ -807,6 +808,8 @@ pub async fn patch_session(
     AxumPath(session_id): AxumPath<String>,
     Json(body): Json<PatchSessionRequest>,
 ) -> ApiResult<Value> {
+    let runtime = state.switch.runtime(&session_id).await;
+    let _lifecycle = runtime.lifecycle_lock.lock().await;
     if let Some(Some(handle)) = body.orchestrator_member.as_ref() {
         state
             .switch
@@ -823,21 +826,23 @@ pub async fn patch_session(
     let mut archived_at_patch: Option<Option<i64>> = None;
     if let Some(archive) = body.archived {
         if archive && existing.archived_at.is_none() {
+            let repo_root = state
+                .switch
+                .resolve_session_repo_root(&existing)
+                .map_err(map_switch_err)?;
             state.switch.cancel_all_in_session(&session_id).await;
             state.switch.supervisor.shutdown_session(&session_id).await;
-            if let Some(wt) = existing.integration_wt_path.as_deref() {
-                let _ = commit_worktree_if_dirty(Path::new(wt), "session", &existing.title).await;
+            let saved = async {
+                checkpoint_session_worktrees(&repo_root, &session_id, &existing.title).await?;
+                prune_session_worktree_checkouts(&repo_root, &session_id).await
             }
-            if let Ok(members) = state.switch.store.list_members(&session_id) {
-                for m in members {
-                    if let Some(wt) = m.worktree_path.as_deref() {
-                        let _ = commit_worktree_if_dirty(Path::new(wt), &m.handle, &existing.title)
-                            .await;
-                    }
-                }
-            }
-            if let Ok(repo_root) = state.switch.resolve_session_repo_root(&existing) {
-                let _ = prune_session_worktree_checkouts(&repo_root, &session_id).await;
+            .await;
+            if let Err(error) = saved {
+                state.switch.supervisor.reopen_session(&session_id).await;
+                return Err(err_resp(
+                    StatusCode::CONFLICT,
+                    format!("Could not archive the session: {error}"),
+                ));
             }
             let _ = state.switch.store.clear_session_acp_ids(&session_id);
             let now_ms = std::time::SystemTime::now()
@@ -846,46 +851,58 @@ pub async fn patch_session(
                 .as_millis() as i64;
             archived_at_patch = Some(Some(now_ms));
         } else if !archive && existing.archived_at.is_some() {
-            if existing.isolation_mode == IsolationMode::WorktreePerMember
-                && let Ok(repo_root) = state.switch.resolve_session_repo_root(&existing)
-                && let Ok(int) = ensure_session_integration_worktree(&repo_root, &session_id).await
-            {
+            if existing.isolation_mode == IsolationMode::WorktreePerMember {
+                let repo_root = state
+                    .switch
+                    .resolve_session_repo_root(&existing)
+                    .map_err(map_switch_err)?;
+                let int = ensure_session_integration_worktree(&repo_root, &session_id)
+                    .await
+                    .map_err(|error| err_resp(StatusCode::CONFLICT, error.to_string()))?;
                 let int_wt = dunce::simplified(&int.path).to_string_lossy().into_owned();
-                let _ = state.switch.store.update_session_git_state(
-                    &session_id,
-                    existing
-                        .base_branch
-                        .as_deref()
-                        .or(int.base_branch.as_deref()),
-                    existing
-                        .base_commit_sha
-                        .as_deref()
-                        .or(Some(int.base_commit_sha.as_str())),
-                    Some(&int.branch),
-                    Some(&int_wt),
-                    existing.isolation_mode,
-                );
+                state
+                    .switch
+                    .store
+                    .update_session_git_state(
+                        &session_id,
+                        existing
+                            .base_branch
+                            .as_deref()
+                            .or(int.base_branch.as_deref()),
+                        existing
+                            .base_commit_sha
+                            .as_deref()
+                            .or(Some(int.base_commit_sha.as_str())),
+                        Some(&int.branch),
+                        Some(&int_wt),
+                        existing.isolation_mode,
+                    )
+                    .map_err(|error| {
+                        err_resp(StatusCode::INTERNAL_SERVER_ERROR, error.to_string())
+                    })?;
             }
             archived_at_patch = Some(None);
         }
     }
 
-    let sess = state
-        .switch
-        .store
-        .patch_session(
-            &session_id,
-            PatchSessionParams {
-                title: body.title,
-                orchestrator_member: body.orchestrator_member,
-                confirm_before_dispatch: body.confirm_before_dispatch,
-                max_hops: body.max_hops,
-                permission_policy: body.permission_policy,
-                working_summary: None,
-                archived_at: archived_at_patch,
-            },
-        )
-        .map_err(|e| err_resp(StatusCode::BAD_REQUEST, e.to_string()))?;
+    let patched = state.switch.store.patch_session(
+        &session_id,
+        PatchSessionParams {
+            title: body.title,
+            orchestrator_member: body.orchestrator_member,
+            confirm_before_dispatch: body.confirm_before_dispatch,
+            max_hops: body.max_hops,
+            permission_policy: body.permission_policy,
+            working_summary: None,
+            archived_at: archived_at_patch,
+        },
+    );
+    if matches!(archived_at_patch, Some(None)) && patched.is_ok()
+        || matches!(archived_at_patch, Some(Some(_))) && patched.is_err()
+    {
+        state.switch.supervisor.reopen_session(&session_id).await;
+    }
+    let sess = patched.map_err(|error| err_resp(StatusCode::BAD_REQUEST, error.to_string()))?;
     let _ = state.switch.events_tx.send(WsEvent::SessionUpdated {
         session: sess.clone(),
     });
@@ -1227,11 +1244,10 @@ pub async fn serve_session_worktree_file(
     let Ok(repo_root) = state.switch.resolve_session_repo_root(&sess) else {
         return (StatusCode::NOT_FOUND, "session workspace not found").into_response();
     };
-    let root_owned = sess
-        .integration_wt_path
-        .as_deref()
-        .map(PathBuf::from)
-        .unwrap_or(repo_root);
+    let root_owned = match active_session_workspace(&sess, &repo_root) {
+        Ok(root) => root,
+        Err(error) => return error.into_response(),
+    };
     let root = root_owned.as_path();
     let cleaned = rel_path.trim_start_matches(['/', '\\']);
     if cleaned.is_empty() {
@@ -1245,7 +1261,49 @@ pub async fn serve_session_worktree_file(
         return (StatusCode::FORBIDDEN, "cannot read file").into_response();
     };
     let mime = guess_mime(&candidate.to_string_lossy());
-    (StatusCode::OK, [(header::CONTENT_TYPE, mime)], bytes).into_response()
+    (
+        StatusCode::OK,
+        [
+            (header::CONTENT_TYPE, mime),
+            (
+                header::CONTENT_SECURITY_POLICY,
+                "sandbox allow-scripts allow-forms",
+            ),
+            (header::X_CONTENT_TYPE_OPTIONS, "nosniff"),
+        ],
+        bytes,
+    )
+        .into_response()
+}
+
+pub(crate) fn active_session_workspace(
+    sess: &Session,
+    repo_root: &Path,
+) -> Result<PathBuf, (StatusCode, String)> {
+    if sess.archived_at.is_some() {
+        return Err((
+            StatusCode::CONFLICT,
+            "Restore the session before opening its workspace.".into(),
+        ));
+    }
+    match sess.isolation_mode {
+        IsolationMode::SharedCwd if repo_root.is_dir() => Ok(repo_root.to_path_buf()),
+        IsolationMode::WorktreePerMember => sess
+            .integration_wt_path
+            .as_deref()
+            .map(PathBuf::from)
+            .filter(|root| root.join(".git").is_file())
+            .ok_or_else(|| {
+                (
+                    StatusCode::CONFLICT,
+                    "The session integration worktree is unavailable.".into(),
+                )
+            }),
+        _ => Err((
+            StatusCode::NOT_FOUND,
+            "The session workspace is unavailable.".into(),
+        )),
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -1269,17 +1327,13 @@ pub async fn run_session_preview_command(
         .switch
         .resolve_session_repo_root(&sess)
         .map_err(map_switch_err)?;
-    let base_root_owned = sess
-        .integration_wt_path
-        .as_deref()
-        .map(PathBuf::from)
-        .unwrap_or_else(|| repo_root.clone());
+    let base_root_owned = active_session_workspace(&sess, &repo_root)
+        .map_err(|(status, error)| err_resp(status, error))?;
     let base_root = base_root_owned.as_path();
-    let proj_root = repo_root.as_path();
     let mut cwd = base_root.to_path_buf();
     if let Some(req_cwd) = body.cwd.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
         let cand = PathBuf::from(req_cwd);
-        if (is_path_within(&cand, base_root) || is_path_within(&cand, proj_root)) && cand.is_dir() {
+        if is_path_within(&cand, base_root) && cand.is_dir() {
             cwd = dunce::canonicalize(&cand).unwrap_or(cand);
         }
     }
@@ -1297,9 +1351,7 @@ pub async fn run_session_preview_command(
             let p = PathBuf::from(arg);
             if p.is_absolute() { p } else { cwd.join(p) }
         };
-        if !target.is_dir()
-            || (!is_path_within(&target, base_root) && !is_path_within(&target, proj_root))
-        {
+        if !target.is_dir() || !is_path_within(&target, base_root) {
             return Ok(Json(json!({
                 "cwd": dunce::simplified(&cwd).to_string_lossy(),
                 "exit_code": 1,
@@ -1374,7 +1426,14 @@ pub async fn promote_session_handler(
     let base_sha = sess.base_commit_sha.as_deref().unwrap_or(base_br);
 
     if let Some(wt) = sess.integration_wt_path.as_deref() {
-        let _ = commit_worktree_if_dirty(Path::new(wt), "session", &sess.title).await;
+        commit_worktree_if_dirty(Path::new(wt), "session", &sess.title)
+            .await
+            .map_err(|error| {
+                err_resp(
+                    StatusCode::CONFLICT,
+                    format!("Could not save the integration worktree: {error}"),
+                )
+            })?;
     }
 
     let res = promote_session(&repo_root, base_br, base_sha, int_br, body.mode)
@@ -1717,11 +1776,15 @@ pub async fn cleanup_storage_handler(
             .switch
             .store
             .list_all_sessions(true)
-            .unwrap_or_default()
+            .map_err(|error| err_resp(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?
             .into_iter()
             .map(|s| s.id)
             .collect();
-        let projects = state.switch.store.list_projects().unwrap_or_default();
+        let projects = state
+            .switch
+            .store
+            .list_projects()
+            .map_err(|error| err_resp(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
         for proj in &projects {
             let wt_root = Path::new(&proj.root_path)
                 .join(".meta-harness")

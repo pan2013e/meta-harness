@@ -314,6 +314,18 @@ pub async fn ensure_session_integration_worktree(
     })
 }
 
+fn session_worktree_dir(project_root: &Path, session_id: &str) -> PathBuf {
+    project_root
+        .join(".meta-harness")
+        .join("worktrees")
+        .join(sanitize_ref_component(session_id))
+}
+
+pub fn member_worktree_path(project_root: &Path, session_id: &str, handle: &str) -> PathBuf {
+    session_worktree_dir(project_root, session_id)
+        .join(format!("_exec_{}", sanitize_ref_component(handle)))
+}
+
 pub async fn ensure_member_worktree(
     project_root: &Path,
     session_id: &str,
@@ -323,29 +335,35 @@ pub async fn ensure_member_worktree(
     let sid = sanitize_ref_component(session_id);
     let h = sanitize_ref_component(handle);
     let branch = format!("mh/{sid}/exec-{h}");
-    let wt_path = project_root
-        .join(".meta-harness")
-        .join("worktrees")
-        .join(&sid)
-        .join(format!("_exec_{h}"));
+    let wt_path = member_worktree_path(project_root, session_id, handle);
 
     if !wt_path.join(".git").exists() {
         if let Some(parent) = wt_path.parent() {
             tokio::fs::create_dir_all(parent).await?;
         }
         let wt_str = dunce::simplified(&wt_path).to_string_lossy().into_owned();
-        let (ok, _, err) = run_git(
+        let branch_ref = format!("refs/heads/{branch}");
+        let (branch_exists, _, _) = run_git(
             project_root,
-            &[
-                "worktree",
-                "add",
-                "-B",
-                &branch,
-                &wt_str,
-                integration_branch,
-            ],
+            &["show-ref", "--verify", "--quiet", &branch_ref],
         )
         .await?;
+        let (ok, _, err) = if branch_exists {
+            run_git(project_root, &["worktree", "add", &wt_str, &branch]).await?
+        } else {
+            run_git(
+                project_root,
+                &[
+                    "worktree",
+                    "add",
+                    "-b",
+                    &branch,
+                    &wt_str,
+                    integration_branch,
+                ],
+            )
+            .await?
+        };
         if !ok {
             return Err(AcpError::Git(format!(
                 "failed to create member worktree for {handle}: {err}"
@@ -490,20 +508,7 @@ pub async fn compute_numstat_between(
     if !ok {
         return (DiffStat::default(), Vec::new());
     }
-    let mut stat = DiffStat::default();
-    let mut files = Vec::new();
-    for line in out.lines() {
-        let parts: Vec<&str> = line.split('\t').collect();
-        if parts.len() == 3 {
-            let ins = parts[0].parse::<u32>().unwrap_or(0);
-            let del = parts[1].parse::<u32>().unwrap_or(0);
-            stat.files_changed += 1;
-            stat.insertions += ins;
-            stat.deletions += del;
-            files.push(parts[2].to_string());
-        }
-    }
-    (stat, files)
+    parse_numstat_lines(&out)
 }
 
 /// Auto-commits any uncommitted changes in `wt_path` and returns the resulting commit SHA,
@@ -513,8 +518,14 @@ pub async fn commit_worktree_if_dirty(
     handle: &str,
     summary: &str,
 ) -> Result<Option<(String, DiffStat, Vec<String>)>, AcpError> {
-    let (ok, dirty, _) = run_git(wt_path, &["status", "--porcelain"]).await?;
-    if !ok || dirty.is_empty() {
+    let (ok, dirty, err) = run_git(wt_path, &["status", "--porcelain"]).await?;
+    if !ok {
+        return Err(AcpError::Git(format!(
+            "git status failed in {}: {err}",
+            wt_path.display()
+        )));
+    }
+    if dirty.is_empty() {
         return Ok(None);
     }
 
@@ -560,6 +571,26 @@ pub async fn commit_worktree_if_dirty(
     Ok(Some((new_sha, stat, files)))
 }
 
+/// Saves every checkout before archiving, including shells opened without an ACP turn.
+pub async fn checkpoint_session_worktrees(
+    project_root: &Path,
+    session_id: &str,
+    title: &str,
+) -> Result<(), AcpError> {
+    let mut entries =
+        match tokio::fs::read_dir(session_worktree_dir(project_root, session_id)).await {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(error) => return Err(error.into()),
+        };
+    while let Some(entry) = entries.next_entry().await? {
+        if entry.file_type().await?.is_dir() && entry.path().join(".git").is_file() {
+            commit_worktree_if_dirty(&entry.path(), "archive", title).await?;
+        }
+    }
+    Ok(())
+}
+
 /// Resets an integration worktree to match a newly promoted commit SHA so subsequent
 /// session diffs measure cleanly from the promoted state.
 pub async fn reset_worktree_to_sha(wt_path: &Path, sha: &str) -> Result<(), AcpError> {
@@ -579,15 +610,16 @@ pub async fn get_session_diff(
     base_commit_sha: Option<&str>,
     integration_branch: &str,
 ) -> Result<SessionDiffReport, AcpError> {
-    // Prefer the current tip of `base_branch` in `project_root` so promotions/commits on `main`
-    // immediately update the comparison baseline.
-    let resolved_base_sha = if let Some(br) = base_branch {
+    // Keep the review aligned with the session's recorded baseline and patch promotion.
+    let resolved_base_sha = if let Some(sha) = base_commit_sha {
+        sha.to_string()
+    } else if let Some(br) = base_branch {
         match run_git(project_root, &["rev-parse", "--verify", br]).await {
             Ok((true, sha, _)) if !sha.is_empty() => sha,
-            _ => base_commit_sha.unwrap_or("HEAD").to_string(),
+            _ => "HEAD".to_string(),
         }
     } else {
-        base_commit_sha.unwrap_or("HEAD").to_string()
+        "HEAD".to_string()
     };
 
     let range = format!("{resolved_base_sha}..{integration_branch}");
@@ -598,21 +630,14 @@ pub async fn get_session_diff(
         0
     };
 
-    let (diff_stat, _) = compute_numstat_vs_wt(integration_wt, &resolved_base_sha).await;
-    let output = git_output(integration_wt, &["diff", &resolved_base_sha, "--"]).await?;
-    if !output.status.success() {
-        return Err(AcpError::Git(
-            String::from_utf8_lossy(&output.stderr).into_owned(),
-        ));
-    }
-    let raw_diff = String::from_utf8_lossy(&output.stdout);
+    let (raw_diff, diff_stat) = diff_worktree_snapshot(integration_wt, &resolved_base_sha).await?;
 
     const MAX_DIFF_BYTES: usize = 256 * 1024;
     let truncated = raw_diff.len() > MAX_DIFF_BYTES;
     let unified_diff = if truncated {
         raw_diff[..raw_diff.floor_char_boundary(MAX_DIFF_BYTES)].to_string()
     } else {
-        raw_diff.into_owned()
+        raw_diff
     };
 
     Ok(SessionDiffReport {
@@ -625,14 +650,78 @@ pub async fn get_session_diff(
     })
 }
 
-async fn compute_numstat_vs_wt(repo_dir: &Path, base_ref: &str) -> (DiffStat, Vec<String>) {
-    let Ok((ok, out, _)) = run_git(repo_dir, &["diff", "--numstat", base_ref, "--"]).await else {
-        return (DiffStat::default(), Vec::new());
+async fn diff_worktree_snapshot(
+    worktree: &Path,
+    base: &str,
+) -> Result<(String, DiffStat), AcpError> {
+    let untracked = checked_diff_git(
+        worktree,
+        None,
+        &["ls-files", "--others", "--exclude-standard", "-z"],
+    )
+    .await?;
+    let alternate = if untracked.is_empty() {
+        None
+    } else {
+        Some(tempfile::tempdir()?)
     };
-    if !ok {
-        return (DiffStat::default(), Vec::new());
+    let snapshot = alternate.as_ref().map(tempfile::TempDir::path);
+    let mut args = vec!["diff", "--no-ext-diff"];
+    if let Some(path) = snapshot {
+        let source_objects = checked_diff_git(
+            worktree,
+            None,
+            &[
+                "rev-parse",
+                "--path-format=absolute",
+                "--git-path",
+                "objects",
+            ],
+        )
+        .await?;
+        let info = path.join("objects/info");
+        tokio::fs::create_dir_all(&info).await?;
+        tokio::fs::write(info.join("alternates"), source_objects).await?;
+        // Borrow existing Git objects and keep the snapshot's new objects in the temporary directory.
+        checked_diff_git(worktree, Some(path), &["read-tree", "HEAD"]).await?;
+        checked_diff_git(worktree, Some(path), &["add", "-A", "--"]).await?;
+        args.push("--cached");
     }
-    parse_numstat_lines(&out)
+    let mut stat_args = args.clone();
+    args.extend([base, "--"]);
+    stat_args.extend(["--numstat", base, "--"]);
+    let (patch, stat) = tokio::try_join!(
+        checked_diff_git(worktree, snapshot, &args),
+        checked_diff_git(worktree, snapshot, &stat_args),
+    )?;
+    Ok((patch, parse_numstat_lines(&stat).0))
+}
+
+async fn checked_diff_git(
+    worktree: &Path,
+    snapshot: Option<&Path>,
+    args: &[&str],
+) -> Result<String, AcpError> {
+    let mut command = Command::new("git");
+    command
+        .arg("-C")
+        .arg(dunce::simplified(worktree))
+        .env("GIT_OPTIONAL_LOCKS", "0")
+        .args(args);
+    if let Some(path) = snapshot {
+        command.env("GIT_INDEX_FILE", dunce::simplified(&path.join("index")));
+        command.env(
+            "GIT_OBJECT_DIRECTORY",
+            dunce::simplified(&path.join("objects")),
+        );
+    }
+    let out = command.output().await?;
+    if !out.status.success() {
+        return Err(AcpError::Git(
+            String::from_utf8_lossy(&out.stderr).into_owned(),
+        ));
+    }
+    Ok(String::from_utf8_lossy(&out.stdout).into_owned())
 }
 
 fn parse_numstat_lines(out: &str) -> (DiffStat, Vec<String>) {
@@ -790,32 +879,34 @@ pub async fn prune_session_worktree_checkouts(
         return Ok(());
     }
 
-    let sid = sanitize_ref_component(session_id);
-    let session_wt_dir = project_root
-        .join(".meta-harness")
-        .join("worktrees")
-        .join(&sid);
+    let session_wt_dir = session_worktree_dir(project_root, session_id);
 
     if session_wt_dir.exists() {
         for attempt in 0..6 {
             if let Ok(mut rd) = tokio::fs::read_dir(&session_wt_dir).await {
                 while let Ok(Some(entry)) = rd.next_entry().await {
                     let p = entry.path();
-                    if p.is_dir() {
+                    if entry.file_type().await?.is_dir() && p.join(".git").is_file() {
                         let p_str = dunce::simplified(&p).to_string_lossy().into_owned();
                         let _ =
                             run_git(project_root, &["worktree", "remove", "--force", &p_str]).await;
                     }
                 }
             }
-            if tokio::fs::remove_dir_all(&session_wt_dir).await.is_ok() || !session_wt_dir.exists()
-            {
+            if tokio::fs::remove_dir(&session_wt_dir).await.is_ok() || !session_wt_dir.exists() {
                 break;
             }
             if attempt < 5 {
                 tokio::time::sleep(std::time::Duration::from_millis(50)).await;
             }
         }
+    }
+
+    if session_wt_dir.exists() {
+        return Err(AcpError::Git(format!(
+            "could not remove all session worktrees under {}",
+            session_wt_dir.display()
+        )));
     }
 
     let _ = run_git(project_root, &["worktree", "prune"]).await;
@@ -852,6 +943,46 @@ pub async fn prune_session_worktrees(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn diff_includes_untracked_work_and_excludes_later_main_commits() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        init_git_repo(root).await.unwrap();
+        let int = ensure_session_integration_worktree(root, "review")
+            .await
+            .unwrap();
+        std::fs::write(root.join("upstream.txt"), "base advanced\n").unwrap();
+        commit_worktree_if_dirty(root, "test", "Advance main")
+            .await
+            .unwrap();
+        std::fs::write(int.path.join("draft.txt"), "session work\n").unwrap();
+        let objects_before = run_git(root, &["count-objects"]).await.unwrap().1;
+
+        let diff = get_session_diff(
+            root,
+            &int.path,
+            int.base_branch.as_deref(),
+            Some(&int.base_commit_sha),
+            &int.branch,
+        )
+        .await
+        .unwrap();
+        assert_eq!(diff.diff_stat.files_changed, 1);
+        assert!(diff.unified_diff.contains("+++ b/draft.txt"));
+        assert!(!diff.unified_diff.contains("upstream.txt"));
+        assert_eq!(
+            run_git(root, &["count-objects"]).await.unwrap().1,
+            objects_before
+        );
+        assert_eq!(
+            run_git(&int.path, &["status", "--porcelain"])
+                .await
+                .unwrap()
+                .1,
+            "?? draft.txt"
+        );
+    }
 
     #[tokio::test]
     async fn promotion_checks_the_base_branch_and_patch_leaves_index_clean() {

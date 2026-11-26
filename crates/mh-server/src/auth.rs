@@ -1,7 +1,7 @@
 use axum::{
     Json,
     extract::{Request, State},
-    http::{StatusCode, header},
+    http::{StatusCode, Uri, header, uri::Authority},
     middleware::Next,
     response::{IntoResponse, Response},
 };
@@ -92,6 +92,13 @@ pub async fn require_user_auth(
     req: Request,
     next: Next,
 ) -> Response {
+    if !request_matches_app_origin(&req, state.auth.required) {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(json!({ "error": "request origin does not match Meta-Harness" })),
+        )
+            .into_response();
+    }
     if !state.auth.required {
         return next.run(req).await;
     }
@@ -110,6 +117,42 @@ pub async fn require_user_auth(
         )
             .into_response()
     }
+}
+
+fn request_matches_app_origin(req: &Request, remote_auth: bool) -> bool {
+    let host = req.uri().authority().cloned().or_else(|| {
+        req.headers()
+            .get(header::HOST)?
+            .to_str()
+            .ok()?
+            .parse::<Authority>()
+            .ok()
+    });
+    if !remote_auth
+        && host.as_ref().is_some_and(|authority| {
+            let hostname = authority.host().trim_matches(['[', ']']);
+            !hostname.eq_ignore_ascii_case("localhost")
+                && !hostname
+                    .parse::<std::net::IpAddr>()
+                    .is_ok_and(|ip| ip.is_loopback())
+        })
+    {
+        return false;
+    }
+    let Some(value) = req.headers().get(header::ORIGIN) else {
+        return true;
+    };
+    let origin = value
+        .to_str()
+        .ok()
+        .and_then(|value| value.parse::<Uri>().ok());
+    origin.is_some_and(|origin| {
+        matches!(origin.scheme_str(), Some("http" | "https"))
+            && origin
+                .authority()
+                .zip(host.as_ref())
+                .is_some_and(|(a, b)| a.as_str().eq_ignore_ascii_case(b.as_str()))
+    })
 }
 
 pub fn is_authorized(req: &Request, expected: &str) -> bool {
@@ -150,4 +193,55 @@ pub fn is_authorized(req: &Request, expected: &str) -> bool {
     }
 
     false
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn browser_origins_must_match_the_app_host() {
+        for (host, origin, auth_required, allowed) in [
+            ("localhost:5173", Some("http://localhost:5173"), false, true),
+            ("127.0.0.1:4410", None, false, true),
+            ("[::1]:4410", Some("http://[::1]:4410"), false, true),
+            (
+                "127.0.0.1:4410",
+                Some("http://example.invalid"),
+                false,
+                false,
+            ),
+            ("127.0.0.1:4410", Some("null"), false, false),
+            (
+                "example.invalid",
+                Some("http://example.invalid"),
+                false,
+                false,
+            ),
+            (
+                "harness.example",
+                Some("https://harness.example"),
+                true,
+                true,
+            ),
+            (
+                "harness.example",
+                Some("https://example.invalid"),
+                true,
+                false,
+            ),
+        ] {
+            let mut req = Request::builder().uri("/api/ws").header(header::HOST, host);
+            if let Some(origin) = origin {
+                req = req.header(header::ORIGIN, origin);
+            }
+            assert_eq!(
+                request_matches_app_origin(
+                    &req.body(axum::body::Body::empty()).unwrap(),
+                    auth_required
+                ),
+                allowed
+            );
+        }
+    }
 }

@@ -11,7 +11,6 @@ use axum::{
     routing::{delete, get, patch, post},
 };
 use rust_embed::RustEmbed;
-use tower_http::cors::CorsLayer;
 
 use mh_switch::SwitchEngine;
 
@@ -165,6 +164,5 @@ pub fn build_router(state: AppState) -> Router {
         .merge(public_and_authed_api)
         .route("/internal/mcp", post(routes::internal_mcp_handler))
         .fallback(routes::serve_embedded_spa)
-        .layer(CorsLayer::permissive())
         .with_state(state)
 }

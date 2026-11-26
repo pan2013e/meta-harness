@@ -306,8 +306,12 @@ impl AcpSupervisor {
         self.reset_session_clients(session_id).await;
     }
 
+    pub async fn reopen_session(&self, session_id: &str) {
+        self.closed_sessions.write().await.remove(session_id);
+    }
+
     /// Shuts down active ACP child processes for `session_id` without marking the
-    /// session permanently closed (used for context compaction and archiving).
+    /// session permanently closed (used for context compaction).
     pub async fn reset_session_clients(&self, session_id: &str) {
         let removed: Vec<Arc<ManagedMemberClient>> = {
             let mut guard = self.clients.lock().await;

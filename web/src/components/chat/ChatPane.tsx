@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState } from "react";
+import { lazy, Suspense, useEffect, useMemo, useRef, useState } from "react";
 import { useVirtualizer } from "@tanstack/react-virtual";
 import {
   Brain,
@@ -21,15 +21,22 @@ import { useAppStore } from "../../store/useAppStore";
 import type { ChatMessage } from "../../types/api";
 import { Composer } from "./Composer";
 import { MessageRow } from "./MessageRow";
-import { WebShellDrawer } from "./WebShellDrawer";
+
+const WebShellDrawer = lazy(async () => ({ default: (await import("./WebShellDrawer")).WebShellDrawer }));
 
 const NO_CONSULT_REPLIES: ChatMessage[] = [];
 
-const STARTER_PROMPTS = [
+const PROJECT_PROMPTS = [
   "Inspect this repository and summarize its architecture",
   "Plan a new feature and coordinate implementation",
   "Find edge cases or bugs in recent changes",
   "Add comprehensive tests for the core module",
+];
+
+const STANDALONE_PROMPTS = [
+  "Plan a new project from scratch",
+  "Create a starter web app",
+  "Prototype a command-line tool",
 ];
 
 export function ChatPane() {
@@ -303,7 +310,7 @@ export function ChatPane() {
                   >
                     <FolderGit2 className="w-3.5 h-3.5 text-brand-ink" />
                     <span className="font-medium">
-                      {activeProject ? activeProject.name : "Quick Sessions (~/.meta-harness)"}
+                      {activeProject ? activeProject.name : "Quick Sessions"}
                     </span>
                     {activeProject && (
                       <span
@@ -394,7 +401,7 @@ export function ChatPane() {
               {/* Clickable Starter Prompt Chips */}
               {readyCount > 0 && (
                 <div className="grid grid-cols-1 sm:grid-cols-2 gap-2 text-left pt-1">
-                  {STARTER_PROMPTS.map((promptText) => (
+                  {(activeProject ? PROJECT_PROMPTS : STANDALONE_PROMPTS).map((promptText) => (
                     <button
                       key={promptText}
                       type="button"
@@ -512,14 +519,18 @@ export function ChatPane() {
           <Composer key={activeSession.id} />
 
           {shellOpen && (
-            <WebShellDrawer
-              sessionId={activeSession.id}
-              defaultCwd={
-                activeSession.integration_wt_path ??
-                activeProject?.root_path ??
-                "."
-              }
-            />
+            <Suspense fallback={<div role="status" className="border-t border-line p-3 text-xs text-ink-muted">Loading terminal…</div>}>
+              <WebShellDrawer
+                key={activeSession.id}
+                sessionId={activeSession.id}
+                shared={activeSession.isolation_mode === "shared_cwd"}
+                defaultCwd={
+                  activeSession.integration_wt_path ??
+                  activeProject?.root_path ??
+                  "."
+                }
+              />
+            </Suspense>
           )}
         </>
       )}

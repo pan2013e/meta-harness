@@ -28,8 +28,9 @@ pub use supervisor::{
 pub use trajectory::clean_worktree_display_path;
 pub use worktree::{
     IntegrationWorktree, MemberWorktree, MergeOutcome, PromoteResult, RepoStatus,
-    SessionDiffReport, commit_worktree_if_dirty, ensure_member_worktree,
-    ensure_session_integration_worktree, get_head_sha, get_session_diff, init_git_repo,
-    inspect_repo, integrate_member_turn, promote_session, prune_session_worktree_checkouts,
-    prune_session_worktrees, reset_worktree_to_sha, sanitize_ref_component, sync_member_worktree,
+    SessionDiffReport, checkpoint_session_worktrees, commit_worktree_if_dirty,
+    ensure_member_worktree, ensure_session_integration_worktree, get_head_sha, get_session_diff,
+    init_git_repo, inspect_repo, integrate_member_turn, member_worktree_path, promote_session,
+    prune_session_worktree_checkouts, prune_session_worktrees, reset_worktree_to_sha,
+    sanitize_ref_component, sync_member_worktree,
 };

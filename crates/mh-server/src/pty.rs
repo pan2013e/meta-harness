@@ -15,7 +15,7 @@ use serde::Deserialize;
 use serde_json::json;
 use tokio::sync::mpsc;
 
-use mh_acp::ensure_member_worktree;
+use mh_acp::{ensure_member_worktree, member_worktree_path};
 use mh_core::IsolationMode;
 
 use crate::AppState;
@@ -40,8 +40,9 @@ pub async fn session_pty_ws_handler(
     Query(q): Query<PtyQuery>,
     State(state): State<AppState>,
 ) -> Response {
-    let Ok(cwd) = resolve_pty_cwd(&state, &session_id, q.target.as_deref()).await else {
-        return (StatusCode::NOT_FOUND, "session or worktree not found").into_response();
+    let cwd = match resolve_pty_cwd(&state, &session_id, q.target.as_deref()).await {
+        Ok(cwd) => cwd,
+        Err(error) => return error.into_response(),
     };
     let cols = q.cols.unwrap_or(80).clamp(20, 400);
     let rows = q.rows.unwrap_or(24).clamp(6, 200);
@@ -52,43 +53,62 @@ async fn resolve_pty_cwd(
     state: &AppState,
     session_id: &str,
     target: Option<&str>,
-) -> Result<PathBuf, ()> {
-    let sess = state.switch.store.get_session(session_id).map_err(|_| ())?;
+) -> Result<PathBuf, (StatusCode, String)> {
+    let runtime = state.switch.runtime(session_id).await;
+    let _lifecycle = runtime.lifecycle_lock.lock().await;
+    let sess = state
+        .switch
+        .store
+        .get_session(session_id)
+        .map_err(|e| (StatusCode::NOT_FOUND, e.to_string()))?;
     let repo_root = state
         .switch
         .resolve_session_repo_root(&sess)
-        .map_err(|_| ())?;
+        .map_err(|e| (StatusCode::NOT_FOUND, e.to_string()))?;
+    let session_root = crate::routes::active_session_workspace(&sess, &repo_root)?;
 
     if let Some(handle) = target
         .map(str::trim)
         .filter(|h| !h.is_empty() && *h != "integration")
-        && let Ok(member) = state.switch.store.get_member(session_id, handle)
     {
-        if let Some(ref p) = member.worktree_path {
-            let pb = PathBuf::from(p);
-            if pb.is_dir() {
-                return Ok(pb);
+        let member = state
+            .switch
+            .store
+            .get_member(session_id, handle)
+            .map_err(|_| {
+                (
+                    StatusCode::NOT_FOUND,
+                    format!("Unknown terminal target @{handle}"),
+                )
+            })?;
+        if let IsolationMode::WorktreePerMember = sess.isolation_mode {
+            let path = member_worktree_path(&repo_root, session_id, &member.handle);
+            if path.join(".git").is_file() {
+                return Ok(path);
             }
-        }
-        if sess.isolation_mode == IsolationMode::WorktreePerMember
-            && let Some(ref int_br) = sess.integration_branch
-            && let Ok(m_wt) =
-                ensure_member_worktree(&repo_root, session_id, int_br, &member.handle).await
-        {
-            return Ok(m_wt.path);
+            let branch = sess.integration_branch.as_deref().ok_or_else(|| {
+                (
+                    StatusCode::CONFLICT,
+                    "The session integration worktree is unavailable".into(),
+                )
+            })?;
+            let member_lock = {
+                let mut locks = runtime.member_locks.lock().await;
+                Arc::clone(locks.entry(member.handle.clone()).or_default())
+            };
+            let _idle = member_lock.try_lock().map_err(|_| {
+                (
+                    StatusCode::CONFLICT,
+                    "The member is setting up its worktree. Try again in a moment.".into(),
+                )
+            })?;
+            return ensure_member_worktree(&repo_root, session_id, branch, &member.handle)
+                .await
+                .map(|worktree| worktree.path)
+                .map_err(|e| (StatusCode::CONFLICT, e.to_string()));
         }
     }
-
-    if let Some(ref int_wt) = sess.integration_wt_path {
-        let pb = PathBuf::from(int_wt);
-        if pb.is_dir() {
-            return Ok(pb);
-        }
-    }
-    if repo_root.is_dir() {
-        return Ok(repo_root);
-    }
-    Err(())
+    Ok(session_root)
 }
 
 fn build_utf8_shell_command(cwd: &std::path::Path) -> CommandBuilder {
@@ -189,8 +209,8 @@ async fn handle_pty_socket(mut socket: WebSocket, cwd: PathBuf, cols: u16, rows:
     };
     let master = Arc::new(Mutex::new(pair.master));
 
-    let (out_tx, mut out_rx) = mpsc::unbounded_channel::<String>();
-    let (in_tx, mut in_rx) = mpsc::unbounded_channel::<Vec<u8>>();
+    let (out_tx, mut out_rx) = mpsc::channel::<String>(32);
+    let (in_tx, mut in_rx) = mpsc::channel::<Vec<u8>>(32);
 
     // UTF-8 streaming reader keeping incomplete trailing CJK/multi-byte bytes across read calls
     std::thread::spawn(move || {
@@ -201,14 +221,14 @@ async fn handle_pty_socket(mut socket: WebSocket, cwd: PathBuf, cols: u16, rows:
                 Ok(0) => {
                     if !pending.is_empty() {
                         let tail = String::from_utf8_lossy(&pending).into_owned();
-                        let _ = out_tx.send(tail);
+                        let _ = out_tx.blocking_send(tail);
                     }
                     break;
                 }
                 Ok(n) => {
                     pending.extend_from_slice(&buf[..n]);
                     let emitted = decode_utf8_stream_chunk(&mut pending);
-                    if !emitted.is_empty() && out_tx.send(emitted).is_err() {
+                    if !emitted.is_empty() && out_tx.blocking_send(emitted).is_err() {
                         break;
                     }
                 }
@@ -251,7 +271,9 @@ async fn handle_pty_socket(mut socket: WebSocket, cwd: PathBuf, cols: u16, rows:
                         if let Ok(parsed) = serde_json::from_str::<ClientPtyMsg>(&txt) {
                             match parsed {
                                 ClientPtyMsg::Input { data } => {
-                                    let _ = in_tx.send(data.into_bytes());
+                                    if in_tx.try_send(data.into_bytes()).is_err() {
+                                        break;
+                                    }
                                 }
                                 ClientPtyMsg::Resize { cols, rows } => {
                                     if let Ok(m) = master.lock() {
@@ -267,7 +289,9 @@ async fn handle_pty_socket(mut socket: WebSocket, cwd: PathBuf, cols: u16, rows:
                         }
                     }
                     Some(Ok(Message::Binary(bin))) => {
-                        let _ = in_tx.send(bin.to_vec());
+                        if in_tx.try_send(bin.to_vec()).is_err() {
+                            break;
+                        }
                     }
                     Some(Ok(Message::Ping(p))) => {
                         let _ = socket.send(Message::Pong(p)).await;
@@ -280,8 +304,12 @@ async fn handle_pty_socket(mut socket: WebSocket, cwd: PathBuf, cols: u16, rows:
     }
 
     drop(in_tx);
-    let _ = child.kill();
-    let _ = child.wait();
+    drop(out_rx);
+    let _ = tokio::task::spawn_blocking(move || {
+        let _ = child.kill();
+        let _ = child.wait();
+    })
+    .await;
 }
 
 pub fn decode_utf8_stream_chunk(pending: &mut Vec<u8>) -> String {

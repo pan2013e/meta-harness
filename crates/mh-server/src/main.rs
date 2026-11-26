@@ -119,6 +119,17 @@ async fn main() -> anyhow::Result<()> {
             .configure_adapter(id, None, acfg.exact_quota_probe_opt_in, None, None)
             .await;
     }
+    for pref in store.list_adapter_quota_prefs()? {
+        quota
+            .configure_adapter(
+                &pref.adapter_id,
+                pref.plan_label,
+                pref.exact_probe_opt_in,
+                pref.manual_5h_pct,
+                pref.manual_weekly_pct,
+            )
+            .await;
+    }
 
     let supervisor = AcpSupervisor::new(cfg.switch.idle_process_ttl_secs);
     let self_exe = std::env::current_exe()?;

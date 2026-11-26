@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { FitAddon } from "@xterm/addon-fit";
 import { Terminal as XTerm } from "@xterm/xterm";
+import "@xterm/xterm/css/xterm.css";
 import { Plus, Terminal, Trash2, X } from "lucide-react";
 import { ptyWsUrl } from "../../api/client";
 import { useAppStore } from "../../store/useAppStore";
@@ -97,6 +98,7 @@ function TerminalTabPane({
     try {
       term = new XTerm({
         cursorBlink: true,
+        disableStdin: true,
         fontSize: 12.5,
         lineHeight: 1.32,
         scrollback: 5000,
@@ -118,21 +120,18 @@ function TerminalTabPane({
 
       const cols = Math.max(20, term.cols || 80);
       const rows = Math.max(6, term.rows || 24);
-      const pendingInput: string[] = [];
+      let connected = false;
+      let exited = false;
 
       if (typeof WebSocket !== "undefined") {
         ws = new WebSocket(ptyWsUrl(sessionId, cols, rows, tab.target));
         wsRef.current = ws;
 
         ws.onopen = () => {
-          if (disposed) return;
+          if (disposed || !term) return;
+          connected = true;
+          term.options.disableStdin = false;
           onStatusChange(tab.id, "open");
-          while (pendingInput.length > 0 && ws?.readyState === WebSocket.OPEN) {
-            const chunk = pendingInput.shift();
-            if (chunk) {
-              ws.send(JSON.stringify({ type: "input", data: chunk }));
-            }
-          }
           if (fitAddon && term) {
             try {
               fitAddon.fit();
@@ -159,6 +158,7 @@ function TerminalTabPane({
             if (frame.type === "output" && typeof frame.data === "string") {
               term.write(frame.data);
             } else if (frame.type === "exit") {
+              exited = true;
               onStatusChange(tab.id, "closed");
               term.writeln("\r\n\x1b[90m[shell process exited]\x1b[0m");
             }
@@ -168,15 +168,20 @@ function TerminalTabPane({
         };
 
         ws.onclose = () => {
-          if (!disposed) onStatusChange(tab.id, "closed");
+          if (disposed || !term) return;
+          term.options.disableStdin = true;
+          onStatusChange(tab.id, "closed");
+          if (!exited) {
+            term.writeln(connected
+              ? "\r\n[Terminal disconnected. Open a new terminal to reconnect.]"
+              : "\r\n[Could not open this worktree terminal. Check that the session and worktree are available.]");
+          }
         };
       }
 
       const dataSub = term.onData((data) => {
         if (ws?.readyState === WebSocket.OPEN) {
           ws.send(JSON.stringify({ type: "input", data }));
-        } else {
-          pendingInput.push(data);
         }
       });
 
@@ -268,17 +273,20 @@ function TerminalTabPane({
 export function WebShellDrawer({
   sessionId,
   defaultCwd,
+  shared,
 }: {
   sessionId: string;
   defaultCwd: string;
+  shared: boolean;
 }) {
   const { members, probes, theme, setShellOpen } = useAppStore();
   const [heightPx, setHeightPx] = useState(260);
   const [newMenuOpen, setNewMenuOpen] = useState(false);
   const [clearCounter, setClearCounter] = useState<Record<string, number>>({});
   const seqRef = useRef(1);
+  const workspaceLabel = shared ? "Workspace" : "Integration";
   const [tabs, setTabs] = useState<TerminalTab[]>([
-    { id: "tab_1", label: "integration", target: null, status: "connecting" },
+    { id: "tab_1", label: workspaceLabel, target: null, status: "connecting" },
   ]);
   const [activeTabId, setActiveTabId] = useState("tab_1");
 
@@ -287,15 +295,9 @@ export function WebShellDrawer({
     [probes]
   );
   const worktreeMembers = useMemo(
-    () => members.filter((m) => installedIds.has(m.adapter_id)),
-    [members, installedIds]
+    () => shared ? [] : members.filter((m) => installedIds.has(m.adapter_id)),
+    [members, installedIds, shared]
   );
-
-  useEffect(() => {
-    const id = `tab_${++seqRef.current}`;
-    setTabs([{ id, label: "integration", target: null, status: "connecting" }]);
-    setActiveTabId(id);
-  }, [sessionId]);
 
   const addTab = (target: string | null, label: string) => {
     const id = `tab_${++seqRef.current}`;
@@ -305,17 +307,13 @@ export function WebShellDrawer({
   };
 
   const closeTab = (id: string) => {
-    setTabs((prev) => {
-      const next = prev.filter((t) => t.id !== id);
-      if (next.length === 0) {
-        setShellOpen(false);
-        return prev;
-      }
-      if (activeTabId === id) {
-        setActiveTabId(next[next.length - 1].id);
-      }
-      return next;
-    });
+    const next = tabs.filter((tab) => tab.id !== id);
+    if (next.length === 0) {
+      setShellOpen(false);
+      return;
+    }
+    setTabs(next);
+    if (activeTabId === id) setActiveTabId(next[next.length - 1].id);
   };
 
   const startResize = (e: React.PointerEvent<HTMLDivElement>) => {
@@ -335,6 +333,7 @@ export function WebShellDrawer({
   };
 
   const activeTab = tabs.find((t) => t.id === activeTabId) ?? tabs[0];
+  const targetLabel = activeTab?.target ? `@${activeTab.target} worktree` : defaultCwd;
 
   return (
     <section
@@ -351,14 +350,14 @@ export function WebShellDrawer({
         className="h-1.5 w-full cursor-row-resize bg-transparent hover:bg-brand/40 transition-colors shrink-0"
       />
 
-      <header className="px-3 py-1.5 border-b border-line bg-elevated/70 flex items-center justify-between gap-2 shrink-0">
-        <div className="flex items-center gap-1.5 min-w-0 overflow-x-auto">
+      <header className="relative px-3 py-1.5 border-b border-line bg-elevated/70 flex items-center justify-between gap-2 shrink-0">
+        <div className="flex items-center gap-1.5 min-w-0">
           <div className="flex items-center gap-1.5 px-1.5 text-xs font-semibold text-ink shrink-0">
             <Terminal className="w-3.5 h-3.5 text-brand-ink" />
             <span>Terminal</span>
           </div>
 
-          <div className="flex items-center gap-1">
+          <div className="flex min-w-0 items-center gap-1 overflow-x-auto">
             {tabs.map((tab) => {
               const isActive = tab.id === activeTab?.id;
               return (
@@ -372,6 +371,7 @@ export function WebShellDrawer({
                 >
                   <button
                     type="button"
+                    aria-pressed={isActive}
                     onClick={() => setActiveTabId(tab.id)}
                     className="inline-flex items-center gap-1.5"
                   >
@@ -400,10 +400,11 @@ export function WebShellDrawer({
           </div>
 
           {/* New Terminal Target Menu */}
-          <div className="relative shrink-0">
+          <div className="shrink-0">
             <button
               type="button"
               aria-label="New terminal tab"
+              aria-expanded={newMenuOpen}
               title="Open another worktree terminal"
               onClick={() => setNewMenuOpen((v) => !v)}
               className="p-1 rounded-md text-ink-muted hover:text-ink hover:bg-hover transition-colors"
@@ -416,16 +417,16 @@ export function WebShellDrawer({
                   className="fixed inset-0 z-20"
                   onClick={() => setNewMenuOpen(false)}
                 />
-                <div className="absolute left-0 bottom-full mb-1.5 w-52 rounded-xl border border-line-strong bg-panel shadow-2xl p-1 z-30 space-y-0.5 text-xs">
+                <div className="absolute left-3 bottom-full mb-1.5 w-52 rounded-xl border border-line-strong bg-panel shadow-2xl p-1 z-30 space-y-0.5 text-xs">
                   <div className="px-2.5 py-1 text-[10px] uppercase tracking-wider font-semibold text-ink-muted">
                     Launch terminal in
                   </div>
                   <button
                     type="button"
-                    onClick={() => addTab(null, "integration")}
+                    onClick={() => addTab(null, workspaceLabel)}
                     className="w-full px-2.5 py-1.5 rounded-lg text-left hover:bg-hover text-ink font-mono text-[11px]"
                   >
-                    integration
+                    {workspaceLabel}
                   </button>
                   {worktreeMembers.map((m) => (
                     <button
@@ -446,9 +447,9 @@ export function WebShellDrawer({
         <div className="flex items-center gap-1.5 shrink-0">
           <span
             className="hidden lg:inline text-[10.5px] font-mono text-ink-muted truncate max-w-[260px]"
-            title={defaultCwd}
+            title={targetLabel}
           >
-            {defaultCwd}
+            {targetLabel}
           </span>
           {activeTab && (
             <button

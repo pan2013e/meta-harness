@@ -37,6 +37,7 @@ export function Sidebar() {
     archiveSession,
     deleteSessionById,
     setSettingsOpen,
+    setError,
   } = useAppStore();
 
   const [projDropdownOpen, setProjDropdownOpen] = useState(false);
@@ -78,10 +79,20 @@ export function Sidebar() {
   const commitRename = async () => {
     const id = editingSessionId;
     const next = editingTitle.trim();
-    setEditingSessionId(null);
-    if (id && next) {
-      await renameSession(id, next);
+    if (!id || !next) {
+      setEditingSessionId(null);
+      return;
     }
+    try {
+      await renameSession(id, next);
+      setEditingSessionId(null);
+    } catch (error) {
+      setError(error instanceof Error ? error.message : String(error));
+    }
+  };
+
+  const runSessionAction = (operation: Promise<void>) => {
+    void operation.catch((error: unknown) => setError(error instanceof Error ? error.message : String(error)));
   };
 
   return (
@@ -346,6 +357,11 @@ export function Sidebar() {
                       <Archive className="w-3 h-3 shrink-0 opacity-70" />
                       <span className="truncate">{s.title}</span>
                     </span>
+                    <button type="button" aria-label={`Restore ${s.title}`} title="Restore session"
+                      onClick={() => runSessionAction(archiveSession(s.id, false))}
+                      className="rounded-md p-1 text-ink-muted hover:bg-panel hover:text-brand-ink">
+                      <ArchiveRestore className="h-3.5 w-3.5" />
+                    </button>
                     <button
                       type="button"
                       aria-label={`Session options for ${s.title}`}
@@ -419,14 +435,14 @@ export function Sidebar() {
                 const id = contextMenu.sessionId;
                 const isArchived = contextTarget?.archived_at != null;
                 setContextMenu(null);
-                void archiveSession(id, !isArchived);
+                runSessionAction(archiveSession(id, !isArchived));
               }}
               className="w-full flex items-center gap-2 px-2.5 py-1.5 rounded-lg text-left text-ink hover:bg-hover transition-colors"
             >
               {contextTarget?.archived_at != null ? (
                 <>
                   <ArchiveRestore className="w-3.5 h-3.5 text-brand-ink" />
-                  <span>Unarchive</span>
+                  <span>Restore</span>
                 </>
               ) : (
                 <>
@@ -439,9 +455,11 @@ export function Sidebar() {
               type="button"
               role="menuitem"
               onClick={() => {
-                const id = contextMenu.sessionId;
+                const session = contextTarget;
                 setContextMenu(null);
-                void deleteSessionById(id);
+                if (session && window.confirm(`Permanently delete “${session.title}” and its worktrees?`)) {
+                  runSessionAction(deleteSessionById(session.id));
+                }
               }}
               className="w-full flex items-center gap-2 px-2.5 py-1.5 rounded-lg text-left text-neg hover:bg-neg-soft transition-colors"
             >

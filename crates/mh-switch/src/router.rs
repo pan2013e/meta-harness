@@ -78,6 +78,7 @@ pub struct PendingDispatch {
 
 pub struct SessionRuntime {
     pub git_merge_lock: Mutex<()>,
+    pub lifecycle_lock: Mutex<()>,
     shared_cwd_lock: Mutex<()>,
     pub member_locks: Mutex<HashMap<String, Arc<Mutex<()>>>>,
     pub wait_for_graph: Mutex<WaitForGraph>,
@@ -95,6 +96,7 @@ impl Default for SessionRuntime {
     fn default() -> Self {
         Self {
             git_merge_lock: Mutex::new(()),
+            lifecycle_lock: Mutex::new(()),
             shared_cwd_lock: Mutex::new(()),
             member_locks: Mutex::new(HashMap::new()),
             wait_for_graph: Mutex::new(WaitForGraph::new()),
@@ -260,6 +262,11 @@ impl SwitchEngine {
         effort_override: Option<String>,
     ) -> Result<ChatMessage, SwitchError> {
         let session = self.store.get_session(session_id)?;
+        if session.archived_at.is_some() {
+            return Err(SwitchError::Validation(
+                "Restore the session before sending a message.".into(),
+            ));
+        }
         let members = self.store.list_members(session_id)?;
         if members.is_empty() {
             return Err(SwitchError::Validation(
@@ -1024,6 +1031,9 @@ impl SwitchEngine {
             };
             let _member_guard = member_lock.lock().await;
             let session = self.store.get_session(session_id)?;
+            if session.archived_at.is_some() {
+                return Err(SwitchError::Cancelled);
+            }
             let _shared_cwd_guard = if session.isolation_mode == IsolationMode::SharedCwd {
                 Some(rt.shared_cwd_lock.lock().await)
             } else {
@@ -1291,10 +1301,14 @@ impl SwitchEngine {
             });
 
             let pre_head_sha = get_head_sha(&work_cwd).await;
-            let prompt_res = managed
-                .client
-                .prompt(&turn_id, &full_prompt, stream_listener)
-                .await;
+            let prompt_res = if *rt.cancel_epoch.read().await == epoch_at_start {
+                managed
+                    .client
+                    .prompt(&turn_id, &full_prompt, stream_listener)
+                    .await
+            } else {
+                Err(AcpError::Cancelled)
+            };
             *managed.active_turn_id.write().await = None;
 
             let _ = self

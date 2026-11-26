@@ -5,7 +5,7 @@ use std::time::Duration;
 use serde_json::{Value, json};
 use tokio::net::TcpListener;
 
-use mh_acp::{AcpSupervisor, QuotaTracker, init_git_repo};
+use mh_acp::{AcpSupervisor, QuotaTracker, ensure_member_worktree, init_git_repo};
 use mh_core::{AdapterConfig, AppConfig, AppPaths, DispatchTaskSpec, MessageKind, PromoteMode};
 use mh_server::auth::AuthConfig;
 use mh_server::{AppState, build_router};
@@ -529,6 +529,31 @@ async fn default_new_session_title_auto_renames_context_defaults_and_web_shell()
         .unwrap();
     assert_eq!(cd_ok["exit_code"], 0);
     assert!(cd_ok["cwd"].as_str().unwrap().ends_with("sub"));
+    let cd_main: Value = http
+        .post(format!("{base_url}/api/sessions/{session_id}/run-command"))
+        .json(&json!({ "command": format!("cd \"{}\"", repo_root.display()) }))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(cd_main["exit_code"], 1);
+
+    let file = http
+        .get(format!(
+            "{base_url}/api/sessions/{session_id}/files/README.md"
+        ))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(file.status(), reqwest::StatusCode::OK);
+    assert!(
+        file.headers()["content-security-policy"]
+            .to_str()
+            .unwrap()
+            .starts_with("sandbox")
+    );
 
     // Per-member model config update works
     let cfg_upd: Value = http
@@ -684,6 +709,16 @@ async fn standalone_archive_compact_and_storage_cleanup_lifecycle() {
         .unwrap();
     assert_eq!(prom.status(), reqwest::StatusCode::BAD_REQUEST);
 
+    let int_branch = sess_resp["session"]["integration_branch"].as_str().unwrap();
+    let shell_worktree = ensure_member_worktree(&ws_root, &sid, int_branch, "codex")
+        .await
+        .unwrap();
+    std::fs::write(
+        shell_worktree.path.join("shell-notes.txt"),
+        "keep this work\n",
+    )
+    .unwrap();
+
     // 3. Archive prunes checkouts, hides from default list, unarchive restores checkout
     let arch_resp: Value = http
         .patch(format!("{base_url}/api/sessions/{sid}"))
@@ -696,6 +731,21 @@ async fn standalone_archive_compact_and_storage_cleanup_lifecycle() {
         .unwrap();
     assert!(arch_resp["session"]["archived_at"].is_number());
     assert!(!int_wt.exists());
+
+    let blocked = http
+        .post(format!("{base_url}/api/sessions/{sid}/messages"))
+        .json(&json!({ "content": "This session is archived" }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(blocked.status(), reqwest::StatusCode::BAD_REQUEST);
+    let shell = http
+        .post(format!("{base_url}/api/sessions/{sid}/run-command"))
+        .json(&json!({ "command": "cd" }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(shell.status(), reqwest::StatusCode::CONFLICT);
 
     let branch_out = std::process::Command::new("git")
         .args(["branch", "--list", &format!("mh/{sid}/integration")])
@@ -736,13 +786,32 @@ async fn standalone_archive_compact_and_storage_cleanup_lifecycle() {
     assert!(unarch_resp["session"]["archived_at"].is_null());
     assert!(int_wt.exists());
 
+    let restored = ensure_member_worktree(&ws_root, &sid, int_branch, "codex")
+        .await
+        .unwrap();
+    assert_eq!(
+        std::fs::read_to_string(restored.path.join("shell-notes.txt"))
+            .unwrap()
+            .trim_end(),
+        "keep this work"
+    );
+
     // 4. Compact updates working_summary and posts compaction message
     http.post(format!("{base_url}/api/sessions/{sid}/messages"))
         .json(&json!({ "content": "@codex [MOCK:WRITE path=\"note.txt\" content=\"hi\\n\"]" }))
         .send()
         .await
+        .unwrap()
+        .error_for_status()
         .unwrap();
-    tokio::time::sleep(Duration::from_millis(400)).await;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(12);
+    while !int_wt.join("note.txt").is_file() {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "restored session did not run an ACP turn and integrate its edit"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
 
     let cmp_resp: Value = http
         .post(format!("{base_url}/api/sessions/{sid}/compact"))

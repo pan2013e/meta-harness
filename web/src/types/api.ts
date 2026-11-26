@@ -497,3 +497,8 @@ export type WsEvent =
   | { type: "memory.job_curated"; job: EpisodicJob }
   | { type: "session.updated"; session: Session }
   | { type: "context.updated"; session_id: string; report: SessionContextReport };
+export interface AppUpdateCheck {
+  status: "unsupported" | "no_release" | "current" | "missing_asset" | "available";
+  latest_version: string | null;
+  release_url: string;
+}

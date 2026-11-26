@@ -36,6 +36,10 @@ Right-click any session (or click `...`) to **Rename**, **Archive**, or **Delete
 
 When an unmentioned prompt reaches the **Orchestrator**, Meta-Harness supplies current subscription quota headroom, discovered model/effort catalogs, and top matches from **Project Memory** so the orchestrator can pick suitable harnesses, models, and reasoning efforts.
 
+### Project instructions
+
+Harnesses start from their assigned worktree or the shared workspace. Commit project instruction files so they are present in new worktrees. Codex and Antigravity CLI discover `AGENTS.md` in their workspace. Claude Code uses `CLAUDE.md`, which can import a shared file with `@AGENTS.md`. The Gemini CLI fallback uses `GEMINI.md` by default. Personal instructions and installed tools follow the selected harness profile.
+
 ### Inter-Harness Collaboration & Activity Timelines
 
 While working concurrently, harnesses connect through Meta-Harness's embedded MCP switch (`meta-harness mcp-bridge`):

@@ -32,6 +32,9 @@ dunce = { workspace = true }
 dirs = { workspace = true }
 which = { workspace = true }
 portable-pty = { workspace = true }
+semver = "1"
+self-replace = "1.5.1"
+tempfile = { workspace = true }
 
 [target.'cfg(any(windows, target_os = "macos"))'.dependencies]
 tao = "0.38"
@@ -42,6 +45,3 @@ windows-sys = { version = "0.59", features = ["Win32_System_Console"] }
 
 [target.'cfg(windows)'.build-dependencies]
 winresource = "0.1"
-
-[dev-dependencies]
-tempfile = { workspace = true }

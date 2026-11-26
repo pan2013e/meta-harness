@@ -25,10 +25,17 @@ Install **Git** and at least one supported ACP harness CLI signed in with your o
 
 ### Option 1: Prebuilt Desktop App or Standalone Binary (Recommended)
 
-Download the Electron installer/archive or standalone native binary for Windows or macOS from the [GitHub Releases](https://github.com/pan2013e/meta-harness/releases) or [Release build workflow](https://github.com/pan2013e/meta-harness/actions/workflows/release-build.yml).
+Download the installer or standalone binary for your platform and architecture from [GitHub Releases](https://github.com/pan2013e/meta-harness/releases).
 
-- **Desktop App (Electron):** Opens Meta-Harness in its own native window and stays accessible from the system tray / menu bar.
-- **Standalone Binary (`meta-harness`):** Serves the full web UI at `http://127.0.0.1:4410` and opens your browser automatically (with native tray controls on Windows/macOS; pass `--no-tray` or `--no-open` for headless operation).
+- **Desktop on Windows.** Run `meta-harness-desktop-windows-x64.exe` to install. To remove it, use **Settings → Apps → Installed apps**.
+- **Desktop on macOS.** Open the `meta-harness-desktop-macos-*.dmg` for your architecture and drag Meta-Harness into Applications. To remove it, quit and move Meta-Harness from Applications to the Trash.
+- **Standalone binary.** Run the downloaded `meta-harness-cli-*` file directly after making it executable on macOS (`chmod +x ./meta-harness-cli-macos-arm64` for Apple Silicon). Or run the download with `install` to copy it to a per-user bin directory. The command prints the installation path and tells you if the directory needs to be added to `PATH`.
+
+Desktop users can open **Settings → About → Check for updates**. **Update and quit** downloads and verifies the installer, then closes Meta-Harness and opens the installer. On macOS, drag the new app into Applications and choose **Replace**. On Windows, complete the installer to update the existing installation.
+
+For the standalone binary, use `meta-harness update --check` to check the release feed and `meta-harness update` to download and replace the binary. Quit and restart any running instance to use the new version. `meta-harness uninstall` removes a copy installed with `install`. If you installed to a custom directory, pass the same `--bin-dir` to `uninstall`. Removing the desktop or standalone binary keeps your sessions, profiles, and settings.
+
+The standalone binary serves the web UI at `http://127.0.0.1:4410` and opens your browser automatically. Pass `--no-tray` or `--no-open` for headless operation.
 
 ### Option 2: Build from Source
 
@@ -102,6 +109,8 @@ meta-harness/
 ```
 
 ### Versioning & Release Checks
+
+To publish a version, run the [Release build workflow](https://github.com/pan2013e/meta-harness/actions/workflows/release-build.yml) from its `vMAJOR.MINOR.PATCH` tag with **Publish a GitHub release** enabled. GitHub publishes the release once the Windows and macOS builds succeed.
 
 - Bump versions across Rust, web, and Electron manifests together with `node scripts/version.mjs <patch|minor|major>` and validate alignment with `node scripts/version.mjs --check`.
 - Pre-commit quality gates:

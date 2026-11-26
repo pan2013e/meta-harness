@@ -2,6 +2,7 @@ use std::{path::Path, process::Command};
 
 fn main() -> std::io::Result<()> {
     track_build_commit();
+    println!("cargo:rerun-if-env-changed=MH_RELEASE_BUILD");
     #[cfg(windows)]
     {
         let icon = "../../assets/icon.ico";

@@ -1,4 +1,5 @@
 import type {
+  AppUpdateCheck,
   AdapterConfig,
   AdapterModelCatalog,
   AdapterModelPref,
@@ -109,7 +110,9 @@ export function ptyWsUrl(
 
 export const api = {
   buildInfo: (signal?: AbortSignal) =>
-    apiFetch<{ version: string; commit: string | null }>("/api/health", { signal }),
+    apiFetch<{ version: string; commit: string | null; release_build: boolean }>("/api/health", { signal }),
+  checkForUpdate: (kind: "cli" | "desktop") =>
+    apiFetch<AppUpdateCheck>(`/api/update?kind=${kind}`),
   estimateDraftTokens: (text: string, signal: AbortSignal) =>
     apiFetch<{ tokens: number }>("/api/context/estimate", { method: "POST", body: JSON.stringify({ text }), signal }),
   authStatus: () =>

@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+## 0.6.0
+
+- Check for GitHub release updates in Settings → About. Verify desktop downloads and hand installation to the Windows installer or macOS disk image.
+- Add `meta-harness update`, `install`, and `uninstall` for standalone release binaries. Stage and verify updates before replacing the installed binary.
+- Build installer and standalone update assets for Windows x64 and macOS Apple Silicon and Intel. Publish the GitHub release after all platform builds succeed.
+
 - Keep the composer and Skills settings in sync when switching projects or opening files quickly.
 - Protect installed skills from duplicate imports and validate a bundle before installing its contents.
 - Keep skill discovery within its designated directories and check every file in a brokered tool approval.

@@ -53,6 +53,7 @@ pub async fn health(State(state): State<AppState>) -> Json<Value> {
         "status": "ok",
         "version": env!("CARGO_PKG_VERSION"),
         "commit": option_env!("MH_BUILD_COMMIT"),
+        "release_build": crate::release::is_release_build(),
         "active_subprocesses": active_procs,
         "os": std::env::consts::OS,
         "arch": std::env::consts::ARCH,

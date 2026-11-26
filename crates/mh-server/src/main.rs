@@ -69,6 +69,27 @@ enum Commands {
         #[arg(long)]
         caller: String,
     },
+    /// Check for and install the latest published standalone release.
+    Update {
+        /// Check the release feed without replacing the executable.
+        #[arg(long)]
+        check: bool,
+    },
+    /// Install this release binary in a user-owned bin directory.
+    Install {
+        #[arg(long)]
+        bin_dir: Option<PathBuf>,
+    },
+    /// Remove the installed binary while keeping sessions and settings.
+    Uninstall {
+        #[arg(long)]
+        bin_dir: Option<PathBuf>,
+    },
+    #[command(hide = true)]
+    StageDesktopUpdate {
+        #[arg(long)]
+        version: String,
+    },
     #[command(hide = true)]
     InternalMockAgent,
 }
@@ -78,7 +99,16 @@ fn main() -> anyhow::Result<()> {
     if std::env::args_os().any(|arg| {
         matches!(
             arg.to_str(),
-            Some("--help" | "-h" | "--version" | "-V" | "--no-tray")
+            Some(
+                "--help"
+                    | "-h"
+                    | "--version"
+                    | "-V"
+                    | "--no-tray"
+                    | "update"
+                    | "install"
+                    | "uninstall"
+            )
         )
     }) && !std::env::args_os().any(|arg| arg == "--desktop-child")
     {
@@ -117,6 +147,21 @@ async fn run(
     tray_shutdown: Option<oneshot::Receiver<()>>,
     tray_ready: Option<oneshot::Sender<String>>,
 ) -> anyhow::Result<()> {
+    match &cli.command {
+        Some(Commands::Update { check }) => return mh_server::release::update_cli(*check).await,
+        Some(Commands::Install { bin_dir }) => {
+            return mh_server::release::install_cli(bin_dir.clone());
+        }
+        Some(Commands::Uninstall { bin_dir }) => {
+            return mh_server::release::uninstall_cli(bin_dir.clone());
+        }
+        Some(Commands::StageDesktopUpdate { version }) => {
+            let path = mh_server::release::stage_desktop_update(version).await?;
+            println!("{}", serde_json::to_string(&path)?);
+            return Ok(());
+        }
+        _ => {}
+    }
     if let Some(Commands::InternalMockAgent) = cli.command {
         mh_acp::mock_agent::run_mock_acp_agent_stdio().await;
         return Ok(());

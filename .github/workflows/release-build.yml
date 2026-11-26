@@ -7,6 +7,10 @@ on:
         description: Build only the native binary
         type: boolean
         default: false
+      publish:
+        description: Publish a GitHub release after all platform builds pass (run from a version tag)
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -16,8 +20,14 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [windows-latest, macos-latest]
-    runs-on: ${{ matrix.os }}
+        include:
+          - runner: windows-latest
+            target: windows-x64
+          - runner: macos-15
+            target: macos-arm64
+          - runner: macos-15-intel
+            target: macos-x64
+    runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@v6
       - uses: actions/setup-node@v6
@@ -28,12 +38,60 @@ jobs:
             web/package-lock.json
             desktop/package-lock.json
       - run: rustup update stable
+      - name: Verify runner architecture
+        env:
+          RELEASE_TARGET: ${{ matrix.target }}
+        run: node -e 'const os = { win32:"windows", darwin:"macos" }[process.platform]; if (`${os}-${process.arch}` !== process.env.RELEASE_TARGET) process.exit(1)'
+      - name: Verify release tag
+        if: inputs.publish
+        shell: bash
+        env:
+          CLI_ONLY: ${{ inputs.cli_only }}
+        run: |
+          test "$CLI_ONLY" = false
+          test "$GITHUB_REF_TYPE" = tag
+          test "$GITHUB_REF_NAME" = "v$(node -p 'require("./web/package.json").version')"
       - run: node scripts/build.mjs ${{ inputs.cli_only && '--cli-only' || '' }}
       - uses: actions/upload-artifact@v7
         with:
-          name: meta-harness-${{ runner.os }}-${{ runner.arch }}
+          name: meta-harness-${{ matrix.target }}
           path: |
             dist/cli
             dist/desktop/*.exe
             dist/desktop/*.zip
             dist/desktop/*.dmg
+      - uses: actions/upload-artifact@v7
+        if: inputs.publish
+        with:
+          name: release-${{ matrix.target }}
+          path: dist/release-assets/*
+          if-no-files-found: error
+
+  publish:
+    if: inputs.publish
+    needs: release
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/download-artifact@v8
+        with:
+          pattern: release-*
+          path: release-assets
+          merge-multiple: true
+      - name: Publish the installers and standalone binaries
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          for asset in meta-harness-cli-windows-x64.exe meta-harness-cli-macos-arm64 meta-harness-cli-macos-x64 \
+            meta-harness-desktop-windows-x64.exe meta-harness-desktop-macos-arm64.dmg meta-harness-desktop-macos-x64.dmg; do
+            test -s "release-assets/$asset"
+          done
+          version="${GITHUB_REF_NAME#v}"
+          awk -v header="## $version" '$0 == header { section=1; next } section && /^## / { exit } section { print }' CHANGELOG.md > release-notes.md
+          if grep -q '[^[:space:]]' release-notes.md; then
+            gh release create "$GITHUB_REF_NAME" release-assets/* --repo "$GITHUB_REPOSITORY" --verify-tag --title "Meta-Harness $version" --notes-file release-notes.md
+          else
+            gh release create "$GITHUB_REF_NAME" release-assets/* --repo "$GITHUB_REPOSITORY" --verify-tag --title "Meta-Harness $version" --generate-notes
+          fi

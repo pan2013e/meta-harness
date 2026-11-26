@@ -17,9 +17,9 @@ if (options.has("--cli-only") && options.has("--unpacked")) {
   throw new Error("Choose --cli-only or --unpacked.");
 }
 
-function run(program, args, cwd = root, capture = false) {
+function run(program, args, cwd = root, capture = false, env = process.env) {
   const stdio = capture ? ["ignore", "pipe", "inherit"] : "inherit";
-  const result = spawnSync(program, args, { cwd, encoding: "utf8", stdio, maxBuffer: 16 * 1024 * 1024, windowsHide: true });
+  const result = spawnSync(program, args, { cwd, env, encoding: "utf8", stdio, maxBuffer: 16 * 1024 * 1024, windowsHide: true });
   if (result.error) throw result.error;
   if (result.status !== 0) throw new Error(program + " exited with " + (result.signal ?? result.status));
   return result.stdout;
@@ -31,7 +31,7 @@ function npm(args, folder) {
   else run("npm", args, cwd);
 }
 
-function notices() {
+function notices(rustHost) {
   const sections = [];
   const thirdParty = (name, version, license, folder) => {
     sections.push(name + " " + version + " (" + (license ?? "see package") + ")");
@@ -41,8 +41,6 @@ function notices() {
       }
     }
   };
-  const rustHost = /^host: (.+)$/m.exec(run("rustc", ["-vV"], root, true))?.[1].trim();
-  if (!rustHost) throw new Error("Could not identify the Rust host target.");
   const cargo = JSON.parse(run("cargo", ["metadata", "--format-version", "1", "--locked", "--filter-platform", rustHost], root, true));
   for (const source of cargo.packages.filter((pkg) => pkg.source)) {
     thirdParty(source.name, source.version, source.license, dirname(source.manifest_path));
@@ -63,19 +61,32 @@ function notices() {
 }
 
 run(process.execPath, ["scripts/version.mjs", "--check"]);
+const rustHost = /^host: (.+)$/m.exec(run("rustc", ["-vV"], root, true))?.[1].trim();
+if (!rustHost) throw new Error("Could not identify the Rust host target.");
+const rustArch = { x86_64: "x64", aarch64: "arm64" }[rustHost.split("-")[0]];
+const platform = { win32: "windows", darwin: "macos", linux: "linux" }[process.platform];
+if (!rustArch || !platform || rustArch !== process.arch) {
+  throw new Error("Use matching native Node.js and Rust installations for x64 or arm64 release builds.");
+}
 npm(["ci"], "web");
-notices();
+notices(rustHost);
 npm(["run", "build"], "web");
 
 const target = join(root, "target", "release-build");
 const binary = windows ? "meta-harness.exe" : "meta-harness";
-run("cargo", ["build", "--locked", "--release", "--bin", "meta-harness", "--target-dir", target]);
+run("cargo", ["build", "--locked", "--release", "--bin", "meta-harness", "--target", rustHost, "--target-dir", target], root, false,
+  { ...process.env, MH_RELEASE_BUILD: "1" });
 const cli = join(root, "dist", "cli");
 mkdirSync(cli, { recursive: true });
-copyFileSync(join(target, "release", binary), join(cli, binary));
+copyFileSync(join(target, rustHost, "release", binary), join(cli, binary));
 copyFileSync(join(root, "LICENSE"), join(cli, "LICENSE.txt"));
 copyFileSync(join(root, "web", "public", "third-party-licenses.txt"), join(cli, "third-party-licenses.txt"));
 console.log("CLI release written to " + cli);
+
+const releaseAssets = join(root, "dist", "release-assets");
+mkdirSync(releaseAssets, { recursive: true });
+const cliAsset = `meta-harness-cli-${platform}-${rustArch}${windows ? ".exe" : ""}`;
+copyFileSync(join(cli, binary), join(releaseAssets, cliAsset));
 
 if (!options.has("--cli-only")) {
   const staging = join(root, "desktop", "staging");
@@ -84,4 +95,8 @@ if (!options.has("--cli-only")) {
   npm(["ci"], "desktop");
   npm(["run", options.has("--unpacked") ? "pack" : "release"], "desktop");
   console.log("Desktop release written to " + join(root, "dist", "desktop"));
+  if (!options.has("--unpacked") && (windows || process.platform === "darwin")) {
+    const installer = `meta-harness-desktop-${platform}-${rustArch}.${windows ? "exe" : "dmg"}`;
+    copyFileSync(join(root, "dist", "desktop", installer), join(releaseAssets, installer));
+  }
 }

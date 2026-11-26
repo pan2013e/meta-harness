@@ -12,6 +12,7 @@ import { DiffReviewModal } from "./components/modals/DiffReviewModal";
 import { FilePreviewModal } from "./components/modals/FilePreviewModal";
 import { MemoryModal } from "./components/modals/MemoryModal";
 import { SettingsDialog } from "./components/modals/SettingsDialog";
+import { AboutUpdates } from "./components/modals/AboutUpdates";
 import { PersonaModelFields } from "./components/modals/PersonaModelFields";
 import { Sidebar } from "./components/sidebar/Sidebar";
 import { cleanWorktreePath, groupTrajectoryEvents } from "./components/drawer/trajectory";
@@ -278,6 +279,21 @@ describe("Session navigation", () => {
 });
 
 describe("UI primitives", () => {
+  it("installs only the desktop version returned by an explicit update check", async () => {
+    const installUpdate = vi.fn().mockResolvedValue(undefined);
+    vi.stubGlobal("metaHarnessDesktop", { installUpdate });
+    const check = vi.spyOn(api, "checkForUpdate").mockResolvedValue({
+      status: "available", latest_version: "0.6.1", release_url: "https://github.com/pan2013e/meta-harness/releases/tag/v0.6.1",
+    });
+    render(<AboutUpdates />);
+    expect(check).not.toHaveBeenCalled();
+    expect(screen.queryByRole("button", { name: "Update and quit" })).toBeNull();
+    fireEvent.click(screen.getByRole("button", { name: "Check for updates" }));
+    fireEvent.click(await screen.findByRole("button", { name: "Update and quit" }));
+    expect(check).toHaveBeenCalledWith("desktop");
+    expect(installUpdate).toHaveBeenCalledWith("0.6.1");
+  });
+
   it("shows a shared usage note with private-profile quota windows in compact views", () => {
     render(<QuotaSnapshotSummary compact quota={{
       adapter_id: "antigravity", plan_label: "Google Account",

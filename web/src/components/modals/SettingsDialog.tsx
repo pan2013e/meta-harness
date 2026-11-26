@@ -25,6 +25,7 @@ import { PersonaModelFields, type PersonaModel } from "./PersonaModelFields";
 import { GlobalPersonas } from "./GlobalPersonas";
 import { SettingsBackup } from "./SettingsBackup";
 import { SkillsSettings } from "./SkillsSettings";
+import { AboutUpdates } from "./AboutUpdates";
 import { version } from "../../../package.json";
 
 function formatBytes(bytes: number): string {
@@ -295,6 +296,7 @@ export function SettingsDialog({ onClose }: { onClose: () => void }) {
                     <a className="underline" href="https://github.com/pan2013e/meta-harness/blob/main/LICENSE" target="_blank" rel="noreferrer">MIT License</a>
                   </div>
                 </div>
+                {buildInfo?.release_build && <AboutUpdates />}
                 <div className="space-y-2 border-t border-line pt-4">
                   <h3 className="font-medium">Open-source software</h3>
                   <ul className="space-y-1 text-xs text-ink-soft">

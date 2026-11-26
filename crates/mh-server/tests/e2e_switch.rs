@@ -32,6 +32,7 @@ fn mock_app_config() -> AppConfig {
                 fallback_commands: Vec::new(),
                 quota_provider: "manual".into(),
                 exact_quota_probe_opt_in: false,
+                profile_dir: None,
                 characteristics: Default::default(),
             },
         );
@@ -75,6 +76,7 @@ async fn start_test_server(
     let state = AppState {
         switch: Arc::clone(&switch),
         auth: auth.clone(),
+        harness_jobs: Default::default(),
     };
 
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -646,6 +648,7 @@ async fn start_test_server_with_paths() -> (
     let state = AppState {
         switch: Arc::clone(&switch),
         auth,
+        harness_jobs: Default::default(),
     };
 
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -872,6 +875,72 @@ async fn standalone_archive_compact_and_storage_cleanup_lifecycle() {
     assert!(!ws_root.exists());
     assert_eq!(del_arch["storage"]["archived_sessions_count"], 0);
 
+    switch.supervisor.shutdown_all().await;
+    srv.abort();
+}
+
+#[tokio::test]
+async fn personas_share_an_adapter_with_independent_preferences_and_can_be_removed() {
+    let (base_url, switch, srv, _tmp, _paths) = start_test_server_with_paths().await;
+    let http = reqwest::Client::new();
+    let created: Value = http
+        .post(format!("{base_url}/api/sessions"))
+        .json(&json!({"title":"Persona test", "orchestrator_member":"codex"}))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let sid = created["session"]["id"].as_str().unwrap();
+    let endpoint = format!("{base_url}/api/sessions/{sid}");
+    for (handle, model, effort) in [
+        ("reviewer", "gpt-5.4", "high"),
+        ("writer", "gpt-5.4-mini", "low"),
+    ] {
+        let member: Value = http
+            .post(format!("{endpoint}/members"))
+            .json(&json!({"handle":handle, "adapter_id":"codex",
+                "active_model":model, "active_effort":effort}))
+            .send()
+            .await
+            .unwrap()
+            .error_for_status()
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(member["member"]["adapter_id"], "codex");
+        assert_eq!(member["member"]["active_model"], model);
+        assert_eq!(member["member"]["active_effort"], effort);
+    }
+    http.patch(&endpoint)
+        .json(&json!({"orchestrator_member":"reviewer"}))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap();
+    http.delete(format!("{endpoint}/members/reviewer"))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap();
+    assert!(switch.store.get_member(sid, "reviewer").is_err());
+    assert!(
+        switch
+            .store
+            .get_session(sid)
+            .unwrap()
+            .orchestrator_member
+            .is_none()
+    );
+    let writer = switch.store.get_member(sid, "writer").unwrap();
+    assert_eq!(writer.active_model.as_deref(), Some("gpt-5.4-mini"));
+    assert_eq!(writer.active_effort.as_deref(), Some("low"));
     switch.supervisor.shutdown_all().await;
     srv.abort();
 }

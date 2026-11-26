@@ -371,7 +371,7 @@ Supports four selectable themes (`Obsidian Studio`, `Tokyo Night`, `Catppuccin M
    - **Top Session Changes Bar**: Shows `mh/<sid>/integration` ahead of `main` (`+142 / -31 · 5 files`), **[Diff]** (`DiffViewer` per-file +/- view), **[Preview / Shell]**, and **[Promote ▾]** (`Fast-Forward / Merge`, `Squash Merge`, `Apply Uncommitted Patch`).
    - **Developer Thread Group Chat Stream**:
      - Right-aligned user bubbles and left-aligned harness replies with rich Markdown rendering, **Orchestrator Dispatch Cards**, **Collapsible `peer_consult` Threads**, **Trajectory Read Pills**, **Git Clean-Merge / Conflict Notices**, and **Worktree-Smart Permission Cards**.
-   - **Keyboard-Navigable `@mention` Composer**: Auto-resizing input autocompleting `@member` with live quota % badges, `@all`, `@orchestrator`, and `Confirm Plan First` pill toggle.
+   - **Keyboard-navigable composer** with an auto-resizing input, autocomplete for `@member` with live quota badges, `@all`, `@orchestrator`, and slash commands such as `/plan`. The model and effort menu follows the orchestrator or the single mentioned member. Group messages use each member's settings.
 3. **Right Inspector Drawer**:
    - **Trajectory**: Thoughts and plans, plus collapsible tool calls with status, terminal output, and file diffs. Codex terminal chunks attach to their parent call, so the tool count reflects distinct calls.
    - **Memory Ledger**: Orchestrator-curated job history & pinned architectural/affinity facts.

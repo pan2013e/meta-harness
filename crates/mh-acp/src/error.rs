@@ -11,6 +11,8 @@ pub enum AcpError {
     Core(#[from] mh_core::CoreError),
     #[error("command not found on PATH: {0}")]
     CommandNotFound(String),
+    #[error("invalid harness profile: {0}")]
+    InvalidProfile(String),
     #[error("git command failed: {0}")]
     Git(String),
     #[error("git merge conflict in files: {conflicting_files:?}")]

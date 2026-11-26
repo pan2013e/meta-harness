@@ -10,9 +10,9 @@ use mh_core::{
     ModelChoiceDetail, PendingPermissionView, PermissionPolicy, PermissionRule,
     TrajectoryEventKind,
 };
-use serde_json::Value;
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-use tokio::process::Command;
+use serde_json::{Value, json};
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, Lines};
+use tokio::process::{ChildStdout, Command};
 use tokio::sync::{Mutex, RwLock};
 use tracing::{debug, info};
 
@@ -44,6 +44,7 @@ pub struct ManagedMemberClient {
     member_worktree: PathBuf,
     permission_policy: PermissionPolicy,
     adapter_id: String,
+    profile_dir: Option<PathBuf>,
 }
 
 type ClientMap = HashMap<(String, String), Arc<ManagedMemberClient>>;
@@ -54,6 +55,7 @@ pub struct AcpSupervisor {
     clients: Arc<Mutex<ClientMap>>,
     closed_sessions: Arc<RwLock<HashSet<String>>>,
     catalog_cache: Mutex<HashMap<String, (Instant, AdapterModelCatalog)>>,
+    adapter_activity: Mutex<HashMap<String, Arc<RwLock<()>>>>,
     idle_ttl: Duration,
 }
 
@@ -63,6 +65,7 @@ impl AcpSupervisor {
             clients: Arc::new(Mutex::new(HashMap::new())),
             closed_sessions: Arc::new(RwLock::new(HashSet::new())),
             catalog_cache: Mutex::new(HashMap::new()),
+            adapter_activity: Mutex::new(HashMap::new()),
             idle_ttl: Duration::from_secs(idle_process_ttl_secs.max(30)),
         });
 
@@ -96,6 +99,7 @@ impl AcpSupervisor {
                 && existing.member_worktree == spec.member_worktree
                 && existing.permission_policy == spec.permission_policy
                 && existing.adapter_id == spec.adapter_id
+                && existing.profile_dir == spec.adapter.profile_dir
                 && existing.client.is_alive().await
             {
                 *existing.last_used.lock().await = Instant::now();
@@ -112,7 +116,9 @@ impl AcpSupervisor {
         }
 
         let started = Instant::now();
-        let (command, args) = resolve_adapter_command(&spec.adapter)?;
+        let (command, mut args) = resolve_adapter_command(&spec.adapter)?;
+        let mut extra_env = spec.extra_env;
+        crate::profile::apply_profile(&spec.adapter, &command, &mut args, &mut extra_env).await?;
         let active_turn_id = Arc::new(RwLock::new(None));
         let broker_ctx = MemberBrokerContext {
             session_id: spec.session_id.clone(),
@@ -128,7 +134,7 @@ impl AcpSupervisor {
             &command,
             &args,
             &spec.member_worktree,
-            &spec.extra_env,
+            &extra_env,
             broker_ctx,
             callbacks,
         )
@@ -176,6 +182,7 @@ impl AcpSupervisor {
             member_worktree: spec.member_worktree,
             permission_policy: spec.permission_policy,
             adapter_id: spec.adapter_id,
+            profile_dir: spec.adapter.profile_dir,
         });
 
         let inserted = {
@@ -220,25 +227,46 @@ impl AcpSupervisor {
         }
     }
 
-    pub async fn apply_member_config(
-        &self,
-        session_id: &str,
-        member_handle: &str,
-        model: Option<&str>,
-        effort: Option<&str>,
-    ) -> Option<(Option<String>, Option<String>)> {
-        let client = {
-            let guard = self.clients.lock().await;
-            guard
-                .get(&(session_id.to_string(), member_handle.to_string()))
-                .map(|m| Arc::clone(&m.client))
-        };
-        if let Some(c) = client
-            && c.is_alive().await
-        {
-            return Some(c.apply_model_and_effort(model, effort).await);
+    pub async fn adapter_activity(&self, id: &str) -> Arc<RwLock<()>> {
+        Arc::clone(
+            self.adapter_activity
+                .lock()
+                .await
+                .entry(id.to_string())
+                .or_default(),
+        )
+    }
+
+    pub async fn retire_member(&self, session_id: &str, handle: &str) {
+        let removed = self
+            .clients
+            .lock()
+            .await
+            .remove(&(session_id.into(), handle.into()));
+        if let Some(member) = removed {
+            member.client.shutdown().await;
         }
-        None
+    }
+
+    pub async fn retire_adapter(&self, adapter_id: &str) {
+        let removed = {
+            let mut clients = self.clients.lock().await;
+            let keys: Vec<_> = clients
+                .iter()
+                .filter(|(_, member)| member.adapter_id == adapter_id)
+                .map(|(key, _)| key.clone())
+                .collect();
+            keys.into_iter()
+                .filter_map(|key| clients.remove(&key))
+                .collect::<Vec<_>>()
+        };
+        for member in removed {
+            member.client.shutdown().await;
+        }
+    }
+
+    pub async fn invalidate_catalog(&self, adapter_id: &str) {
+        self.catalog_cache.lock().await.remove(adapter_id);
     }
 
     /// Runs a short-lived ephemeral ACP turn (used for low-effort utility passes such as
@@ -251,7 +279,9 @@ impl AcpSupervisor {
         prompt_text: &str,
         timeout_dur: Duration,
     ) -> Result<String, AcpError> {
-        let (command, args) = resolve_adapter_command(adapter)?;
+        let (command, mut args) = resolve_adapter_command(adapter)?;
+        let mut extra_env = Vec::new();
+        crate::profile::apply_profile(adapter, &command, &mut args, &mut extra_env).await?;
         let active_turn_id = Arc::new(RwLock::new(Some("ephemeral_title".to_string())));
         let broker_ctx = MemberBrokerContext {
             session_id: "ephemeral".into(),
@@ -263,7 +293,8 @@ impl AcpSupervisor {
             rules: Arc::new(RwLock::new(Vec::new())),
         };
         let callbacks = Arc::new(EphemeralCallbacks);
-        let client = AcpClient::spawn(&command, &args, cwd, &[], broker_ctx, callbacks).await?;
+        let client =
+            AcpClient::spawn(&command, &args, cwd, &extra_env, broker_ctx, callbacks).await?;
         let listener = Arc::new(NoopStreamListener);
         let res = tokio::time::timeout(timeout_dur, async {
             client.initialize().await?;
@@ -334,10 +365,12 @@ impl AcpSupervisor {
         &self,
         adapter_id: &str,
         adapter: &AdapterConfig,
+        refresh: bool,
     ) -> AdapterModelCatalog {
         {
             let cache = self.catalog_cache.lock().await;
-            if let Some((ts, cat)) = cache.get(adapter_id)
+            if !refresh
+                && let Some((ts, cat)) = cache.get(adapter_id)
                 && ts.elapsed() < Duration::from_secs(600)
             {
                 return cat.clone();
@@ -345,13 +378,15 @@ impl AcpSupervisor {
         }
 
         let mut catalog = builtin_adapter_catalog(adapter_id);
-        if adapter_id == "codex"
-            && adapter.quota_provider != "manual"
-            && let Some(codex_bin) = find_cli_binary("codex")
-            && let Some(live) = probe_codex_models(&codex_bin).await
-        {
-            catalog = live;
-            if let Some(cfg_model) = read_codex_configured_model()
+        let Ok(_activity) = self.adapter_activity(adapter_id).await.try_read_owned() else {
+            return catalog;
+        };
+        if adapter.quota_provider == "codex_local" && adapter.enabled {
+            if let Some(live) = probe_codex_models(adapter).await {
+                catalog = live;
+                catalog.adapter_id = adapter_id.to_string();
+            }
+            if let Some(cfg_model) = read_codex_configured_model(adapter.profile_dir.as_deref())
                 && !catalog
                     .models
                     .iter()
@@ -369,12 +404,27 @@ impl AcpSupervisor {
                     ModelChoiceDetail {
                         value: cfg_model.clone(),
                         label: cfg_model,
-                        description: "Configured in ~/.codex/config.toml".into(),
+                        description: "Configured in the Codex profile".into(),
                         is_default: false,
                         default_effort: None,
                         supported_efforts: catalog.efforts.clone(),
                     },
                 );
+            }
+        }
+        if adapter.quota_provider == "google_local"
+            && let Ok((command, _)) = resolve_adapter_command(adapter)
+            && crate::profile::is_agy(&command)
+        {
+            let live = if adapter.profile_dir.is_some() {
+                probe_agy_profile_catalog(adapter, adapter_id).await
+            } else {
+                crate::antigravity::run_agy(&command, None, &["models"])
+                    .await
+                    .and_then(|output| crate::antigravity::model_catalog(&output, adapter_id))
+            };
+            if let Some(live) = live {
+                catalog = live;
             }
         }
 
@@ -425,6 +475,65 @@ impl AcpSupervisor {
     }
 }
 
+async fn probe_agy_profile_catalog(
+    adapter: &AdapterConfig,
+    adapter_id: &str,
+) -> Option<AdapterModelCatalog> {
+    if !crate::quota::has_google_cli_auth(adapter.profile_dir.as_deref(), true) {
+        return None;
+    }
+    let temp = tempfile::tempdir().ok()?;
+    let (command, mut args) = resolve_adapter_command(adapter).ok()?;
+    let mut env = vec![("AGY_CLI_DISABLE_AUTO_UPDATE".into(), "true".into())];
+    crate::profile::apply_profile(adapter, &command, &mut args, &mut env)
+        .await
+        .ok()?;
+    let cwd = temp.path();
+    let context = MemberBrokerContext {
+        session_id: "catalog".into(),
+        member_handle: adapter_id.into(),
+        project_root: cwd.to_path_buf(),
+        member_worktree: cwd.to_path_buf(),
+        permission_policy: PermissionPolicy::Strict,
+        active_turn_id: Arc::new(RwLock::new(None)),
+        rules: Arc::new(RwLock::new(Vec::new())),
+    };
+    let client = AcpClient::spawn(
+        &command,
+        &args,
+        cwd,
+        &env,
+        context,
+        Arc::new(EphemeralCallbacks),
+    )
+    .await
+    .ok()?;
+    let result = tokio::time::timeout(Duration::from_secs(10), async {
+        client.initialize().await.ok()?;
+        let response = client.new_session(cwd, Vec::new()).await.ok()?;
+        let models = response.models?;
+        let rows = models
+            .get("availableModels")?
+            .as_array()?
+            .iter()
+            .filter_map(|model| {
+                Some(format!(
+                    "{}\t{}",
+                    model.get("modelId")?.as_str()?,
+                    model.get("name")?.as_str()?
+                ))
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        crate::antigravity::model_catalog(&rows, adapter_id)
+    })
+    .await
+    .ok()
+    .flatten();
+    client.shutdown().await;
+    result
+}
+
 fn format_effort_label(val: &str) -> String {
     match val.to_ascii_lowercase().as_str() {
         "low" => "Low".into(),
@@ -437,8 +546,64 @@ fn format_effort_label(val: &str) -> String {
     }
 }
 
-async fn probe_codex_models(codex_bin: &Path) -> Option<AdapterModelCatalog> {
-    let mut cmd = Command::new(codex_bin);
+pub(crate) fn codex_model_command(adapter: &AdapterConfig) -> Option<Command> {
+    if let Some(override_path) = std::env::var_os("CODEX_PATH")
+        .and_then(|path| path.into_string().ok())
+        .filter(|path| !path.is_empty())
+    {
+        return find_cli_binary(&override_path).map(Command::new);
+    }
+    if let Ok((launcher, _)) = resolve_adapter_command(adapter) {
+        let launcher = PathBuf::from(launcher);
+        let actual = dunce::canonicalize(&launcher).unwrap_or_else(|_| launcher.clone());
+        let bundled = actual
+            .ancestors()
+            .chain(launcher.ancestors())
+            .find_map(|parent| {
+                let node_modules = if parent
+                    .file_name()
+                    .is_some_and(|name| name == "node_modules")
+                {
+                    parent.to_path_buf()
+                } else {
+                    parent.join("node_modules")
+                };
+                [
+                    node_modules.join(
+                        "@agentclientprotocol/codex-acp/node_modules/@openai/codex/bin/codex.js",
+                    ),
+                    node_modules.join("@openai/codex/bin/codex.js"),
+                ]
+                .into_iter()
+                .find(|entry| entry.is_file())
+            });
+        if let Some(bundle) = bundled
+            && let Some(node) = find_cli_binary("node")
+        {
+            let mut command = Command::new(node);
+            command.arg(dunce::simplified(&bundle));
+            return Some(command);
+        }
+    }
+    find_cli_binary("codex").map(Command::new)
+}
+
+async fn read_codex_result(lines: &mut Lines<BufReader<ChildStdout>>, id: i64) -> Option<Value> {
+    while let Some(line) = lines.next_line().await.ok().flatten() {
+        if let Ok(mut frame) = serde_json::from_str::<Value>(&line)
+            && frame.get("id").and_then(Value::as_i64) == Some(id)
+        {
+            return frame.get_mut("result").map(Value::take);
+        }
+    }
+    None
+}
+
+async fn probe_codex_models(adapter: &AdapterConfig) -> Option<AdapterModelCatalog> {
+    let mut cmd = codex_model_command(adapter)?;
+    if let Some(profile) = adapter.profile_dir.as_deref() {
+        cmd.env("CODEX_HOME", dunce::simplified(profile));
+    }
     cmd.args(["app-server", "--stdio"])
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -462,37 +627,43 @@ async fn probe_codex_models(codex_bin: &Path) -> Option<AdapterModelCatalog> {
         stdin.flush().await.ok()?;
 
         let mut lines = BufReader::new(stdout).lines();
-        for _ in 0..8 {
-            let line = lines.next_line().await.ok().flatten()?;
-            if let Ok(val) = serde_json::from_str::<Value>(&line)
-                && val.get("id").and_then(Value::as_i64) == Some(1)
-            {
-                break;
-            }
-        }
+        read_codex_result(&mut lines, 1).await?;
 
         stdin
             .write_all(
                 br#"{"jsonrpc":"2.0","method":"initialized"}
-{"jsonrpc":"2.0","id":2,"method":"model/list","params":{}}
 "#,
             )
             .await
             .ok()?;
         stdin.flush().await.ok()?;
 
-        for _ in 0..24 {
-            let line = lines.next_line().await.ok().flatten()?;
-            if let Ok(val) = serde_json::from_str::<Value>(&line)
-                && val.get("id").and_then(Value::as_i64) == Some(2)
-            {
-                return val.get("result").and_then(parse_codex_models_result);
+        let mut models = Vec::new();
+        let mut cursor: Option<String> = None;
+        let mut seen = HashSet::new();
+        for id in 2..=17 {
+            let request = json!({"jsonrpc":"2.0", "id":id, "method":"model/list", "params":{"cursor":cursor, "limit":100, "includeHidden":false}});
+            stdin
+                .write_all(format!("{request}\n").as_bytes())
+                .await
+                .ok()?;
+            stdin.flush().await.ok()?;
+            let mut page = read_codex_result(&mut lines, id).await?;
+            models.append(page.get_mut("data")?.as_array_mut()?);
+            cursor = page
+                .get("nextCursor")
+                .and_then(Value::as_str)
+                .map(str::to_string);
+            match &cursor {
+                None => return parse_codex_models_result(&json!({"data": models})),
+                Some(next) if !seen.insert(next.clone()) => return None,
+                _ => {}
             }
         }
         None
     };
 
-    let catalog = tokio::time::timeout(Duration::from_secs(5), rpc_fut)
+    let catalog = tokio::time::timeout(Duration::from_secs(8), rpc_fut)
         .await
         .ok()
         .flatten();
@@ -508,16 +679,24 @@ fn parse_codex_models_result(result: &Value) -> Option<AdapterModelCatalog> {
     let mut model_details = Vec::new();
     let mut effort_union: Vec<ConfigOptionChoice> = Vec::new();
     let mut seen_efforts: HashSet<String> = HashSet::new();
+    let mut seen_models = HashSet::new();
 
     for entry in data {
         if entry.get("hidden").and_then(Value::as_bool) == Some(true) {
             continue;
         }
-        let id = entry
-            .get("id")
-            .or_else(|| entry.get("model"))
-            .and_then(Value::as_str)?
-            .to_string();
+        let Some(id) = ["model", "id"].into_iter().find_map(|key| {
+            entry
+                .get(key)
+                .and_then(Value::as_str)
+                .filter(|id| !id.is_empty())
+        }) else {
+            continue;
+        };
+        if !seen_models.insert(id.to_string()) {
+            continue;
+        }
+        let id = id.to_string();
         let display = entry
             .get("displayName")
             .and_then(Value::as_str)
@@ -602,7 +781,7 @@ pub fn builtin_adapter_catalog(adapter_id: &str) -> AdapterModelCatalog {
         })
         .collect();
 
-    let (mut models, mut model_details, efforts) = match adapter_id {
+    let (models, model_details, efforts) = match adapter_id {
         "codex" => {
             let entries = [
                 ("gpt-6-astra", "GPT-6-Astra", true, Some("medium")),
@@ -663,66 +842,8 @@ pub fn builtin_adapter_catalog(adapter_id: &str) -> AdapterModelCatalog {
                 .collect();
             (m, d, effs)
         }
-        "antigravity" => {
-            let effs: Vec<ConfigOptionChoice> = ["low", "medium", "high", "xhigh", "max"]
-                .into_iter()
-                .map(|v| ConfigOptionChoice {
-                    value: v.into(),
-                    label: format_effort_label(v),
-                })
-                .collect();
-            let entries = [
-                ("gemini-2.5-pro", "Gemini 2.5 Pro", true),
-                ("gemini-2.5-flash", "Gemini 2.5 Flash", false),
-            ];
-            let m = entries
-                .iter()
-                .map(|(v, l, _)| ConfigOptionChoice {
-                    value: (*v).into(),
-                    label: (*l).into(),
-                })
-                .collect();
-            let d = entries
-                .iter()
-                .map(|(v, l, def)| ModelChoiceDetail {
-                    value: (*v).into(),
-                    label: (*l).into(),
-                    description: String::new(),
-                    is_default: *def,
-                    default_effort: Some("medium".into()),
-                    supported_efforts: effs.clone(),
-                })
-                .collect();
-            (m, d, effs)
-        }
         _ => (Vec::new(), Vec::new(), Vec::new()),
     };
-
-    if adapter_id == "codex"
-        && let Some(cfg_model) = read_codex_configured_model()
-        && !models
-            .iter()
-            .any(|m| m.value.eq_ignore_ascii_case(&cfg_model))
-    {
-        models.insert(
-            0,
-            ConfigOptionChoice {
-                value: cfg_model.clone(),
-                label: cfg_model.clone(),
-            },
-        );
-        model_details.insert(
-            0,
-            ModelChoiceDetail {
-                value: cfg_model.clone(),
-                label: cfg_model,
-                description: "Configured in ~/.codex/config.toml".into(),
-                is_default: false,
-                default_effort: None,
-                supported_efforts: efforts.clone(),
-            },
-        );
-    }
 
     let default_context_window = match adapter_id {
         "antigravity" => 1_000_000,
@@ -738,10 +859,8 @@ pub fn builtin_adapter_catalog(adapter_id: &str) -> AdapterModelCatalog {
     }
 }
 
-fn read_codex_configured_model() -> Option<String> {
-    let codex_dir = std::env::var_os("CODEX_HOME")
-        .map(PathBuf::from)
-        .or_else(|| dirs::home_dir().map(|h| h.join(".codex")))?;
+fn read_codex_configured_model(profile: Option<&Path>) -> Option<String> {
+    let codex_dir = crate::profile::profile_home(profile, "CODEX_HOME", ".codex")?;
     let raw = std::fs::read_to_string(codex_dir.join("config.toml")).ok()?;
     let val: toml::Value = toml::from_str(&raw).ok()?;
     val.get("model")
@@ -920,6 +1039,21 @@ pub fn build_mcp_bridge_spec(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn codex_catalog_keeps_public_model_slugs_and_skips_invalid_rows() {
+        let catalog = parse_codex_models_result(&json!({"data":[
+            {"hidden":true,"model":"internal"},
+            {"description":"missing model"},
+            {"id":"legacy-id","model":"latest-slug","displayName":"Latest","isDefault":true,
+            "supportedReasoningEfforts":[{"reasoningEffort":"medium"}]},
+            {"model":"latest-slug"}
+        ]}))
+        .unwrap();
+        assert_eq!(catalog.models.len(), 1);
+        assert_eq!(catalog.models[0].value, "latest-slug");
+        assert!(catalog.model_details[0].is_default);
+    }
 
     #[test]
     fn cached_codex_launch_uses_only_a_matching_npm_exec_installation() {

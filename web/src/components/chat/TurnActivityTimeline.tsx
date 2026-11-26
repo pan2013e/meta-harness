@@ -1,28 +1,32 @@
 import { useEffect, useMemo, useState } from "react";
 import { ChevronDown, ChevronRight, FileDiff, Loader2, Sparkles, Terminal } from "lucide-react";
 import { useAppStore } from "../../store/useAppStore";
+import { MarkdownBlock } from "../common/MarkdownBlock";
 import { TrajectoryRow } from "../drawer/TrajectoryRow";
 import { cleanWorktreePath, groupTrajectoryEvents } from "../drawer/trajectory";
 
 export function TurnActivityTimeline({
   turnId,
+  sessionId,
   streaming,
   intermediateNotes,
 }: {
   turnId: string;
+  sessionId: string;
   streaming: boolean;
   intermediateNotes: string[];
 }) {
   const [expanded, setExpanded] = useState(false);
   const events = useAppStore((s) => s.turnEvents[turnId]);
   const counters = useAppStore((s) => s.turnCounters[turnId]);
+  const snapshotReady = useAppStore((s) => s.turnEventSnapshots[turnId]);
   const loadTurnEvents = useAppStore((s) => s.loadTurnEvents);
 
   useEffect(() => {
-    if (expanded && !events && !streaming) {
+    if (expanded && !snapshotReady) {
       void loadTurnEvents(turnId);
     }
-  }, [expanded, events, streaming, turnId, loadTurnEvents]);
+  }, [expanded, snapshotReady, turnId, loadTurnEvents]);
 
   const entries = useMemo(() => groupTrajectoryEvents(events ?? []), [events]);
 
@@ -63,15 +67,11 @@ export function TurnActivityTimeline({
     return last.event.event_kind;
   }, [entries, fallbackNotes]);
 
-  if (!streaming && totalSteps === 0) {
-    return null;
-  }
-
   const summaryLabel = streaming
     ? `Working${latestTitle ? ` · ${latestTitle}` : ""}`
     : [
         `Worked`,
-        `${totalSteps} step${totalSteps === 1 ? "" : "s"}`,
+        totalSteps > 0 ? `${totalSteps} step${totalSteps === 1 ? "" : "s"}` : null,
         editsCount > 0 ? `${editsCount} file edit${editsCount === 1 ? "" : "s"}` : null,
       ]
         .filter(Boolean)
@@ -82,6 +82,7 @@ export function TurnActivityTimeline({
       <button
         type="button"
         onClick={() => setExpanded((v) => !v)}
+        aria-expanded={expanded}
         className="w-full px-3 py-1.5 flex items-center justify-between gap-2 text-left text-ink-muted hover:text-ink hover:bg-hover/60 transition-colors"
       >
         <span className="flex items-center gap-2 min-w-0">
@@ -122,17 +123,17 @@ export function TurnActivityTimeline({
                 <Sparkles className="w-3 h-3 text-brand-ink" />
                 <span>Progress note</span>
               </div>
-              {note}
+              <MarkdownBlock content={note.trim()} sessionId={sessionId} />
             </div>
           ))}
 
           {entries.map((entry) => (
-            <TrajectoryRow key={entry.key} entry={entry} />
+            <TrajectoryRow key={entry.key} entry={entry} sessionId={sessionId} />
           ))}
 
           {entries.length === 0 && fallbackNotes.length === 0 && (
             <div className="py-3 text-center text-[11px] text-ink-muted">
-              Loading steps...
+              {snapshotReady ? "No steps recorded yet." : "Loading steps…"}
             </div>
           )}
         </div>

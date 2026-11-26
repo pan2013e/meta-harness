@@ -324,8 +324,9 @@ impl Store {
     }
 
     pub fn delete_member(&self, session_id: &str, handle: &str) -> Result<(), StoreError> {
-        let conn = self.conn()?;
-        let changed = conn.execute(
+        let mut conn = self.conn()?;
+        let tx = conn.transaction()?;
+        let changed = tx.execute(
             "DELETE FROM session_members WHERE session_id = ?1 AND handle = ?2",
             params![session_id, handle],
         )?;
@@ -334,17 +335,19 @@ impl Store {
                 "member {session_id}/{handle}"
             )));
         }
+        tx.execute(
+            "UPDATE sessions SET orchestrator_member = NULL WHERE id = ?1 AND orchestrator_member = ?2",
+            params![session_id, handle],
+        )?;
+        tx.commit()?;
         Ok(())
     }
 
-    #[allow(clippy::too_many_arguments)]
     pub fn update_member_runtime(
         &self,
         session_id: &str,
         handle: &str,
         acp_session_id: Option<&str>,
-        active_model: Option<&str>,
-        active_effort: Option<&str>,
         worktree_branch: Option<&str>,
         worktree_path: Option<&str>,
     ) -> Result<(), StoreError> {
@@ -352,15 +355,11 @@ impl Store {
         conn.execute(
             "UPDATE session_members
              SET acp_session_id = COALESCE(?1, acp_session_id),
-                 active_model = COALESCE(?2, active_model),
-                 active_effort = COALESCE(?3, active_effort),
-                 worktree_branch = COALESCE(?4, worktree_branch),
-                 worktree_path = COALESCE(?5, worktree_path)
-             WHERE session_id = ?6 AND handle = ?7",
+                 worktree_branch = COALESCE(?2, worktree_branch),
+                 worktree_path = COALESCE(?3, worktree_path)
+             WHERE session_id = ?4 AND handle = ?5",
             params![
                 acp_session_id,
-                active_model,
-                active_effort,
                 worktree_branch,
                 worktree_path,
                 session_id,

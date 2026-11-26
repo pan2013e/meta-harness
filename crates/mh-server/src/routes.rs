@@ -197,7 +197,18 @@ pub async fn pick_fs_folder() -> ApiResult<Value> {
     })))
 }
 
-pub async fn list_adapters(State(state): State<AppState>) -> ApiResult<Value> {
+#[derive(Debug, Deserialize)]
+pub struct AdapterListQuery {
+    #[serde(default)]
+    refresh: bool,
+    #[serde(default)]
+    summary: bool,
+}
+
+pub async fn list_adapters(
+    State(state): State<AppState>,
+    Query(query): Query<AdapterListQuery>,
+) -> ApiResult<Value> {
     let cfg = state.switch.config.read().await.clone();
     let prefs = state
         .switch
@@ -205,13 +216,26 @@ pub async fn list_adapters(State(state): State<AppState>) -> ApiResult<Value> {
         .list_adapter_model_prefs()
         .map_err(|e| err_resp(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
     let mut catalogs = std::collections::BTreeMap::new();
-    for (id, acfg) in &cfg.adapters {
-        let cat = state
-            .switch
-            .supervisor
-            .resolve_adapter_catalog(id, acfg)
-            .await;
-        catalogs.insert(id.clone(), cat);
+    if query.summary {
+        for id in cfg.adapters.keys() {
+            catalogs.insert(id.clone(), mh_acp::supervisor::builtin_adapter_catalog(id));
+        }
+    } else {
+        let mut probes = tokio::task::JoinSet::new();
+        for (id, adapter) in cfg.adapters.clone() {
+            let supervisor = std::sync::Arc::clone(&state.switch.supervisor);
+            probes.spawn(async move {
+                let catalog = supervisor
+                    .resolve_adapter_catalog(&id, &adapter, query.refresh)
+                    .await;
+                (id, catalog)
+            });
+        }
+        while let Some(result) = probes.join_next().await {
+            if let Ok((id, catalog)) = result {
+                catalogs.insert(id, catalog);
+            }
+        }
     }
     let mut defaults = std::collections::BTreeMap::new();
     for p in prefs {
@@ -289,6 +313,40 @@ pub async fn refresh_quotas(State(state): State<AppState>) -> Json<Value> {
         });
     }
     Json(json!({ "quotas": snapshots }))
+}
+
+pub async fn shared_antigravity_usage(
+    State(state): State<AppState>,
+    AxumPath(adapter_id): AxumPath<String>,
+) -> ApiResult<Value> {
+    let adapter = state
+        .switch
+        .config
+        .read()
+        .await
+        .adapters
+        .get(&adapter_id)
+        .cloned()
+        .ok_or_else(|| err_resp(StatusCode::NOT_FOUND, "Unknown adapter"))?;
+    let _activity = state
+        .switch
+        .supervisor
+        .adapter_activity(&adapter_id)
+        .await
+        .try_read_owned()
+        .map_err(|_| {
+            err_resp(
+                StatusCode::CONFLICT,
+                "This harness is undergoing maintenance.",
+            )
+        })?;
+    let windows = state
+        .switch
+        .quota
+        .shared_antigravity_usage(&adapter_id, &adapter)
+        .await
+        .map_err(|error| err_resp(StatusCode::BAD_REQUEST, error.to_string()))?;
+    Ok(Json(json!({ "windows": windows })))
 }
 
 #[derive(Debug, Deserialize)]
@@ -490,6 +548,8 @@ pub struct CreateMemberInput {
     pub display_name: Option<String>,
     pub role: Option<MemberRole>,
     pub persona_prompt: Option<String>,
+    pub active_model: Option<String>,
+    pub active_effort: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -570,6 +630,8 @@ async fn create_session_internal(
                 display_name: Some(a.display_name.clone()),
                 role: Some(MemberRole::Executor),
                 persona_prompt: None,
+                active_model: None,
+                active_effort: None,
             })
             .collect()
     });
@@ -922,7 +984,7 @@ pub async fn patch_member_config(
     AxumPath((session_id, handle)): AxumPath<(String, String)>,
     Json(body): Json<PatchMemberConfigRequest>,
 ) -> ApiResult<Value> {
-    let updated = state
+    let final_member = state
         .switch
         .store
         .update_member_model_effort(
@@ -933,33 +995,6 @@ pub async fn patch_member_config(
         )
         .map_err(|e| err_resp(StatusCode::BAD_REQUEST, e.to_string()))?;
 
-    if let Some((applied_m, applied_e)) = state
-        .switch
-        .supervisor
-        .apply_member_config(
-            &session_id,
-            &handle,
-            updated.active_model.as_deref(),
-            updated.active_effort.as_deref(),
-        )
-        .await
-        && (applied_m.is_some() || applied_e.is_some())
-    {
-        let _ = state.switch.store.update_member_runtime(
-            &session_id,
-            &handle,
-            None,
-            applied_m.as_deref(),
-            applied_e.as_deref(),
-            None,
-            None,
-        );
-    }
-    let final_member = state
-        .switch
-        .store
-        .get_member(&session_id, &handle)
-        .unwrap_or(updated);
     let statuses = state.switch.get_member_statuses(&session_id).await;
     let (status, turn_id) = statuses
         .get(&handle)
@@ -1049,6 +1084,16 @@ pub async fn upsert_session_member(
             "handle must contain only alphanumeric, '-', or '_' characters",
         ));
     }
+    if !state
+        .switch
+        .config
+        .read()
+        .await
+        .adapters
+        .contains_key(&body.adapter_id)
+    {
+        return Err(err_resp(StatusCode::BAD_REQUEST, "unknown adapter"));
+    }
     let member = state
         .switch
         .store
@@ -1063,6 +1108,20 @@ pub async fn upsert_session_member(
             worktree_path: None,
         })
         .map_err(|e| err_resp(StatusCode::BAD_REQUEST, e.to_string()))?;
+    let member = if body.active_model.is_some() || body.active_effort.is_some() {
+        state
+            .switch
+            .store
+            .update_member_model_effort(
+                &member.session_id,
+                &member.handle,
+                body.active_model.as_deref().map(Some),
+                body.active_effort.as_deref().map(Some),
+            )
+            .map_err(|error| err_resp(StatusCode::BAD_REQUEST, error.to_string()))?
+    } else {
+        member
+    };
     Ok(Json(json!({ "member": member })))
 }
 
@@ -1070,11 +1129,29 @@ pub async fn delete_session_member(
     State(state): State<AppState>,
     AxumPath((session_id, handle)): AxumPath<(String, String)>,
 ) -> ApiResult<Value> {
+    let runtime = state.switch.runtime(&session_id).await;
+    let member_lock = {
+        let mut locks = runtime.member_locks.lock().await;
+        std::sync::Arc::clone(locks.entry(handle.clone()).or_default())
+    };
+    let _idle = member_lock.try_lock().map_err(|_| {
+        err_resp(
+            StatusCode::CONFLICT,
+            "Stop this persona's turn before removing it.",
+        )
+    })?;
     state
         .switch
         .store
         .delete_member(&session_id, &handle)
         .map_err(|e| err_resp(StatusCode::NOT_FOUND, e.to_string()))?;
+    state
+        .switch
+        .supervisor
+        .retire_member(&session_id, &handle)
+        .await;
+    runtime.member_statuses.write().await.remove(&handle);
+    runtime.active_member_chain.write().await.remove(&handle);
     Ok(Json(json!({ "deleted": true })))
 }
 

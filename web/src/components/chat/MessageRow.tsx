@@ -220,6 +220,7 @@ export const MessageRow = memo(function MessageRow({ message, consultReplies }: 
           {message.turn_id && (
             <TurnActivityTimeline
               turnId={message.turn_id}
+              sessionId={message.session_id}
               streaming={streaming}
               intermediateNotes={intermediateNotes}
             />

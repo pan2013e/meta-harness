@@ -1063,6 +1063,12 @@ impl SwitchEngine {
                 .get(&member.adapter_id)
                 .cloned()
                 .ok_or_else(|| SwitchError::NotFound(format!("adapter {}", member.adapter_id)))?;
+            let _adapter_use = self
+                .supervisor
+                .adapter_activity(&member.adapter_id)
+                .await
+                .read_owned()
+                .await;
 
             rt.active_member_chain
                 .write()
@@ -1127,6 +1133,7 @@ impl SwitchEngine {
                 counters: Mutex::new(TurnCounters::default()),
             });
 
+            let profile_dir = adapter_cfg.profile_dir.clone();
             let spawn_spec = MemberSpawnSpec {
                 session_id: session_id.to_string(),
                 member_handle: member.handle.clone(),
@@ -1135,9 +1142,13 @@ impl SwitchEngine {
                 project_root: project_root.clone(),
                 member_worktree: work_cwd.clone(),
                 permission_policy: session.permission_policy,
-                existing_acp_session_id: member.acp_session_id.clone().filter(|_| {
-                    previous_cwd.as_deref().map(Path::new) == Some(dunce::simplified(&work_cwd))
-                }),
+                existing_acp_session_id: member
+                    .acp_session_id
+                    .as_deref()
+                    .filter(|_| {
+                        previous_cwd.as_deref().map(Path::new) == Some(dunce::simplified(&work_cwd))
+                    })
+                    .and_then(|id| mh_acp::resume_profile_session(profile_dir.as_deref(), id)),
                 extra_env: Vec::new(),
                 mcp_bridge_spec: mcp_spec,
                 rules,
@@ -1216,18 +1227,17 @@ impl SwitchEngine {
                 .apply_model_and_effort(wanted_model, wanted_effort)
                 .await;
 
-            let new_acp_sid = managed.client.acp_session_id.read().await.clone();
-            let saved_effort = if matches!(purpose, TurnPurpose::MemoryCuration) {
-                None
-            } else {
-                applied_effort.as_deref().or(wanted_effort)
-            };
+            let new_acp_sid = managed
+                .client
+                .acp_session_id
+                .read()
+                .await
+                .as_deref()
+                .map(|id| mh_acp::store_profile_session(profile_dir.as_deref(), id));
             let _ = self.store.update_member_runtime(
                 session_id,
                 &member.handle,
                 new_acp_sid.as_deref(),
-                applied_model.as_deref().or(wanted_model),
-                saved_effort,
                 work_branch.as_deref(),
                 Some(dunce::simplified(&work_cwd).to_string_lossy().as_ref()),
             );
@@ -2330,6 +2340,11 @@ impl SwitchEngine {
         let cfg = self.config.read().await.clone();
         let generated = if let Some(target_member) = picker
             && let Some(adapter_cfg) = cfg.adapters.get(&target_member.adapter_id)
+            && let Ok(_activity) = self
+                .supervisor
+                .adapter_activity(&target_member.adapter_id)
+                .await
+                .try_read_owned()
         {
             let cwd = session
                 .integration_wt_path

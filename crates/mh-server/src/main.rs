@@ -108,13 +108,15 @@ async fn main() -> anyhow::Result<()> {
         paths.data_dir = dd;
     }
 
-    let cfg = AppConfig::load_or_default(config_path.as_deref(), &paths)?;
+    let mut cfg = AppConfig::load_or_default(config_path.as_deref(), &paths)?;
+    mh_server::harness_jobs::restore_profiles(&mut cfg, &paths.data_dir);
     let bind = bind_opt.unwrap_or_else(|| cfg.server.bind.clone());
     let open_browser = !no_open && cfg.server.open_browser_on_start;
 
     let store = Store::open(&paths.db_path())?;
     let quota = Arc::new(QuotaTracker::new());
     for (id, acfg) in &cfg.adapters {
+        quota.configure_launch_profile(id, acfg).await;
         quota
             .configure_adapter(id, None, acfg.exact_quota_probe_opt_in, None, None)
             .await;
@@ -150,6 +152,7 @@ async fn main() -> anyhow::Result<()> {
     let state = AppState {
         switch: Arc::clone(&switch),
         auth: auth.clone(),
+        harness_jobs: Default::default(),
     };
 
     let listener = TcpListener::bind(&bind).await?;

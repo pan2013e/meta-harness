@@ -24,6 +24,33 @@ All harnesses run locally over the **Agent Client Protocol (ACP)** using your **
 
 ---
 
+## Separate harness profiles
+
+In **Settings → Harnesses**, choose **Create profile & sign in** for Codex, Claude Code, or Antigravity. Follow the provider's sign-in steps shown in Settings. Meta-Harness activates the new directory after sign-in completes and restores it on restart. A preconfigured `profile_dir` takes precedence.
+
+Codex's primary sign-in button opens the provider's browser login on the machine running Meta-Harness. **Use device code** starts the alternative flow, where you enter the code on the provider's page. Separate Antigravity profiles can use **Check shared CLI usage** to view the shared account's quota for reference.
+
+Use **Check CLI version** and **Upgrade CLI** in the same card for supported launchers. Upgrades run the vendor updater or refresh the compatible npm bundle for the default Codex ACP launcher.
+
+Under **Settings → Session**, a persona can inherit its harness's defaults or choose its own model and reasoning effort. Removing a persona preserves its chat history and worktree.
+
+Set `profile_dir` under an adapter in your Meta-Harness config, then restart Meta-Harness. Relative paths are rooted in the Meta-Harness data directory. Each adapter can use a different profile.
+
+```toml
+[adapters.codex]
+profile_dir = "profiles/codex"
+
+[adapters.claude]
+profile_dir = "profiles/claude"
+
+[adapters.antigravity]
+profile_dir = "profiles/antigravity"
+```
+
+Add these keys to the existing adapter sections in `configs/harnesses.local.toml`, or start with `configs/harnesses.example.toml`. Meta-Harness creates the directories on first launch of each harness and starts a fresh ACP session when the profile changes. Existing chat stays in Meta-Harness, and existing native conversations stay in their original profiles.
+
+For Codex or Claude Code, sign in to the separate directory using the harness CLI with `CODEX_HOME` or `CLAUDE_CONFIG_DIR` pointing to the resolved profile path shown in Settings. For Antigravity, the ACP launcher uses `--gemini-dir <profile> --app-data-dir antigravity-cli`. The OS keyring may still supply the same Google account. When needed, run `agy acp --login` with the same directory flags. Gemini CLI fallback uses `GEMINI_CLI_HOME`.
+
 ## Repository Map
 
 ```text

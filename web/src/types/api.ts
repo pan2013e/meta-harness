@@ -170,11 +170,26 @@ export interface AdapterConfig {
   args: string[];
   quota_provider: string;
   exact_quota_probe_opt_in: boolean;
+  profile_dir?: string | null;
   characteristics: {
     strengths: string[];
     latency_tier: string;
     context_window_tier: string;
   };
+}
+
+export interface HarnessCliVersion {
+  installed: string | null;
+  published: string | null;
+  can_upgrade: boolean;
+  can_sign_in: boolean;
+}
+
+export interface HarnessOperation {
+  kind: "sign_in" | "upgrade";
+  status: "running" | "completed" | "failed";
+  output: string;
+  accepts_input: boolean;
 }
 
 export interface ConfigOptionChoice {

@@ -7,6 +7,8 @@ import type {
   DiscoveredConfigOption,
   EpisodicJob,
   FsEntry,
+  HarnessCliVersion,
+  HarnessOperation,
   IsolationMode,
   MemberRole,
   MemberStatus,
@@ -17,6 +19,7 @@ import type {
   ProjectFact,
   PromoteMode,
   QuotaSnapshot,
+  QuotaWindow,
   Session,
   SessionContextReport,
   SessionDiffReport,
@@ -105,12 +108,12 @@ export const api = {
     apiFetch<{ current: string; parent: string | null; entries: FsEntry[] }>(
       `/api/fs/list${path ? `?path=${encodeURIComponent(path)}` : ""}`
     ),
-  listAdapters: () =>
+  listAdapters: (refresh = false, summary = false) =>
     apiFetch<{
       adapters: Record<string, AdapterConfig>;
       catalogs?: Record<string, AdapterModelCatalog>;
       defaults?: Record<string, AdapterModelPref>;
-    }>("/api/adapters"),
+    }>(summary ? "/api/adapters?summary=true" : refresh ? "/api/adapters?refresh=true" : "/api/adapters"),
   updateAdapterDefaults: (
     adapterId: string,
     payload: {
@@ -124,7 +127,23 @@ export const api = {
     ),
   probeAdapters: () =>
     apiFetch<{ probes: AdapterProbeStatus[] }>("/api/adapters/probe"),
+  checkHarnessVersion: (id: string) =>
+    apiFetch<{ version: HarnessCliVersion }>(`/api/adapters/${encodeURIComponent(id)}/version`),
+  harnessOperation: (id: string) =>
+    apiFetch<{ operation: HarnessOperation | null }>(`/api/adapters/${encodeURIComponent(id)}/operation`),
+  startHarnessOperation: (id: string, kind: HarnessOperation["kind"], loginMode?: "device_code") =>
+    apiFetch<{ operation: HarnessOperation }>(`/api/adapters/${encodeURIComponent(id)}/operation`, {
+      method: "POST", body: JSON.stringify({ kind, ...(loginMode && { login_mode: loginMode }) }),
+    }),
+  cancelHarnessOperation: (id: string) =>
+    apiFetch<{ cancelled: boolean }>(`/api/adapters/${encodeURIComponent(id)}/operation`, { method: "DELETE" }),
+  sendHarnessSignInInput: (id: string, value: string) =>
+    apiFetch<{ accepted: boolean }>(`/api/adapters/${encodeURIComponent(id)}/operation/input`, {
+      method: "POST", body: JSON.stringify({ value }),
+    }),
   listQuotas: () => apiFetch<{ quotas: QuotaSnapshot[] }>("/api/quotas"),
+  sharedAntigravityUsage: (adapterId: string) =>
+    apiFetch<{ windows: QuotaWindow[] }>(`/api/adapters/${encodeURIComponent(adapterId)}/shared-usage`, { method: "POST" }),
   refreshQuotasLive: () =>
     apiFetch<{ quotas: QuotaSnapshot[] }>("/api/quotas/refresh", {
       method: "POST",
@@ -246,6 +265,8 @@ export const api = {
       display_name?: string;
       role?: MemberRole;
       persona_prompt?: string;
+      active_model?: string | null;
+      active_effort?: string | null;
     }
   ) =>
     apiFetch<{ member: SessionMember }>(

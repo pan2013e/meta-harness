@@ -87,11 +87,8 @@ interface AppState {
   shellOpen: boolean;
   pickingFolder: boolean;
   quotasRefreshing: boolean;
-  selectedRecipient: string | null;
   promoteBanner: string | null;
   pendingPermissionPolicy: PermissionPolicy;
-  autoModelOverride: string | null;
-  autoEffortOverride: string | null;
 
   adapters: Record<string, AdapterConfig>;
   adapterCatalogs: Record<string, AdapterModelCatalog>;
@@ -118,6 +115,7 @@ interface AppState {
   messages: ChatMessage[];
   trajectories: TurnTrajectory[];
   turnEvents: Record<string, TrajectoryEvent[]>;
+  turnEventSnapshots: Record<string, true>;
   turnCounters: Record<
     string,
     { tool_calls: number; file_edits: number; thoughts: number }
@@ -144,11 +142,8 @@ interface AppState {
   setMemoryModalOpen: (open: boolean) => void;
   setDiffModalOpen: (open: boolean) => void;
   setShellOpen: (open: boolean) => void;
-  setSelectedRecipient: (handle: string | null) => void;
   setPromoteBanner: (msg: string | null) => void;
   setPendingPermissionPolicy: (policy: PermissionPolicy) => void;
-  setAutoModelOverride: (model: string | null) => void;
-  setAutoEffortOverride: (effort: string | null) => void;
   openProjectWithNativeOrModal: () => Promise<void>;
 
   init: () => Promise<void>;
@@ -216,11 +211,11 @@ const emptySessionState = {
   sessionDiff: null,
   sessionContext: null,
   hopPaused: null,
-  selectedRecipient: null,
   promoteBanner: null,
   messages: [],
   trajectories: [],
   turnEvents: {},
+  turnEventSnapshots: {},
   turnCounters: {},
   inspectedTurnId: null,
   inspectedTrajectory: null,
@@ -232,14 +227,14 @@ export const useAppStore = create<AppState>((set, get) => {
   let projectRequest = 0;
   let sessionRequest = 0;
   let diffRequest = 0;
-  let inspectionRequest = 0;
   let memoryRequest = 0;
   let trajectoryRequest = 0;
+  let catalogRequest = 0;
   let sessionLoad: { id: string; events: WsEvent[] } | null = null;
+  const turnRequests = new Map<string, Promise<void>>();
 
   const clearSession = () => {
     sessionRequest++;
-    inspectionRequest++;
     sessionLoad = null;
     get().wsClient?.subscribeTrajectory(null);
     get().wsClient?.setSession(null);
@@ -266,11 +261,8 @@ export const useAppStore = create<AppState>((set, get) => {
     shellOpen: false,
     pickingFolder: false,
     quotasRefreshing: false,
-    selectedRecipient: null,
     promoteBanner: null,
     pendingPermissionPolicy: "worktree_smart",
-    autoModelOverride: null,
-    autoEffortOverride: null,
 
     adapters: {},
     adapterCatalogs: {},
@@ -297,6 +289,7 @@ export const useAppStore = create<AppState>((set, get) => {
     messages: [],
     trajectories: [],
     turnEvents: {},
+    turnEventSnapshots: {},
     turnCounters: {},
 
     drawerOpen: false,
@@ -321,11 +314,8 @@ export const useAppStore = create<AppState>((set, get) => {
     setMemoryModalOpen: (open) => set({ memoryModalOpen: open }),
     setDiffModalOpen: (open) => set({ diffModalOpen: open }),
     setShellOpen: (open) => set({ shellOpen: open }),
-    setSelectedRecipient: (handle) => set({ selectedRecipient: handle }),
     setPromoteBanner: (msg) => set({ promoteBanner: msg }),
     setPendingPermissionPolicy: (policy) => set({ pendingPermissionPolicy: policy }),
-    setAutoModelOverride: (model) => set({ autoModelOverride: model }),
-    setAutoEffortOverride: (effort) => set({ autoEffortOverride: effort }),
 
     openProjectWithNativeOrModal: async () => {
       set({ folderModalOpen: true });
@@ -361,7 +351,7 @@ export const useAppStore = create<AppState>((set, get) => {
         }
 
         const [adaptersRes, probeRes, projRes] = await Promise.all([
-          api.listAdapters(),
+          api.listAdapters(false, true),
           api.probeAdapters(),
           api.listProjects(),
         ]);
@@ -389,6 +379,10 @@ export const useAppStore = create<AppState>((set, get) => {
         });
 
         void get().refreshQuotas().catch((error: unknown) => reportError(error));
+        const request = ++catalogRequest;
+        void api.listAdapters().then(({ catalogs }) => {
+          if (catalogs && request === catalogRequest) set({ adapterCatalogs: catalogs });
+        }).catch(() => undefined);
 
         if (projRes.projects.length > 0) {
           await get().selectProject(projRes.projects[0].id);
@@ -507,9 +501,15 @@ export const useAppStore = create<AppState>((set, get) => {
               : message
           ),
           trajectories: trajRes.trajectories,
+          turnEventSnapshots: {},
         });
         sessionLoad = null;
         for (const event of load.events) get().handleWsEvent(event);
+        const runningTurns = new Set(trajRes.trajectories.filter((turn) => turn.status === "running").map((turn) => turn.turn_id));
+        for (const message of get().messages) {
+          if (message.turn_id && message.metadata.streaming === true) runningTurns.add(message.turn_id);
+        }
+        for (const turnId of runningTurns) void get().loadTurnEvents(turnId);
         await get().refreshSessionDiff();
       } catch (error) {
         if (request === sessionRequest) {
@@ -683,9 +683,10 @@ export const useAppStore = create<AppState>((set, get) => {
       const sid = get().activeSession?.id;
       if (!sid) return;
       const { member } = await api.patchMemberConfig(sid, handle, payload);
-      set((s) => ({
-        members: s.members.map((m) => (m.handle === member.handle ? member : m)),
-      }));
+      set((s) => s.activeSession?.id === sid
+        ? { members: s.members.map((m) => (m.handle === member.handle ? member : m)) }
+        : s
+      );
     },
 
     sendMessage: async (content, opts) => {
@@ -743,33 +744,35 @@ export const useAppStore = create<AppState>((set, get) => {
     },
 
     inspectTurn: async (turnId: string) => {
+      set({ inspectedTurnId: turnId, inspectedEvents: get().turnEvents[turnId] ?? [], inspectedTrajectory: null });
       await get().loadTurnEvents(turnId);
     },
 
     loadTurnEvents: async (turnId: string) => {
-      const request = ++inspectionRequest;
       const activeSid = get().activeSession?.id;
-      try {
-        const res = await api.getTrajectory(turnId);
-        if (request !== inspectionRequest && get().activeSession?.id !== activeSid) {
-          return;
-        }
+      if (!activeSid) return;
+      const selection = sessionRequest;
+      const key = `${selection}:${turnId}`;
+      const pending = turnRequests.get(key);
+      if (pending) return pending;
+
+      const request = api.getTrajectory(turnId).then((res) => {
+        if (selection !== sessionRequest || res.trajectory.session_id !== activeSid) return;
         set((state) => {
           const events = new Map(res.events.map((event) => [event.id, event]));
-          for (const event of state.turnEvents[turnId] ?? []) {
-            events.set(event.id, event);
-          }
+          for (const event of state.turnEvents[turnId] ?? []) events.set(event.id, event);
           const sorted = [...events.values()].sort((a, b) => a.id - b.id);
           return {
-            inspectedTurnId: turnId,
-            inspectedTrajectory: res.trajectory,
-            inspectedEvents: sorted,
+            ...(state.inspectedTurnId === turnId && { inspectedTrajectory: res.trajectory, inspectedEvents: sorted }),
             turnEvents: { ...state.turnEvents, [turnId]: sorted },
+            turnEventSnapshots: { ...state.turnEventSnapshots, [turnId]: true },
           };
         });
-      } catch (error) {
-        reportError(error);
-      }
+      }).catch((error: unknown) => {
+        if (selection === sessionRequest) reportError(error);
+      }).finally(() => turnRequests.delete(key));
+      turnRequests.set(key, request);
+      return request;
     },
 
     openDrawerTab: (tab: DrawerTab) => {
@@ -785,7 +788,6 @@ export const useAppStore = create<AppState>((set, get) => {
     },
 
     closeDrawer: () => {
-      inspectionRequest++;
       get().wsClient?.subscribeTrajectory(null);
       set({ drawerOpen: false });
     },
@@ -808,15 +810,19 @@ export const useAppStore = create<AppState>((set, get) => {
     },
 
     refreshQuotasLive: async () => {
+      const request = ++catalogRequest;
       set({ quotasRefreshing: true });
       try {
-        const [{ quotas }, { probes }] = await Promise.all([
+        const [{ quotas }, { probes }, catalog] = await Promise.all([
           api.refreshQuotasLive(),
           api.probeAdapters(),
+          api.listAdapters(true),
         ]);
         const map: Record<string, QuotaSnapshot> = {};
         for (const q of quotas) map[q.adapter_id] = q;
-        set({ quotas: map, probes });
+        if (request === catalogRequest) {
+          set({ quotas: map, probes, adapters: catalog.adapters, adapterCatalogs: catalog.catalogs ?? get().adapterCatalogs });
+        }
       } catch (e) {
         set({ errorBanner: e instanceof Error ? e.message : String(e) });
       } finally {

@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { MarkdownBlock } from "./components/common/MarkdownBlock";
 import { formatCreditsDisplay, QuotaMeter } from "./components/common/Badges";
 import { DiffViewer } from "./components/common/DiffViewer";
@@ -9,11 +9,15 @@ import { MentionEditor, serializeMentionDom } from "./components/chat/MentionEdi
 import { MessageRow } from "./components/chat/MessageRow";
 import { DiffReviewModal } from "./components/modals/DiffReviewModal";
 import { SettingsDialog } from "./components/modals/SettingsDialog";
+import { SharedAntigravityUsage } from "./components/modals/SharedAntigravityUsage";
+import { PersonaModelFields } from "./components/modals/PersonaModelFields";
 import { Sidebar } from "./components/sidebar/Sidebar";
 import { cleanWorktreePath, groupTrajectoryEvents } from "./components/drawer/trajectory";
 import { TrajectoryRow } from "./components/drawer/TrajectoryRow";
+import { terminalDirectory } from "./components/chat/terminalPaths";
 import { api, WsHubClient } from "./api/client";
 import { useAppStore } from "./store/useAppStore";
+import type { TrajectoryEvent, TurnTrajectory } from "./types/api";
 
 afterEach(() => {
   cleanup();
@@ -93,6 +97,40 @@ describe("Session navigation", () => {
     expect(close).toHaveBeenCalledOnce();
   });
 
+  it("backfills a running turn on return and merges its streamed steps", async () => {
+    const turn: TurnTrajectory = {
+      turn_id: "running", session_id: "first", member_handle: "codex", adapter_id: "codex",
+      model: null, effort: null, worktree_branch: null, head_commit_sha: null, status: "running",
+      summary: "", touched_files: [], diff_stat: { files_changed: 0, insertions: 0, deletions: 0 },
+      started_at: 1, finished_at: null,
+    };
+    const firstStep: TrajectoryEvent = { id: 1, turn_id: turn.turn_id, event_kind: "thought", payload: { text: "Before switching" }, created_at: 1 };
+    const liveStep: TrajectoryEvent = { ...firstStep, id: 2, payload: { text: "While loading history" } };
+    vi.spyOn(api, "getSession").mockImplementation(async (id) => ({
+      session: {
+        id, project_id: null, title: id, isolation_mode: "shared_cwd", base_branch: null,
+        base_commit_sha: null, integration_branch: null, integration_wt_path: null,
+        orchestrator_member: null, confirm_before_dispatch: false, max_hops: 6,
+        permission_policy: "worktree_smart", working_summary: "", created_at: 0, updated_at: 0,
+      },
+      members: [], statuses: {}, permission_rules: [], pending_permissions: [],
+    }));
+    vi.spyOn(api, "listMessages").mockResolvedValue({ messages: [] });
+    vi.spyOn(api, "listTrajectories").mockImplementation(async (id) => ({ trajectories: id === "first" ? [turn] : [] }));
+    vi.spyOn(api, "getSessionDiff").mockResolvedValue({ diff: null });
+    let deliverSnapshot!: () => void;
+    vi.spyOn(api, "getTrajectory").mockImplementation(() => new Promise((resolve) => {
+      deliverSnapshot = () => resolve({ trajectory: turn, events: [firstStep] });
+    }));
+
+    const store = useAppStore.getState();
+    await store.selectSession("other");
+    await store.selectSession("first");
+    store.handleWsEvent({ type: "trajectory.event", session_id: "first", turn_id: "running", event: liveStep });
+    deliverSnapshot();
+    await waitFor(() => expect(useAppStore.getState().turnEvents.running).toEqual([firstStep, liveStep]));
+  });
+
   it("replaces streaming content when a new step starts after tool calls", () => {
     useAppStore.setState({
       activeSession: {
@@ -146,6 +184,48 @@ describe("Session navigation", () => {
 });
 
 describe("UI primitives", () => {
+  it("labels shared Antigravity usage separately from the profile quota", async () => {
+    const profileQuotas = useAppStore.getState().quotas;
+    const check = vi.spyOn(api, "sharedAntigravityUsage").mockResolvedValue({ windows: [
+      { id: "gemini/300", label: "Gemini · 5h", remaining_pct: 83, resets_at: null, window_mins: 300 },
+    ] });
+    render(<SharedAntigravityUsage adapterId="antigravity" />);
+    fireEvent.click(screen.getByRole("button", { name: "Check shared CLI usage" }));
+    expect(await screen.findByRole("heading", { name: "Shared CLI account" })).toBeTruthy();
+    expect(screen.getByText("83%")).toBeTruthy();
+    expect(check).toHaveBeenCalledWith("antigravity");
+    expect(useAppStore.getState().quotas).toBe(profileQuotas);
+  });
+  it("clears an incompatible persona effort when that persona changes model", () => {
+    const save = vi.fn();
+    const low = { value: "low", label: "Low" };
+    const high = { value: "high", label: "High" };
+    render(<PersonaModelFields label="@reviewer" model="first" effort="high" disabled={false} onChange={save}
+      catalog={{ adapter_id: "codex", default_context_window: 200000, efforts: [low, high],
+        models: [{ value: "first", label: "First" }, { value: "second", label: "Second" }],
+        model_details: [
+          { value: "first", label: "First", description: "", is_default: false, default_effort: null, supported_efforts: [high] },
+          { value: "second", label: "Second", description: "", is_default: false, default_effort: null, supported_efforts: [low] },
+        ],
+      }} />);
+    fireEvent.change(screen.getByRole("combobox", { name: "@reviewer model" }), { target: { value: "second" } });
+    expect(save).toHaveBeenCalledWith({ active_model: "second", active_effort: null });
+  });
+  it("renders Markdown in trajectory narrative blocks", () => {
+    render(<TrajectoryRow entry={{ type: "event", key: "1", event: {
+      id: 1, turn_id: "turn", event_kind: "thought", created_at: 0,
+      payload: { text: "\n\n**Testing key-event text entry**\n\nNext, run the check." },
+    } }} />);
+    expect(screen.getByText("Testing key-event text entry").tagName).toBe("STRONG");
+    expect(screen.getByText("Next, run the check.")).toBeTruthy();
+  });
+
+  it("decodes per-terminal directory reports without interpreting other OSC notifications", () => {
+    expect(terminalDirectory("9;C:\\Users\\Demo\\My Files", 9)).toBe("C:\\Users\\Demo\\My Files");
+    expect(terminalDirectory("file:///C:/Users/Demo/My%20Files", 7)).toBe("C:\\Users\\Demo\\My Files");
+    expect(terminalDirectory("file://localhost/tmp/My%20Files", 7)).toBe("/tmp/My Files");
+    expect(terminalDirectory("This is a notification", 9)).toBeNull();
+  });
   it("renders markdown code fences without highlighting internal @mentions, plus <details> & preview links", () => {
     const md =
       "## Summary\n\nPing @codex outside.\n[Open the page](C:/Users/demo/.meta-harness/worktrees/s_1/_integration/index.html)\n<details><summary>Prompt</summary>Body text</details>\n```python\n@decorator\ndef foo(): pass\n```";
@@ -508,7 +588,7 @@ describe("UI primitives", () => {
     expect(onChange).toHaveBeenLastCalledWith(" @codex /diff");
   });
 
-  it("uses custom Model & Effort popovers with model_details and resets unsupported effort", () => {
+  it("follows mentions in the model menu and keeps effort overrides scoped to the recipient", async () => {
     vi.spyOn(api, "getSessionDiff").mockResolvedValue({ diff: null });
     useAppStore.setState({
       activeProjectId: null,
@@ -593,28 +673,79 @@ describe("UI primitives", () => {
       },
     });
 
-    const { container } = render(<Composer />);
-    expect(container.querySelectorAll("select")).toHaveLength(0);
+    const sendMessage = vi.fn().mockResolvedValue(undefined);
+    const { probes, members, adapterCatalogs } = useAppStore.getState();
+    const claude = { ...members[0], handle: "reviewer", adapter_id: "claude", display_name: "Reviewer" };
+    useAppStore.setState({
+      sendMessage,
+      probes: [...probes, { ...probes[0], adapter_id: "claude", display_name: "Claude" }],
+      members: [...members, claude],
+      adapterCatalogs: {
+        ...adapterCatalogs,
+        claude: {
+          adapter_id: "claude",
+          models: [{ value: "sonnet", label: "Sonnet" }],
+          efforts: [{ value: "low", label: "Low" }],
+          default_context_window: 200000,
+        },
+      },
+    });
+    const saveMember = vi.spyOn(api, "patchMemberConfig").mockResolvedValue({
+      member: { ...claude, active_model: "sonnet", active_effort: "low" },
+    });
+    render(<Composer />);
 
-    fireEvent.click(screen.getByRole("button", { name: "Target model" }));
-    fireEvent.click(screen.getByText("gpt-6-astra"));
-    expect(useAppStore.getState().autoModelOverride).toBe("gpt-6-astra");
-
-    fireEvent.click(screen.getByRole("button", { name: "Reasoning effort" }));
-    expect(screen.getByText("Ultra")).toBeTruthy();
-    fireEvent.click(screen.getByText("Ultra"));
-    expect(useAppStore.getState().autoEffortOverride).toBe("ultra");
-
-    fireEvent.click(screen.getByRole("button", { name: "Target model" }));
-    fireEvent.click(screen.getByText("gpt-5.6-luna"));
-    expect(useAppStore.getState().autoModelOverride).toBe("gpt-5.6-luna");
-    expect(useAppStore.getState().autoEffortOverride).toBeNull();
-
-    // Test action slash command /diff opens Diff modal without sending a message
+    const trigger = screen.getByRole("button", { name: "Model and reasoning effort" });
     const editor = screen.getByRole("textbox", { name: "Message group chat" });
-    editor.textContent = "/diff";
-    fireEvent.input(editor);
-    fireEvent.click(screen.getByRole("button", { name: /Send/i }));
+    const draft = (text: string) => {
+      editor.textContent = text;
+      fireEvent.input(editor);
+    };
+    const openMenu = (handle: string) => {
+      fireEvent.click(trigger);
+      return within(screen.getByRole("group", { name: `Model and effort for @${handle}` }));
+    };
+    const send = screen.getByRole("button", { name: /Send/i });
+
+    draft("Mention `@reviewer` in the documentation");
+    const codexMenu = openMenu("codex");
+    fireEvent.click(codexMenu.getByRole("button", { name: "gpt-6-astra" }));
+    const slider = codexMenu.getByRole("slider", { name: "Reasoning effort" });
+    fireEvent.change(slider, { target: { value: "3" } });
+    expect(slider.getAttribute("aria-valuetext")).toBe("Ultra");
+    fireEvent.click(codexMenu.getByRole("button", { name: "Done" }));
+
+    draft("Please ask (@Reviewer) for help");
+    const claudeMenu = openMenu("reviewer");
+    expect(claudeMenu.queryByRole("button", { name: "gpt-6-astra" })).toBeNull();
+    fireEvent.click(claudeMenu.getByRole("button", { name: "Sonnet" }));
+    fireEvent.change(claudeMenu.getByRole("slider"), { target: { value: "1" } });
+    fireEvent.click(claudeMenu.getByRole("button", { name: "Done" }));
+    await waitFor(() => expect(trigger.textContent).toContain("Sonnet"));
+    expect(saveMember).toHaveBeenCalledWith("s_standalone", "reviewer", {
+      active_model: "sonnet", active_effort: "low",
+    });
+
+    draft("@reviewer @codex check this");
+    expect((trigger as HTMLButtonElement).disabled).toBe(true);
+    fireEvent.click(send);
+    expect(sendMessage).toHaveBeenLastCalledWith("@reviewer @codex check this", undefined);
+
+    await waitFor(() => expect((send as HTMLButtonElement).disabled).toBe(true));
+    draft("@orchestrator ask @reviewer to check this");
+    const resetMenu = openMenu("codex");
+    expect(resetMenu.getByRole("slider").getAttribute("aria-valuetext")).toBe("Ultra");
+    fireEvent.click(resetMenu.getByRole("button", { name: "gpt-5.6-luna" }));
+    expect(resetMenu.getByRole("slider").getAttribute("aria-valuetext")).toBe("Default");
+    fireEvent.click(resetMenu.getByRole("button", { name: "Done" }));
+    fireEvent.click(send);
+    expect(sendMessage).toHaveBeenLastCalledWith("@orchestrator ask @reviewer to check this", {
+      model: "gpt-5.6-luna", effort: undefined,
+    });
+
+    await waitFor(() => expect((send as HTMLButtonElement).disabled).toBe(true));
+    draft("/diff");
+    fireEvent.click(send);
     expect(useAppStore.getState().diffModalOpen).toBe(true);
   });
 

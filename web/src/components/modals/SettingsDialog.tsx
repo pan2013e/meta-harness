@@ -18,6 +18,9 @@ import { api } from "../../api/client";
 import { useAppStore } from "../../store/useAppStore";
 import type { PermissionPolicy } from "../../types/api";
 import { HarnessAvatar, QuotaSnapshotSummary, THEMES } from "../common/Badges";
+import { HarnessMaintenance } from "./HarnessMaintenance";
+import { SharedAntigravityUsage } from "./SharedAntigravityUsage";
+import { PersonaModelFields, type PersonaModel } from "./PersonaModelFields";
 
 function formatBytes(bytes: number): string {
   if (!Number.isFinite(bytes) || bytes <= 0) return "0 B";
@@ -65,6 +68,7 @@ export function SettingsDialog({ onClose }: { onClose: () => void }) {
 
   const [personaHandle, setPersonaHandle] = useState("codex-reviewer");
   const [personaAdapter, setPersonaAdapter] = useState("codex");
+  const [personaOptions, setPersonaOptions] = useState<PersonaModel>({ active_model: null, active_effort: null });
   const [personaName, setPersonaName] = useState("Codex Reviewer");
   const [personaPrompt, setPersonaPrompt] = useState(
     "Focus on architecture, race conditions, and thorough test coverage."
@@ -74,12 +78,14 @@ export function SettingsDialog({ onClose }: { onClose: () => void }) {
     theme,
     setTheme,
     probes,
+    adapters,
     quotas,
     adapterCatalogs,
     adapterDefaults,
     quotasRefreshing,
     refreshQuotasLive,
     updateAdapterDefaults,
+    updateMemberConfig,
     errorBanner,
     activeSession,
     members,
@@ -159,9 +165,40 @@ export function SettingsDialog({ onClose }: { onClose: () => void }) {
         adapter_id: personaAdapter,
         display_name: personaName.trim() || personaHandle.trim(),
         persona_prompt: personaPrompt.trim(),
+        ...personaOptions,
       });
-      await selectSession(activeSession.id);
+      if (useAppStore.getState().activeSession?.id === activeSession.id) await selectSession(activeSession.id);
       setPersonaHandle("");
+      setPersonaOptions({ active_model: null, active_effort: null });
+    } catch (cause) {
+      setError(cause instanceof Error ? cause.message : String(cause));
+    } finally {
+      setSaving(null);
+    }
+  };
+
+  const changePersona = async (handle: string, values: Partial<PersonaModel>) => {
+    setSaving(handle);
+    setError(null);
+    try {
+      await updateMemberConfig(handle, values);
+    } catch (cause) {
+      setError(cause instanceof Error ? cause.message : String(cause));
+    } finally {
+      setSaving(null);
+    }
+  };
+
+  const removePersona = async (handle: string) => {
+    if (!activeSession) return;
+    const sid = activeSession.id;
+    setSaving(handle);
+    setError(null);
+    try {
+      await api.deleteMember(sid, handle);
+      if (useAppStore.getState().activeSession?.id === sid) {
+        await selectSession(sid);
+      }
     } catch (cause) {
       setError(cause instanceof Error ? cause.message : String(cause));
     } finally {
@@ -424,7 +461,7 @@ export function SettingsDialog({ onClose }: { onClose: () => void }) {
                       size={13}
                       className={quotasRefreshing ? "animate-spin" : ""}
                     />
-                    {quotasRefreshing ? "Refreshing…" : "Refresh Quotas"}
+                    {quotasRefreshing ? "Refreshing…" : "Refresh Models & Quotas"}
                   </button>
                 </div>
 
@@ -435,6 +472,9 @@ export function SettingsDialog({ onClose }: { onClose: () => void }) {
                 ) : (
                   installedProbes.map((probe) => {
                     const quota = quotas[probe.adapter_id];
+                    const adapter = adapters[probe.adapter_id];
+                    const isAntigravityCli = adapter?.quota_provider === "google_local"
+                      && /(?:^|[\\/])(?:agy|antigravity)(?:\.(?:exe|cmd|bat|ps1))?$/i.test(probe.resolved_command ?? "");
                     const catalog = adapterCatalogs[probe.adapter_id];
                     const pref = adapterDefaults[probe.adapter_id];
                     const modelDetails =
@@ -479,6 +519,11 @@ export function SettingsDialog({ onClose }: { onClose: () => void }) {
                             <p className="mt-0.5 text-xs text-ink-muted">
                               {probe.auth_hint}
                             </p>
+                            {adapters[probe.adapter_id]?.profile_dir && (
+                              <p className="mt-1 truncate text-[11px] text-ink-muted" title={adapters[probe.adapter_id].profile_dir ?? undefined}>
+                                Separate profile · {adapters[probe.adapter_id].profile_dir}
+                              </p>
+                            )}
                             {probe.resolved_command && (
                               <p
                                 className="mt-1 truncate font-mono text-[11px] text-ink-muted"
@@ -492,10 +537,17 @@ export function SettingsDialog({ onClose }: { onClose: () => void }) {
                             Available
                           </span>
                         </div>
+                        <HarnessMaintenance
+                          adapterId={probe.adapter_id}
+                          profile={adapter?.profile_dir}
+                          offersDeviceCode={adapter?.quota_provider === "codex_local"}
+                          offersSignIn={["codex_local", "claude_local"].includes(adapter?.quota_provider ?? "") || isAntigravityCli}
+                        />
 
-                        {quota && (
+                        {(quota || (isAntigravityCli && adapter?.profile_dir)) && (
                           <div className="border-t border-line pt-3">
-                            <QuotaSnapshotSummary quota={quota} />
+                            {quota && <QuotaSnapshotSummary quota={quota} />}
+                            {isAntigravityCli && adapter?.profile_dir && <SharedAntigravityUsage adapterId={probe.adapter_id} />}
                           </div>
                         )}
 
@@ -638,8 +690,9 @@ export function SettingsDialog({ onClose }: { onClose: () => void }) {
                           return (
                             <div
                               key={m.handle}
-                              className="flex items-center justify-between gap-3 rounded-xl border border-line bg-inset px-3 py-2"
+                              className="space-y-2.5 rounded-xl border border-line bg-inset px-3 py-2"
                             >
+                              <div className="flex items-center justify-between gap-2">
                               <div className="min-w-0">
                                 <div className="flex items-center gap-2">
                                   <span className="font-mono font-semibold text-ink">
@@ -671,6 +724,17 @@ export function SettingsDialog({ onClose }: { onClose: () => void }) {
                                 <Crown className="w-3 h-3" />
                                 <span>{isOrch ? "Orchestrator" : "Make Orchestrator"}</span>
                               </button>
+                              {(m.handle !== m.adapter_id || Boolean(m.persona_prompt)) && (
+                                <button type="button" aria-label={"Remove persona @" + m.handle}
+                                  disabled={saving !== null} onClick={() => void removePersona(m.handle)}
+                                  className="shrink-0 rounded-lg p-1.5 text-ink-muted hover:bg-neg-soft hover:text-neg">
+                                  <Trash2 className="h-3.5 w-3.5" />
+                                </button>
+                              )}
+                              </div>
+                              <PersonaModelFields label={"@" + m.handle} catalog={adapterCatalogs[m.adapter_id]}
+                                model={m.active_model} effort={m.active_effort} disabled={saving !== null}
+                                onChange={(values) => void changePersona(m.handle, values)} />
                             </div>
                           );
                         })}
@@ -694,7 +758,10 @@ export function SettingsDialog({ onClose }: { onClose: () => void }) {
                             <select
                               aria-label="Persona adapter"
                               value={personaAdapter}
-                              onChange={(e) => setPersonaAdapter(e.target.value)}
+                              onChange={(e) => {
+                                setPersonaAdapter(e.target.value);
+                                setPersonaOptions({ active_model: null, active_effort: null });
+                              }}
                               className="rounded-lg bg-inset border border-line px-2.5 py-1.5 text-ink"
                             >
                               {installedAdapters.map((a) => (
@@ -711,6 +778,10 @@ export function SettingsDialog({ onClose }: { onClose: () => void }) {
                               className="rounded-lg bg-inset border border-line px-2.5 py-1.5 text-ink"
                             />
                           </div>
+                          <PersonaModelFields label="New persona" catalog={adapterCatalogs[personaAdapter]}
+                            model={personaOptions.active_model} effort={personaOptions.active_effort}
+                            disabled={saving !== null}
+                            onChange={(values) => setPersonaOptions((previous) => ({ ...previous, ...values }))} />
                           <div className="flex gap-2">
                             <input
                               type="text"

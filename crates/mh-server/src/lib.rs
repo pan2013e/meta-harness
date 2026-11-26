@@ -1,4 +1,5 @@
 pub mod auth;
+pub mod harness_jobs;
 pub mod mcp_bridge;
 pub mod pty;
 pub mod routes;
@@ -24,6 +25,7 @@ pub struct WebAssets;
 pub struct AppState {
     pub switch: Arc<SwitchEngine>,
     pub auth: AuthConfig,
+    pub harness_jobs: harness_jobs::HarnessJobs,
 }
 
 pub fn build_router(state: AppState) -> Router {
@@ -35,11 +37,26 @@ pub fn build_router(state: AppState) -> Router {
         .route("/api/fs/pick-folder", post(routes::pick_fs_folder))
         .route("/api/adapters", get(routes::list_adapters))
         .route("/api/adapters/probe", get(routes::probe_adapters))
+        .route("/api/adapters/{id}/version", get(harness_jobs::version))
+        .route(
+            "/api/adapters/{id}/operation",
+            get(harness_jobs::status)
+                .post(harness_jobs::start)
+                .delete(harness_jobs::cancel),
+        )
+        .route(
+            "/api/adapters/{id}/operation/input",
+            post(harness_jobs::input),
+        )
         .route(
             "/api/adapters/{id}/defaults",
             patch(routes::update_adapter_defaults),
         )
         .route("/api/quotas", get(routes::list_quotas))
+        .route(
+            "/api/adapters/{id}/shared-usage",
+            post(routes::shared_antigravity_usage),
+        )
         .route("/api/quotas/refresh", post(routes::refresh_quotas))
         .route(
             "/api/adapters/{id}/quota",

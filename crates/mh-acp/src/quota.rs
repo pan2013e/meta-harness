@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::Duration;
 
@@ -10,9 +10,11 @@ use tokio::process::Command;
 use tokio::sync::RwLock;
 use tokio::task::JoinSet;
 
-use mh_core::{AppConfig, QuotaSnapshot, QuotaSource, QuotaWindow};
+use crate::AcpError;
+use mh_core::{AdapterConfig, AppConfig, QuotaSnapshot, QuotaSource, QuotaWindow};
 
 use crate::platform::{ProcessTreeGuard, find_cli_binary, prepare_isolated_command};
+use crate::profile::{has_agy_keyring_entry, is_agy, profile_home};
 use crate::supervisor::resolve_adapter_command;
 
 const LIVE_QUOTA_CACHE_TTL_MS: i64 = 5 * 60 * 1000;
@@ -50,6 +52,8 @@ struct AdapterQuotaPrefs {
     manual_5h_pct: Option<f32>,
     manual_weekly_pct: Option<f32>,
     rate_limited_until: Option<i64>,
+    profile_dir: Option<PathBuf>,
+    google_cli: Option<String>,
 }
 
 impl Default for AdapterQuotaPrefs {
@@ -60,6 +64,8 @@ impl Default for AdapterQuotaPrefs {
             manual_5h_pct: None,
             manual_weekly_pct: None,
             rate_limited_until: None,
+            profile_dir: None,
+            google_cli: None,
         }
     }
 }
@@ -96,6 +102,68 @@ pub struct QuotaTracker {
 }
 
 impl QuotaTracker {
+    /// Reads the shared CLI account for display only. It never feeds the adapter's quota ledger.
+    pub async fn shared_antigravity_usage(
+        &self,
+        id: &str,
+        adapter: &AdapterConfig,
+    ) -> Result<Vec<QuotaWindow>, AcpError> {
+        let enabled = self
+            .prefs
+            .read()
+            .await
+            .get(id)
+            .map_or(adapter.exact_quota_probe_opt_in, |prefs| {
+                prefs.exact_probe_opt_in
+            });
+        if !enabled {
+            return Err(AcpError::PermissionDenied(
+                "Live usage checks are disabled for this adapter.".into(),
+            ));
+        }
+        let (command, _) = resolve_adapter_command(adapter)?;
+        if adapter.quota_provider != "google_local"
+            || adapter.profile_dir.is_none()
+            || !is_agy(&command)
+        {
+            return Err(AcpError::InvalidProfile(
+                "The shared usage view is available for a separate Antigravity profile.".into(),
+            ));
+        }
+        let (outcome, _) = probe_google_live(
+            &self.http,
+            chrono::Utc::now().timestamp_millis(),
+            None,
+            Some(&command),
+        )
+        .await;
+        if outcome.source == Some(QuotaSource::LiveProbe) && !outcome.windows.is_empty() {
+            return Ok(outcome.windows);
+        }
+        Err(AcpError::Rpc {
+            code: -32000,
+            message: outcome
+                .status_note
+                .unwrap_or_else(|| "Shared Antigravity usage is unavailable.".into()),
+            data: None,
+        })
+    }
+
+    pub async fn configure_launch_profile(&self, adapter_id: &str, cfg: &AdapterConfig) {
+        let mut prefs = self.prefs.write().await;
+        let entry = prefs.entry(adapter_id.to_string()).or_default();
+        entry.profile_dir = cfg.profile_dir.clone();
+        entry.google_cli = if cfg.quota_provider == "google_local" {
+            resolve_adapter_command(cfg)
+                .ok()
+                .map(|(command, _)| command)
+        } else {
+            None
+        };
+        drop(prefs);
+        self.invalidate(adapter_id).await;
+    }
+
     pub fn new() -> Self {
         let http = reqwest::Client::builder()
             .timeout(Duration::from_secs(6))
@@ -320,9 +388,21 @@ impl QuotaTracker {
             LiveProbeOutcome::default()
         } else {
             let (fresh, ttl_ms) = match quota_provider {
-                "codex_local" => probe_codex_live(&self.http, now).await,
-                "claude_local" => probe_claude_live(&self.http, now).await,
-                "google_local" => probe_google_live(&self.http, now).await,
+                "codex_local" => {
+                    probe_codex_live(&self.http, now, pref.profile_dir.as_deref()).await
+                }
+                "claude_local" => {
+                    probe_claude_live(&self.http, now, pref.profile_dir.as_deref()).await
+                }
+                "google_local" => {
+                    probe_google_live(
+                        &self.http,
+                        now,
+                        pref.profile_dir.as_deref(),
+                        pref.google_cli.as_deref(),
+                    )
+                    .await
+                }
                 _ => (
                     LiveProbeOutcome {
                         status_note: Some("Custom adapter (no quota API)".into()),
@@ -495,16 +575,20 @@ fn format_plan_label(raw: &str) -> String {
     }
 }
 
-async fn probe_codex_live(http: &reqwest::Client, now: i64) -> (LiveProbeOutcome, i64) {
+async fn probe_codex_live(
+    http: &reqwest::Client,
+    now: i64,
+    profile: Option<&Path>,
+) -> (LiveProbeOutcome, i64) {
     // 1. Native `codex app-server --stdio` RPC (`account/rateLimits/read`)
     if let Some(codex_bin) = find_cli_binary("codex")
-        && let Some(outcome) = probe_codex_app_server(&codex_bin, now).await
+        && let Some(outcome) = probe_codex_app_server(&codex_bin, now, profile).await
     {
         return (outcome, LIVE_QUOTA_CACHE_TTL_MS);
     }
 
     // 2. Fallback: ChatGPT Codex OAuth usage endpoint from `~/.codex/auth.json`
-    if let Some((token, account_id)) = read_codex_oauth_credentials() {
+    if let Some((token, account_id)) = read_codex_oauth_credentials(profile) {
         let mut req = http
             .get("https://chatgpt.com/backend-api/wham/usage")
             .bearer_auth(&token)
@@ -559,8 +643,15 @@ async fn probe_codex_live(http: &reqwest::Client, now: i64) -> (LiveProbeOutcome
     )
 }
 
-async fn probe_codex_app_server(codex_bin: &std::path::Path, now: i64) -> Option<LiveProbeOutcome> {
+async fn probe_codex_app_server(
+    codex_bin: &Path,
+    now: i64,
+    profile: Option<&Path>,
+) -> Option<LiveProbeOutcome> {
     let mut cmd = Command::new(codex_bin);
+    if let Some(path) = profile {
+        cmd.env("CODEX_HOME", dunce::simplified(path));
+    }
     cmd.args(["app-server", "--stdio"])
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -770,10 +861,8 @@ fn classify_window(mins: Option<i64>, is_primary: bool) -> (String, String) {
     }
 }
 
-fn read_codex_oauth_credentials() -> Option<(String, Option<String>)> {
-    let codex_dir = std::env::var_os("CODEX_HOME")
-        .map(PathBuf::from)
-        .or_else(|| dirs::home_dir().map(|h| h.join(".codex")))?;
+fn read_codex_oauth_credentials(profile: Option<&Path>) -> Option<(String, Option<String>)> {
+    let codex_dir = profile_home(profile, "CODEX_HOME", ".codex")?;
     let raw = std::fs::read_to_string(codex_dir.join("auth.json")).ok()?;
     let json: Value = serde_json::from_str(&raw).ok()?;
     let token = json
@@ -794,8 +883,12 @@ fn read_codex_oauth_credentials() -> Option<(String, Option<String>)> {
     Some((token, account_id))
 }
 
-async fn probe_claude_live(http: &reqwest::Client, _now: i64) -> (LiveProbeOutcome, i64) {
-    if let Some((token, sub_type)) = read_claude_oauth_credentials().await {
+async fn probe_claude_live(
+    http: &reqwest::Client,
+    _now: i64,
+    profile: Option<&Path>,
+) -> (LiveProbeOutcome, i64) {
+    if let Some((token, sub_type)) = read_claude_oauth_credentials(profile).await {
         let resp = http
             .get("https://api.anthropic.com/api/oauth/usage")
             .bearer_auth(&token)
@@ -929,10 +1022,8 @@ fn parse_claude_usage_json(json: &Value, sub_type: Option<&str>) -> LiveProbeOut
     out
 }
 
-async fn read_claude_oauth_credentials() -> Option<(String, Option<String>)> {
-    let claude_dir = std::env::var_os("CLAUDE_CONFIG_DIR")
-        .map(PathBuf::from)
-        .or_else(|| dirs::home_dir().map(|h| h.join(".claude")));
+async fn read_claude_oauth_credentials(profile: Option<&Path>) -> Option<(String, Option<String>)> {
+    let claude_dir = profile_home(profile, "CLAUDE_CONFIG_DIR", ".claude");
 
     if let Some(dir) = claude_dir {
         let cred_path = dir.join(".credentials.json");
@@ -944,7 +1035,7 @@ async fn read_claude_oauth_credentials() -> Option<(String, Option<String>)> {
     }
 
     #[cfg(target_os = "macos")]
-    {
+    if profile.is_none() {
         if let Ok(output) = tokio::time::timeout(
             Duration::from_secs(2),
             Command::new("security")
@@ -989,7 +1080,77 @@ fn extract_claude_oauth_from_json(raw: &str) -> Option<(String, Option<String>)>
     Some((token, sub))
 }
 
-async fn probe_google_live(http: &reqwest::Client, now: i64) -> (LiveProbeOutcome, i64) {
+async fn probe_google_live(
+    http: &reqwest::Client,
+    now: i64,
+    profile: Option<&Path>,
+    configured_cli: Option<&str>,
+) -> (LiveProbeOutcome, i64) {
+    let executable = configured_cli.map(str::to_string).or_else(|| {
+        find_cli_binary("agy")
+            .or_else(|| find_cli_binary("gemini"))
+            .map(|p| p.to_string_lossy().into_owned())
+    });
+    if let Some(command) = executable.as_deref().filter(|command| is_agy(command)) {
+        let credentials = has_google_cli_auth(profile, true);
+        if profile.is_some() {
+            return (LiveProbeOutcome {
+                plan_label: credentials.then(|| "Google Account".into()),
+                status_note: Some("Antigravity's usage command reads the shared CLI profile; private-profile quota is unavailable".into()),
+                source: Some(QuotaSource::Unavailable),
+                ..Default::default()
+            }, LIVE_QUOTA_CACHE_TTL_MS);
+        }
+        let windows = if credentials {
+            crate::antigravity::run_agy(command, None, &["-p", "/usage", "--print-timeout", "12s"])
+                .await
+                .map_or_else(Vec::new, |output| {
+                    crate::antigravity::quota_windows(&output)
+                })
+        } else {
+            Vec::new()
+        };
+        if !windows.is_empty() {
+            let limiting = |minutes| {
+                windows
+                    .iter()
+                    .filter(|window| window.window_mins == Some(minutes))
+                    .min_by(|a, b| a.remaining_pct.total_cmp(&b.remaining_pct))
+            };
+            let five = limiting(300);
+            let week = limiting(10_080);
+            return (
+                LiveProbeOutcome {
+                    plan_label: Some("Google Account".into()),
+                    window_5h_remaining_pct: five.map(|window| window.remaining_pct),
+                    window_5h_resets_at: five.and_then(|window| window.resets_at),
+                    weekly_remaining_pct: week.map(|window| window.remaining_pct),
+                    weekly_resets_at: week.and_then(|window| window.resets_at),
+                    windows,
+                    source: Some(QuotaSource::LiveProbe),
+                    status_note: Some("Live · Antigravity CLI".into()),
+                    ..Default::default()
+                },
+                LIVE_QUOTA_CACHE_TTL_MS,
+            );
+        }
+        return (
+            LiveProbeOutcome {
+                plan_label: credentials.then(|| "Google Account".into()),
+                status_note: Some(
+                    if credentials {
+                        "Antigravity CLI usage is unavailable"
+                    } else {
+                        "Antigravity sign-in status unavailable"
+                    }
+                    .into(),
+                ),
+                source: Some(QuotaSource::Unavailable),
+                ..Default::default()
+            },
+            30_000,
+        );
+    }
     let api_key = std::env::var("GEMINI_API_KEY")
         .ok()
         .filter(|s| !s.is_empty())
@@ -1044,18 +1205,15 @@ async fn probe_google_live(http: &reqwest::Client, now: i64) -> (LiveProbeOutcom
         );
     }
 
-    let gem_auth_ok = has_google_cli_auth();
-    let cli_ok = find_cli_binary("agy")
-        .or_else(|| find_cli_binary("gemini"))
-        .is_some();
+    let harness = executable.as_ref().map(|_| false);
 
-    let (plan, note) = if cli_ok && gem_auth_ok {
+    let (plan, note) = if harness.is_some_and(|agy| has_google_cli_auth(profile, agy)) {
         (
             Some("Google Account".into()),
-            "Connected · no public OAuth % API",
+            "Credentials detected · no public OAuth quota percentage",
         )
-    } else if cli_ok {
-        (None, "CLI found · sign in with `agy` or `gemini`")
+    } else if harness.is_some() {
+        (None, "CLI found · local sign-in status unavailable")
     } else {
         (None, "CLI (`agy` / `gemini`) not installed")
     };
@@ -1071,22 +1229,28 @@ async fn probe_google_live(http: &reqwest::Client, now: i64) -> (LiveProbeOutcom
     )
 }
 
-fn has_google_cli_auth() -> bool {
-    dirs::home_dir()
-        .map(|h| h.join(".gemini"))
-        .is_some_and(|d| d.join("oauth_creds.json").exists() || d.join("settings.json").exists())
+pub(crate) fn has_google_cli_auth(profile: Option<&Path>, agy: bool) -> bool {
+    if agy {
+        return profile_home(profile, "GEMINI_HOME", ".gemini").is_some_and(|root| {
+            ["antigravity-cli", "antigravity-acp"]
+                .iter()
+                .any(|dir| root.join(dir).join("antigravity-oauth-token").is_file())
+        }) || has_agy_keyring_entry();
+    }
+    let home = profile_home(profile, "GEMINI_CLI_HOME", "");
+    home.is_some_and(|root| root.join(".gemini/oauth_creds.json").is_file())
 }
 
 pub fn probe_installed_adapters(config: &AppConfig) -> Vec<AdapterProbeStatus> {
-    let home = dirs::home_dir();
     let mut results = Vec::new();
 
     for (id, cfg) in &config.adapters {
+        let command = resolve_adapter_command(cfg);
+        let agy = command.as_ref().is_ok_and(|(command, _)| is_agy(command));
+        let profile = cfg.profile_dir.as_deref();
         let (auth_detected, auth_hint) = match cfg.quota_provider.as_str() {
             "codex_local" => {
-                let codex_dir = std::env::var_os("CODEX_HOME")
-                    .map(PathBuf::from)
-                    .or_else(|| home.as_ref().map(|h| h.join(".codex")));
+                let codex_dir = profile_home(profile, "CODEX_HOME", ".codex");
                 let has_oauth = codex_dir
                     .as_ref()
                     .is_some_and(|d| d.join("auth.json").is_file());
@@ -1101,9 +1265,7 @@ pub fn probe_installed_adapters(config: &AppConfig) -> Vec<AdapterProbeStatus> {
                 )
             }
             "claude_local" => {
-                let dir = std::env::var_os("CLAUDE_CONFIG_DIR")
-                    .map(PathBuf::from)
-                    .or_else(|| home.as_ref().map(|h| h.join(".claude")));
+                let dir = profile_home(profile, "CLAUDE_CONFIG_DIR", ".claude");
                 let has_creds = dir
                     .as_ref()
                     .is_some_and(|d| d.join(".credentials.json").is_file());
@@ -1118,21 +1280,20 @@ pub fn probe_installed_adapters(config: &AppConfig) -> Vec<AdapterProbeStatus> {
                 )
             }
             "google_local" => {
-                let auth_ok = has_google_cli_auth()
-                    || std::env::var_os("GEMINI_API_KEY").is_some_and(|v| !v.is_empty())
+                let signed_in = has_google_cli_auth(profile, agy);
+                let has_key = std::env::var_os("GEMINI_API_KEY").is_some_and(|v| !v.is_empty())
                     || std::env::var_os("GOOGLE_API_KEY").is_some_and(|v| !v.is_empty());
-                (
-                    auth_ok,
-                    if auth_ok {
-                        "Google/Gemini credentials detected"
-                    } else {
-                        "Sign in with Antigravity or Gemini CLI"
-                    },
-                )
+                let hint = match (signed_in, agy, has_key) {
+                    (true, true, _) => "Antigravity sign-in detected",
+                    (true, false, _) => "Gemini CLI credentials detected",
+                    (_, _, true) => "Gemini API key detected",
+                    _ => "CLI sign-in status unavailable",
+                };
+                (signed_in || has_key, hint)
             }
             _ => (true, "Custom ACP adapter"),
         };
-        let (resolved, auth_hint) = match resolve_adapter_command(cfg) {
+        let (resolved, auth_hint) = match command {
             Ok((command, _)) => (Some(command), auth_hint.into()),
             Err(error) => (None, error.to_string()),
         };
@@ -1154,6 +1315,25 @@ pub fn probe_installed_adapters(config: &AppConfig) -> Vec<AdapterProbeStatus> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn shared_usage_respects_adapter_opt_out() {
+        let tracker = QuotaTracker::new();
+        tracker
+            .configure_adapter("antigravity", None, false, None, None)
+            .await;
+        let adapter = AdapterConfig {
+            quota_provider: "google_local".into(),
+            exact_quota_probe_opt_in: true,
+            profile_dir: Some("profiles/antigravity".into()),
+            ..AdapterConfig::default()
+        };
+        let error = tracker
+            .shared_antigravity_usage("antigravity", &adapter)
+            .await
+            .unwrap_err();
+        assert!(matches!(error, AcpError::PermissionDenied(_)));
+    }
     use serde_json::json;
 
     #[test]

@@ -65,6 +65,7 @@ pub fn find_cli_binary(name: &str) -> Option<PathBuf> {
             } else if name.eq_ignore_ascii_case("claude") {
                 candidates.push(local.join("Programs/claude-code/claude.exe"));
             } else if name.eq_ignore_ascii_case("agy") {
+                candidates.push(local.join("agy/bin/agy.exe"));
                 candidates.push(local.join("Programs/Antigravity/bin/agy.exe"));
             }
         }

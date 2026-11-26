@@ -6,12 +6,14 @@ import { Plus, Terminal, Trash2, X } from "lucide-react";
 import { ptyWsUrl } from "../../api/client";
 import { useAppStore } from "../../store/useAppStore";
 import type { ThemeId } from "../../types/api";
+import { terminalDirectory } from "./terminalPaths";
 
 interface TerminalTab {
   id: string;
   label: string;
   target: string | null;
   status: "connecting" | "open" | "closed";
+  cwd?: string;
 }
 
 function getXtermTheme(theme: ThemeId) {
@@ -55,6 +57,7 @@ function TerminalTabPane({
   heightPx,
   clearSeq,
   onStatusChange,
+  onCwdChange,
 }: {
   sessionId: string;
   tab: TerminalTab;
@@ -63,6 +66,7 @@ function TerminalTabPane({
   heightPx: number;
   clearSeq: number;
   onStatusChange: (tabId: string, status: TerminalTab["status"]) => void;
+  onCwdChange: (tabId: string, cwd: string) => void;
 }) {
   const hostRef = useRef<HTMLDivElement | null>(null);
   const termRef = useRef<XTerm | null>(null);
@@ -110,6 +114,13 @@ function TerminalTabPane({
       fitAddon = new FitAddon();
       term.loadAddon(fitAddon);
       term.open(host);
+      for (const osc of [7, 9] as const) {
+        term.parser.registerOscHandler(osc, (data) => {
+          const path = terminalDirectory(data, osc);
+          if (path) onCwdChange(tab.id, path);
+          return path !== null;
+        });
+      }
       try {
         fitAddon.fit();
       } catch {
@@ -154,9 +165,12 @@ function TerminalTabPane({
             const frame = JSON.parse(String(ev.data)) as {
               type: string;
               data?: string;
+              path?: string;
             };
             if (frame.type === "output" && typeof frame.data === "string") {
               term.write(frame.data);
+            } else if (frame.type === "cwd" && typeof frame.path === "string") {
+              onCwdChange(tab.id, frame.path);
             } else if (frame.type === "exit") {
               exited = true;
               onStatusChange(tab.id, "closed");
@@ -333,7 +347,7 @@ export function WebShellDrawer({
   };
 
   const activeTab = tabs.find((t) => t.id === activeTabId) ?? tabs[0];
-  const targetLabel = activeTab?.target ? `@${activeTab.target} worktree` : defaultCwd;
+  const targetLabel = activeTab?.cwd ?? (activeTab?.target ? `@${activeTab.target} worktree` : defaultCwd);
 
   return (
     <section
@@ -487,6 +501,9 @@ export function WebShellDrawer({
             theme={theme}
             heightPx={heightPx}
             clearSeq={clearCounter[tab.id] ?? 0}
+            onCwdChange={(tabId, cwd) => setTabs((prev) => prev.map(
+              (item) => item.id === tabId && item.cwd !== cwd ? { ...item, cwd } : item
+            ))}
             onStatusChange={(tabId, status) =>
               setTabs((prev) =>
                 prev.map((t) => (t.id === tabId ? { ...t, status } : t))

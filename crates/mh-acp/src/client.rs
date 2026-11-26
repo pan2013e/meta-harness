@@ -63,6 +63,7 @@ pub struct AcpClient {
     pub agent_capabilities: RwLock<InitializeResult>,
     pub acp_session_id: RwLock<Option<String>>,
     pub config_options: RwLock<Vec<DiscoveredConfigOption>>,
+    session_defaults: RwLock<Vec<DiscoveredConfigOption>>,
     pub latest_usage: RwLock<Option<(u64, u64)>>,
     reader_task: tokio::task::JoinHandle<()>,
     coalescer_task: tokio::task::JoinHandle<()>,
@@ -237,6 +238,7 @@ impl AcpClient {
                 agent_capabilities: RwLock::new(InitializeResult::default()),
                 acp_session_id: RwLock::new(None),
                 config_options: RwLock::new(Vec::new()),
+                session_defaults: RwLock::new(Vec::new()),
                 latest_usage: RwLock::new(None),
                 reader_task,
                 coalescer_task,
@@ -284,6 +286,7 @@ impl AcpClient {
         let res: NewSessionResult = serde_json::from_value(raw)?;
         *self.acp_session_id.write().await = Some(res.session_id.clone());
         let opts = parse_new_session_options(&res);
+        *self.session_defaults.write().await = opts.clone();
         *self.config_options.write().await = opts;
         Ok(res)
     }
@@ -299,9 +302,13 @@ impl AcpClient {
             cwd: dunce::simplified(cwd).to_string_lossy().into_owned(),
             mcp_servers,
         };
-        let _ = self
+        let response = self
             .request("session/load", serde_json::to_value(params)?)
             .await?;
+        if let Some(options) = response.get("configOptions").and_then(Value::as_array) {
+            *self.config_options.write().await = parse_config_options(options);
+        }
+        *self.session_defaults.write().await = self.config_options.read().await.clone();
         *self.acp_session_id.write().await = Some(acp_session_id.to_string());
         Ok(())
     }
@@ -337,29 +344,44 @@ impl AcpClient {
         target_effort: Option<&str>,
     ) -> (Option<String>, Option<String>) {
         let opts = self.config_options.read().await.clone();
+        let defaults = self.session_defaults.read().await.clone();
         let mut applied_model = None;
         let mut applied_effort = None;
 
-        if let Some(req_model) = target_model
-            && let Some(opt) = find_option_by_category_or_id(&opts, &["model"], &["model"])
+        if let Some(req_model) = target_model.or_else(|| {
+            find_option_by_category_or_id(&defaults, &["model"], &["model"])
+                .and_then(|option| option.current_value.as_deref())
+        }) && let Some(opt) = find_option_by_category_or_id(&opts, &["model"], &["model"])
         {
             let matched = match_choice(&opt.choices, req_model).unwrap_or(req_model);
-            if self.set_config_option(&opt.id, matched).await.is_ok() {
+            if opt.current_value.as_deref() == Some(matched)
+                || self.set_config_option(&opt.id, matched).await.is_ok()
+            {
                 applied_model = Some(matched.to_string());
             } else {
                 warn!("session/set_config_option failed for model={matched}");
             }
         }
 
-        if let Some(req_effort) = target_effort
-            && let Some(opt) = find_option_by_category_or_id(
-                &opts,
-                &["thought_level", "reasoning_effort"],
-                &["reasoning_effort", "thought_level", "effort"],
-            )
+        let opts = self.config_options.read().await.clone();
+        let effort_categories = ["thought_level", "reasoning_effort"];
+        let effort_ids = ["reasoning_effort", "thought_level", "effort"];
+        if let Some(req_effort) = target_effort.or_else(|| {
+            // A different model can have a different native default effort.
+            let original = find_option_by_category_or_id(&defaults, &["model"], &["model"])
+                .and_then(|option| option.current_value.as_deref());
+            if applied_model.as_deref() != original {
+                return None;
+            }
+            find_option_by_category_or_id(&defaults, &effort_categories, &effort_ids)
+                .and_then(|option| option.current_value.as_deref())
+        }) && let Some(opt) =
+            find_option_by_category_or_id(&opts, &effort_categories, &effort_ids)
         {
             let matched = match_choice(&opt.choices, req_effort).unwrap_or(req_effort);
-            if self.set_config_option(&opt.id, matched).await.is_ok() {
+            if opt.current_value.as_deref() == Some(matched)
+                || self.set_config_option(&opt.id, matched).await.is_ok()
+            {
                 applied_effort = Some(matched.to_string());
             } else {
                 debug!("skipping effort={matched} on adapter that rejected it");

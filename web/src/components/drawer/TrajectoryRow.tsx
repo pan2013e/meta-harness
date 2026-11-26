@@ -1,9 +1,10 @@
 import { memo } from "react";
 import { ChevronRight, FileCode, ListChecks, Terminal, Wrench } from "lucide-react";
 import { DiffViewer } from "../common/DiffViewer";
+import { MarkdownBlock } from "../common/MarkdownBlock";
 import { asRecord, type TrajectoryEntry } from "./trajectory";
 
-export const TrajectoryRow = memo(function TrajectoryRow({ entry }: { entry: TrajectoryEntry }) {
+export const TrajectoryRow = memo(function TrajectoryRow({ entry, sessionId }: { entry: TrajectoryEntry; sessionId?: string }) {
   if (entry.type === "tool") {
     const terminal = entry.category === "execute" || entry.exitCode != null || !!entry.output;
     const Icon = terminal ? Terminal : entry.edits.length ? FileCode : Wrench;
@@ -30,7 +31,9 @@ export const TrajectoryRow = memo(function TrajectoryRow({ entry }: { entry: Tra
           {output && (
             <div>
               <h4 className="mb-1 text-ink-muted">{entry.outputTruncated ? "Output (last 24,000 characters)" : "Output"}</h4>
-              <pre className="max-h-64 overflow-auto whitespace-pre-wrap break-words rounded-lg bg-inset p-2 leading-relaxed text-ink-soft">{output}</pre>
+              {terminal ? (
+                <pre className="max-h-64 overflow-auto whitespace-pre-wrap break-words rounded-lg bg-inset p-2 leading-relaxed text-ink-soft">{output}</pre>
+              ) : <MarkdownBlock content={output.trim()} sessionId={sessionId} />}
             </div>
           )}
           {!output && entry.result != null && !(entry.exitCode != null && Object.keys(asRecord(entry.result)).length === 1) && (
@@ -63,10 +66,10 @@ export const TrajectoryRow = memo(function TrajectoryRow({ entry }: { entry: Tra
       </div>
       {plan ? (
         <ul className="space-y-1.5">
-          {plan.map((item, index) => <li key={index} className="flex items-start gap-2"><ListChecks size={13} className="shrink-0 text-brand-ink" /><span>{String(item.content ?? "")}</span><span className="ml-auto text-ink-muted">{String(item.status ?? "").replaceAll("_", " ")}</span></li>)}
+          {plan.map((item, index) => <li key={index} className="flex items-start gap-2"><ListChecks size={13} className="shrink-0 text-brand-ink" /><div className="min-w-0 flex-1"><MarkdownBlock content={String(item.content ?? "").trim()} sessionId={sessionId} /></div><span className="shrink-0 text-ink-muted">{String(item.status ?? "").replaceAll("_", " ")}</span></li>)}
         </ul>
       ) : typeof payload.text === "string" ? (
-        <p className="whitespace-pre-wrap break-words leading-relaxed text-ink-soft">{payload.text}</p>
+        <MarkdownBlock content={payload.text.trim()} sessionId={sessionId} />
       ) : (
         <pre className="overflow-x-auto whitespace-pre-wrap font-mono text-ink-soft">{JSON.stringify(payload, null, 2)}</pre>
       )}

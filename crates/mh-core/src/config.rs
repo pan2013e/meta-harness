@@ -56,6 +56,7 @@ pub struct AdapterConfig {
     pub fallback_commands: Vec<AdapterFallbackCommand>,
     pub quota_provider: String,
     pub exact_quota_probe_opt_in: bool,
+    pub profile_dir: Option<std::path::PathBuf>,
     pub characteristics: AdapterCharacteristics,
 }
 
@@ -123,6 +124,7 @@ impl Default for AdapterConfig {
             fallback_commands: Vec::new(),
             quota_provider: "manual".to_string(),
             exact_quota_probe_opt_in: false,
+            profile_dir: None,
             characteristics: AdapterCharacteristics::default(),
         }
     }
@@ -143,6 +145,7 @@ impl Default for AppConfig {
                 fallback_commands: Vec::new(),
                 quota_provider: "codex_local".to_string(),
                 exact_quota_probe_opt_in: true,
+                profile_dir: None,
                 characteristics: AdapterCharacteristics {
                     strengths: vec![
                         "backend-systems".into(),
@@ -169,6 +172,7 @@ impl Default for AppConfig {
                 fallback_commands: Vec::new(),
                 quota_provider: "claude_local".to_string(),
                 exact_quota_probe_opt_in: true,
+                profile_dir: None,
                 characteristics: AdapterCharacteristics {
                     strengths: vec![
                         "architecture".into(),
@@ -197,6 +201,7 @@ impl Default for AppConfig {
                 }],
                 quota_provider: "google_local".to_string(),
                 exact_quota_probe_opt_in: true,
+                profile_dir: None,
                 characteristics: AdapterCharacteristics {
                     strengths: vec![
                         "broad-codebase-research".into(),
@@ -244,6 +249,13 @@ impl AppConfig {
                 let defaults = AppConfig::default();
                 for (k, v) in defaults.adapters {
                     cfg.adapters.entry(k).or_insert(v);
+                }
+                for adapter in cfg.adapters.values_mut() {
+                    if let Some(dir) = adapter.profile_dir.as_mut()
+                        && dir.is_relative()
+                    {
+                        *dir = app_paths.data_dir.join(&*dir);
+                    }
                 }
                 return Ok(cfg);
             } else if explicit_path.is_some() {

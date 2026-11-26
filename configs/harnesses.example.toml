@@ -32,6 +32,7 @@ curation_mode = "orchestrator_llm" # "orchestrator_llm" | "deterministic_only"
 # -----------------------------------------------------------------------------
 
 [adapters.codex]
+# profile_dir = "profiles/codex" # Optional, relative to the Meta-Harness data directory
 display_name = "Codex"
 accent_color = "#10a37f"
 enabled = true
@@ -47,6 +48,7 @@ latency_tier = "medium"
 context_window_tier = "large"
 
 [adapters.claude]
+# profile_dir = "profiles/claude"
 display_name = "Claude Code"
 accent_color = "#d97757"
 enabled = true
@@ -62,6 +64,7 @@ latency_tier = "fast"
 context_window_tier = "large"
 
 [adapters.antigravity]
+# profile_dir = "profiles/antigravity"
 display_name = "Antigravity"
 accent_color = "#4285f4"
 enabled = true

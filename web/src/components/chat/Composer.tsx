@@ -4,11 +4,9 @@ import {
   ChevronDown,
   CornerDownLeft,
   Cpu,
-  Crown,
   Gauge,
   Send,
   Shield,
-  Sparkles,
   Square,
 } from "lucide-react";
 import { api } from "../../api/client";
@@ -49,6 +47,8 @@ const PERMISSION_LABELS: Record<PermissionPolicy, string> = {
 };
 
 const EFFORT_LABELS: Record<string, string> = {
+  none: "None",
+  minimal: "Minimal",
   low: "Low",
   medium: "Medium",
   high: "High",
@@ -56,6 +56,42 @@ const EFFORT_LABELS: Record<string, string> = {
   max: "Max",
   ultra: "Ultra",
 };
+
+const EFFORT_ORDER = Object.keys(EFFORT_LABELS);
+const COMPACT_COMMAND = /^\/compact(?:\s+([\s\S]+))?$/i;
+
+type ModelSettings = { model: string | null; effort: string | null };
+const DEFAULT_MODEL_SETTINGS: ModelSettings = { model: null, effort: null };
+
+function routingMentions(markdown: string): Set<string> {
+  // Match the router's mention boundaries and ignore fenced and inline code.
+  let fence: string | undefined;
+  const withoutFences = markdown.split("\n").map((line) => {
+    if (fence) {
+      const closing = line.match(/^[ \t]*(`{3,}|~{3,})\s*$/)?.[1];
+      if (closing?.startsWith(fence)) fence = undefined;
+      return "";
+    }
+    const opening = line.match(/^[ \t]*(`{3,}|~{3,})(.*)$/);
+    if (opening && (opening[1][0] === "~" || !opening[2].includes("`"))) {
+      fence = opening[1];
+      return "";
+    }
+    return line;
+  }).join("\n");
+  const withoutCode = withoutFences.replace(/(?<!`)(`+)(?!`)[\s\S]*?(?<!`)\1(?!`)/g, " ");
+  return new Set(
+    Array.from(
+      withoutCode.matchAll(/(?:^|[\s([{"',:;>*])@([a-z0-9_-]+)(?![a-z0-9_/-]|\.[a-z0-9])(?:\[[^\s\]]+\])?/gi),
+      (match) => match[1].toLowerCase()
+    )
+  );
+}
+
+function effortRank(value: string): number {
+  const index = EFFORT_ORDER.indexOf(value);
+  return index < 0 ? EFFORT_ORDER.length : index;
+}
 
 function formatCompactTokens(tokens: number): string {
   if (tokens >= 1_000_000) return `${(tokens / 1_000_000).toFixed(1)}M`;
@@ -84,14 +120,8 @@ export function Composer({
     sessionContext,
     memoryJobs,
     memoryFacts,
-    selectedRecipient,
-    setSelectedRecipient,
     pendingPermissionPolicy,
     setPendingPermissionPolicy,
-    autoModelOverride,
-    setAutoModelOverride,
-    autoEffortOverride,
-    setAutoEffortOverride,
     updateMemberConfig,
     createAndSelectSession,
     archiveSession,
@@ -113,13 +143,14 @@ export function Composer({
   const [slashQuery, setSlashQuery] = useState<string | null>(null);
   const [selectedIdx, setSelectedIdx] = useState(0);
   const [menuDismissed, setMenuDismissed] = useState(false);
-  const [recipientOpen, setRecipientOpen] = useState(false);
-  const [modelOpen, setModelOpen] = useState(false);
-  const [effortOpen, setEffortOpen] = useState(false);
+  const [modelDraft, setModelDraft] = useState<(ModelSettings & { target: string }) | null>(null);
+  const [modelOverrides, setModelOverrides] = useState<Record<string, ModelSettings>>({});
+  const [savingModel, setSavingModel] = useState(false);
   const [permOpen, setPermOpen] = useState(false);
   const [contextOpen, setContextOpen] = useState(false);
   const [contextMemberHandle, setContextMemberHandle] = useState<string | null>(null);
   const editorRef = useRef<MentionEditorHandle | null>(null);
+  const modelButtonRef = useRef<HTMLButtonElement | null>(null);
 
   useEffect(() => {
     if (draftPreset?.text) {
@@ -244,176 +275,120 @@ export function Composer({
     return SLASH_ITEMS.filter((item) => item.command.startsWith(slashQuery));
   }, [slashQuery, menuDismissed]);
 
-  const explicitMentions = useMemo(
-    () =>
-      Array.from(
-        text
-          .replace(/```[\s\S]*?```|`[^`]+`/g, " ")
-          .matchAll(/(?:^|\s)@([a-zA-Z0-9_-]+)/g)
-      ).map((m) => m[1]),
-    [text]
+  const raw = text.trim();
+  const compactMatch = raw.match(COMPACT_COMMAND);
+  const routingText = compactMatch ? compactMatch[1]?.trim() ?? "" : raw;
+  const explicitMentions = useMemo(() => routingMentions(routingText), [routingText]);
+  const mentionedMembers = (activeSession ? members : availableMembers).filter((member) =>
+    explicitMentions.has(member.handle.toLowerCase())
   );
-
-  const routingLabel = useMemo(() => {
-    if (explicitMentions.length > 0) {
-      return `Direct · ${[...new Set(explicitMentions)].map((h) => `@${h}`).join(", ")}`;
-    }
-    if (selectedRecipient) {
-      return selectedRecipient === "all"
-        ? "Broadcast · @all"
-        : `Direct · @${selectedRecipient}`;
-    }
-    if (orchestrator) return `Auto · @${orchestrator.handle}`;
-    return availableMembers.length
-      ? `To @${availableMembers[0].handle}`
-      : "No harness";
-  }, [explicitMentions, selectedRecipient, orchestrator, availableMembers]);
-
-  // Determine target member when controlling per-target vs Auto model & effort
-  const targetedMember = useMemo(() => {
-    const firstExplicit = explicitMentions.find(
-      (h) => h.toLowerCase() !== "all" && h.toLowerCase() !== "orchestrator"
-    );
-    if (firstExplicit) {
-      return (
-        availableMembers.find(
-          (m) => m.handle.toLowerCase() === firstExplicit.toLowerCase()
-        ) ?? null
-      );
-    }
-    if (selectedRecipient && selectedRecipient !== "all") {
-      return (
-        availableMembers.find((m) => m.handle === selectedRecipient) ?? null
-      );
-    }
-    return null;
-  }, [explicitMentions, selectedRecipient, availableMembers]);
-
-  const targetAdapterId =
-    targetedMember?.adapter_id ??
-    orchestrator?.adapter_id ??
-    availableMembers[0]?.adapter_id;
+  const toOrchestrator = explicitMentions.has("orchestrator");
+  const multipleRecipients =
+    !toOrchestrator && (explicitMentions.has("all") || mentionedMembers.length > 1);
+  const directMember = !toOrchestrator && !multipleRecipients ? mentionedMembers[0] : undefined;
+  const recipient = multipleRecipients
+    ? undefined
+    : toOrchestrator
+      ? orchestrator ?? undefined
+      : directMember ?? orchestrator ?? availableMembers[0];
+  const targetMember = availableMembers.find((m) => m.handle === recipient?.handle);
+  const targetAdapterId = targetMember?.adapter_id;
   const targetCatalog = targetAdapterId ? adapterCatalogs[targetAdapterId] : undefined;
+  const targetDefaults = targetAdapterId ? adapterDefaults[targetAdapterId] : undefined;
+  const targetKey = targetMember ? targetMember.adapter_id + "/" + targetMember.handle : undefined;
+  const savesMemberConfig = Boolean(activeSession && directMember);
+  const menuTarget = targetKey ? (savesMemberConfig ? "member/" : "draft/") + targetKey : undefined;
+  const openModelDraft = modelDraft?.target === menuTarget ? modelDraft : null;
+
+  const liveOptions = targetMember ? memberOptions[targetMember.handle] : undefined;
+  const discoveredEfforts = liveOptions?.find(
+    (option) =>
+      option.category === "thought_level" ||
+      option.category === "reasoning_effort" ||
+      ["reasoning_effort", "thought_level", "effort"].includes(option.id)
+  )?.choices;
+  const defaultEffortChoices = discoveredEfforts ?? targetCatalog?.efforts ?? [];
 
   const modelDetailsForTarget = useMemo(() => {
     if (!targetAdapterId) return [];
-    const discovered = targetedMember
-      ? (memberOptions[targetedMember.handle] ?? []).find(
-          (o) => o.category === "model" || o.id === "model"
-        )?.choices ?? []
-      : [];
-    const baseDetails =
-      targetCatalog?.model_details && targetCatalog.model_details.length > 0
-        ? targetCatalog.model_details
-        : (targetCatalog?.models ?? []).map((m) => ({
-            value: m.value,
-            label: m.label,
-            description: "",
-            is_default: false,
-            default_effort: null,
-            supported_efforts: targetCatalog?.efforts ?? [],
-          }));
-    const seen = new Set<string>();
-    const merged = [
-      ...discovered.map((c) => ({
-        value: c.value,
-        label: c.label,
-        description: "",
-        is_default: false,
-        default_effort: null,
-        supported_efforts:
-          baseDetails.find((d) => d.value === c.value)?.supported_efforts ??
-          targetCatalog?.efforts ??
-          [],
-      })),
-      ...baseDetails,
-    ].filter((item) => {
-      if (seen.has(item.value)) return false;
-      seen.add(item.value);
-      return true;
-    });
-    const extra =
-      targetedMember?.active_model ?? adapterDefaults[targetAdapterId]?.default_model;
-    if (extra && !seen.has(extra)) {
-      merged.unshift({
-        value: extra,
-        label: extra,
-        description: "",
-        is_default: false,
-        default_effort: null,
-        supported_efforts: targetCatalog?.efforts ?? [],
+    const discovered = liveOptions?.find(
+      (option) => option.category === "model" || option.id === "model"
+    )?.choices ?? [];
+    const catalogModels = targetCatalog?.model_details?.length
+      ? targetCatalog.model_details
+      : (targetCatalog?.models ?? []).map((model) => ({
+          ...model,
+          supported_efforts: targetCatalog?.efforts ?? [],
+        }));
+    const merged = new Map(catalogModels.map((model) => [model.value, model]));
+    for (const model of discovered) {
+      merged.set(model.value, {
+        ...model,
+        supported_efforts: merged.get(model.value)?.supported_efforts ?? discoveredEfforts ?? targetCatalog?.efforts ?? [],
       });
     }
-    return merged;
-  }, [targetAdapterId, targetCatalog, targetedMember, memberOptions, adapterDefaults]);
-
-  const selectedModelValue = targetedMember
-    ? targetedMember.active_model ?? ""
-    : autoModelOverride ?? "";
-  const selectedEffortValue = targetedMember
-    ? targetedMember.active_effort ?? ""
-    : autoEffortOverride ?? "";
-
-  const selectedModelDetail = useMemo(
-    () => modelDetailsForTarget.find((m) => m.value === selectedModelValue) ?? null,
-    [modelDetailsForTarget, selectedModelValue]
-  );
-
-  const effortChoicesForTarget = useMemo(() => {
-    if (!targetAdapterId) return [];
-    if (selectedModelDetail && selectedModelDetail.supported_efforts.length > 0) {
-      return selectedModelDetail.supported_efforts;
+    for (const model of [targetMember?.active_model, targetDefaults?.default_model]) {
+      if (model && !merged.has(model)) {
+        merged.set(model, {
+          value: model,
+          label: model,
+          supported_efforts: discoveredEfforts ?? targetCatalog?.efforts ?? [],
+        });
+      }
     }
-    const discovered = targetedMember
-      ? (memberOptions[targetedMember.handle] ?? []).find(
-          (o) =>
-            o.category === "thought_level" ||
-            o.category === "reasoning_effort" ||
-            o.id === "reasoning_effort"
-        )?.choices ?? []
-      : [];
-    return discovered.length > 0 ? discovered : targetCatalog?.efforts ?? [];
-  }, [targetAdapterId, selectedModelDetail, targetedMember, memberOptions, targetCatalog]);
+    return [...merged.values()];
+  }, [targetAdapterId, targetCatalog, liveOptions, discoveredEfforts, targetMember?.active_model, targetDefaults]);
+
+  const inheritedModel = (savesMemberConfig ? null : targetMember?.active_model) ??
+    targetDefaults?.default_model ?? targetCatalog?.model_details?.find((model) => model.is_default)?.value;
+  const override = targetKey && !savesMemberConfig ? modelOverrides[targetKey] : undefined;
+  const selectedSettings = savesMemberConfig
+    ? { model: targetMember?.active_model ?? null, effort: targetMember?.active_effort ?? null }
+    : override ?? DEFAULT_MODEL_SETTINGS;
+  const selectedModel = selectedSettings.model ?? inheritedModel;
+  const modelLabel =
+    modelDetailsForTarget.find((model) => model.value === selectedModel)?.label ??
+    selectedModel ??
+    "Model";
+  const effortsForModel = (model: string | null) => {
+    const effectiveModel = model ?? inheritedModel;
+    return modelDetailsForTarget.find((detail) => detail.value === effectiveModel)?.supported_efforts ??
+      defaultEffortChoices;
+  };
+  const effortChoices = openModelDraft
+    ? [...effortsForModel(openModelDraft.model)].sort((left, right) => effortRank(left.value) - effortRank(right.value))
+    : [];
+  const effortIndex = effortChoices.findIndex((choice) => choice.value === openModelDraft?.effort) + 1;
+  const currentEffort = effortChoices[effortIndex - 1];
+  const effortLabel = currentEffort ? EFFORT_LABELS[currentEffort.value] ?? currentEffort.label : "Default";
+  const selectedEffortLabel = selectedSettings.effort
+    ? EFFORT_LABELS[selectedSettings.effort] ?? selectedSettings.effort
+    : null;
 
   const closeAllMenus = () => {
-    setRecipientOpen(false);
-    setModelOpen(false);
-    setEffortOpen(false);
+    setModelDraft(null);
     setPermOpen(false);
     setContextOpen(false);
   };
 
-  const handleModelSelect = (nextModel: string | null) => {
-    setModelOpen(false);
-    const nextDetail = modelDetailsForTarget.find((m) => m.value === nextModel);
-    const allowed =
-      nextDetail && nextDetail.supported_efforts.length > 0
-        ? nextDetail.supported_efforts
-        : targetCatalog?.efforts ?? [];
-    const curEffort = selectedEffortValue || null;
-    const effortStillValid =
-      curEffort === null || allowed.some((e) => e.value === curEffort);
-    const nextEffort = effortStillValid ? undefined : null;
+  const applyModelSettings = async () => {
+    if (!openModelDraft || !targetMember || !targetKey) return;
+    const model = openModelDraft.model;
+    const effort = currentEffort?.value ?? null;
+    setModelDraft(null);
+    if (model === selectedSettings.model && effort === selectedSettings.effort) return;
 
-    if (targetedMember && activeSession) {
-      void updateMemberConfig(targetedMember.handle, {
-        active_model: nextModel,
-        ...(nextEffort !== undefined ? { active_effort: nextEffort } : {}),
-      });
+    if (savesMemberConfig) {
+      setSavingModel(true);
+      try {
+        await updateMemberConfig(targetMember.handle, { active_model: model, active_effort: effort });
+      } catch (error) {
+        setError(error instanceof Error ? error.message : String(error));
+      } finally {
+        setSavingModel(false);
+      }
     } else {
-      setAutoModelOverride(nextModel);
-      if (nextEffort !== undefined) setAutoEffortOverride(null);
-    }
-  };
-
-  const handleEffortSelect = (nextEffort: string | null) => {
-    setEffortOpen(false);
-    if (targetedMember && activeSession) {
-      void updateMemberConfig(targetedMember.handle, {
-        active_effort: nextEffort,
-      });
-    } else {
-      setAutoEffortOverride(nextEffort);
+      setModelOverrides((current) => ({ ...current, [targetKey]: { model, effort } }));
     }
   };
 
@@ -454,7 +429,7 @@ export function Composer({
   const activeContextBreakdown = useMemo(() => {
     const preferredHandle =
       contextMemberHandle ??
-      targetedMember?.handle ??
+      targetMember?.handle ??
       orchestrator?.handle ??
       contextMembersList[0]?.handle;
     return (
@@ -462,7 +437,7 @@ export function Composer({
       contextMembersList[0] ??
       null
     );
-  }, [contextMemberHandle, targetedMember, orchestrator, contextMembersList]);
+  }, [contextMemberHandle, targetMember, orchestrator, contextMembersList]);
 
   const contextTotalWithDraft = activeContextBreakdown
     ? activeContextBreakdown.used_tokens + draftTokens
@@ -470,14 +445,13 @@ export function Composer({
   const contextWindow = Math.max(activeContextBreakdown?.context_window ?? 200_000, 1);
   const contextPct = Math.min(100, Math.round((contextTotalWithDraft / contextWindow) * 100));
 
-  const usingOrchestrator =
-    Boolean(orchestrator) &&
-    selectedRecipient === null &&
-    explicitMentions.length === 0;
-
   const handleSend = async () => {
-    const raw = text.trim();
-    if (!raw || sending) return;
+    if (!raw || sending || savingModel) return;
+
+    const opts = override ? {
+      model: override.model ?? undefined,
+      effort: override.effort ?? undefined,
+    } : undefined;
 
     const lowerRaw = raw.toLowerCase();
     if (lowerRaw === "/diff") {
@@ -529,29 +503,14 @@ export function Composer({
       return;
     }
 
-    const compactMatch = raw.match(/^\/compact(?:\s+([\s\S]+))?$/i);
     if (compactMatch) {
       if (!activeSession) return;
-      const remainder = compactMatch[1]?.trim() ?? "";
       setText("");
       setSending(true);
       try {
         await compactActiveSession();
-        if (remainder) {
-          const payload =
-            selectedRecipient && explicitMentions.length === 0
-              ? `@${selectedRecipient} ${remainder}`
-              : remainder;
-          const opts = targetedMember
-            ? {
-                model: targetedMember.active_model ?? undefined,
-                effort: targetedMember.active_effort ?? undefined,
-              }
-            : {
-                model: autoModelOverride ?? undefined,
-                effort: autoEffortOverride ?? undefined,
-              };
-          await sendMessage(payload, opts);
+        if (routingText) {
+          await sendMessage(routingText, opts);
         }
       } catch (error) {
         setText((current) => (current ? `${raw}\n${current}` : raw));
@@ -563,42 +522,15 @@ export function Composer({
     }
 
     if (!availableMembers.length) return;
-    const payload =
-      selectedRecipient && explicitMentions.length === 0
-        ? `@${selectedRecipient} ${raw}`
-        : raw;
-    const opts = targetedMember
-      ? {
-          model: targetedMember.active_model ?? undefined,
-          effort: targetedMember.active_effort ?? undefined,
-        }
-      : {
-          model: autoModelOverride ?? undefined,
-          effort: autoEffortOverride ?? undefined,
-        };
     setText("");
     setSending(true);
     try {
-      await sendMessage(payload, opts);
+      await sendMessage(raw, opts);
     } catch (error) {
       setText((current) => (current ? `${raw}\n${current}` : raw));
       setError(error instanceof Error ? error.message : String(error));
     } finally {
       setSending(false);
-    }
-  };
-
-  const toggleConfirmFirst = async () => {
-    if (!activeSession) return;
-    try {
-      await api.patchSession(activeSession.id, {
-        confirm_before_dispatch: !activeSession.confirm_before_dispatch,
-      });
-      if (useAppStore.getState().activeSession?.id === activeSession.id) {
-        await selectSession(activeSession.id);
-      }
-    } catch (error) {
-      setError(error instanceof Error ? error.message : String(error));
     }
   };
 
@@ -623,7 +555,7 @@ export function Composer({
 
   return (
     <div className="relative px-4 pb-4 pt-2 sm:px-6">
-      <div className="relative mx-auto max-w-[52rem]">
+      <div className="relative mx-auto max-w-[52rem] @container">
         {/* Autocomplete Dropdown (@mentions or /slash commands) */}
         {candidates.length > 0 && (
           <div className="absolute bottom-full left-0 mb-2 w-80 max-w-full rounded-xl border border-line-strong bg-panel shadow-2xl overflow-hidden z-30 p-1">
@@ -700,7 +632,7 @@ export function Composer({
             disabled={!availableMembers.length}
             placeholder={
               availableMembers.length
-                ? "Message the group… Type @ for harnesses or / for commands"
+                ? "Message the group… Use @ to mention or / for commands"
                 : "No CLI harnesses detected yet — open Settings to check requirements"
             }
             onChange={setText}
@@ -750,281 +682,121 @@ export function Composer({
             }}
           />
 
-          <div className="flex items-center justify-between gap-2 pt-2 border-t border-line whitespace-nowrap">
-            <div className="flex items-center gap-1.5 text-[11px] relative min-w-0">
-              {/* Recipient Pill */}
-              <div className="relative">
-                <button
-                  type="button"
-                  onClick={() => {
-                    const next = !recipientOpen;
-                    closeAllMenus();
-                    setRecipientOpen(next);
-                  }}
-                  disabled={explicitMentions.length > 0}
-                  className="inline-flex items-center gap-1 px-2 py-1 rounded-lg bg-elevated hover:bg-hover disabled:opacity-70 border border-line text-ink-soft hover:text-ink transition-colors"
-                >
-                  {usingOrchestrator && <Crown className="w-3 h-3 text-warn shrink-0" />}
-                  <span className="font-mono truncate max-w-[125px]">{routingLabel}</span>
-                  {explicitMentions.length === 0 && (
-                    <ChevronDown className="w-3 h-3 text-ink-muted shrink-0" />
-                  )}
-                </button>
+          <div className="relative flex flex-wrap items-center gap-x-2 gap-y-1.5 border-t border-line pt-2">
+            <div className="flex min-w-0 max-w-full flex-wrap items-center gap-1.5 whitespace-nowrap text-[11px]">
+              {availableMembers.length > 0 && (
+                <div className="@min-[48rem]:relative">
+                  <button
+                    ref={modelButtonRef}
+                    type="button"
+                    aria-label="Model and reasoning effort"
+                    aria-expanded={Boolean(openModelDraft)}
+                    title={
+                      targetMember
+                        ? [modelLabel, selectedEffortLabel, "@" + targetMember.handle].filter(Boolean).join(" · ")
+                        : multipleRecipients
+                          ? "Each recipient uses its own model and reasoning effort"
+                          : "The recipient's harness is unavailable"
+                    }
+                    disabled={!menuTarget || savingModel}
+                    onClick={() => {
+                      closeAllMenus();
+                      if (!openModelDraft && menuTarget) {
+                        setModelDraft({ ...selectedSettings, target: menuTarget });
+                      }
+                    }}
+                    className="inline-flex max-w-full items-center gap-1.5 rounded-lg border border-line bg-elevated px-2 py-1 text-ink-soft transition-colors hover:bg-hover hover:text-ink disabled:opacity-65"
+                  >
+                    <Cpu className="h-3.5 w-3.5 shrink-0 text-brand-ink" />
+                    <span className="max-w-40 truncate font-medium">
+                      {multipleRecipients ? "Per agent" : modelLabel}
+                    </span>
+                    {selectedEffortLabel && (
+                      <span className="hidden shrink-0 text-ink-muted @[30rem]:inline">
+                        · {selectedEffortLabel}
+                      </span>
+                    )}
+                    {menuTarget && <ChevronDown className="h-3 w-3 shrink-0 text-ink-muted" />}
+                  </button>
 
-                {recipientOpen && explicitMentions.length === 0 && (
-                  <>
-                    <div
-                      className="fixed inset-0 z-20"
-                      onClick={() => setRecipientOpen(false)}
-                    />
-                    <div className="absolute bottom-full left-0 mb-1.5 w-64 rounded-xl border border-line-strong bg-panel shadow-2xl p-1 z-30 space-y-0.5">
-                      <div className="px-2.5 py-1 text-[10px] uppercase tracking-wider font-semibold text-ink-muted">
-                        Send messages to
-                      </div>
-                      {orchestrator && (
-                        <button
-                          type="button"
-                          onClick={() => {
-                            setSelectedRecipient(null);
-                            setRecipientOpen(false);
-                          }}
-                          className={`w-full flex items-center justify-between px-2.5 py-1.5 rounded-lg text-left text-xs ${
-                            selectedRecipient === null
-                              ? "bg-brand-soft text-ink"
-                              : "hover:bg-hover text-ink-soft"
-                          }`}
-                        >
-                          <span className="flex items-center gap-2">
-                            <Crown className="w-3.5 h-3.5 text-warn" />
-                            <span>Auto (@{orchestrator.handle})</span>
+                  {openModelDraft && targetMember && (
+                    <>
+                      <div className="fixed inset-0 z-20" onClick={closeAllMenus} />
+                      <div
+                        role="group"
+                        aria-label={"Model and effort for @" + targetMember.handle}
+                        onKeyDown={(event) => {
+                          if (event.key === "Escape") {
+                            event.preventDefault();
+                            closeAllMenus();
+                            modelButtonRef.current?.focus();
+                          }
+                        }}
+                        className="absolute bottom-full left-0 z-30 mb-2 w-72 max-w-full rounded-xl border border-line-strong bg-panel text-xs whitespace-normal shadow-2xl @min-[48rem]:max-w-none"
+                      >
+                        <div className="flex items-center justify-between gap-3 px-3 pt-3 pb-2">
+                          <span className="font-semibold text-ink">Model</span>
+                          <span className="truncate font-mono text-[11px] text-ink-muted">
+                            @{targetMember.handle}
                           </span>
-                          {selectedRecipient === null && (
-                            <Check className="w-3 h-3 text-brand-ink" />
-                          )}
-                        </button>
-                      )}
-
-                      {availableMembers.map((m) => {
-                        const pct = memberQuotaLabel(m.adapter_id);
-                        const accent = adapters[m.adapter_id]?.accent_color ?? "#6366f1";
-                        const active = selectedRecipient === m.handle;
-                        return (
+                        </div>
+                        <div className="max-h-[min(12rem,28vh)] space-y-0.5 overflow-y-auto px-1.5 pb-1.5">
+                          {[{ value: null, label: "Default" }, ...modelDetailsForTarget].map((option) => {
+                            const active = openModelDraft.model === option.value;
+                            return (
+                              <button
+                                key={option.value ?? ""}
+                                type="button"
+                                aria-pressed={active}
+                                onClick={() => {
+                                  const effort = effortsForModel(option.value).some(
+                                    (choice) => choice.value === openModelDraft.effort
+                                  ) ? openModelDraft.effort : null;
+                                  setModelDraft({ ...openModelDraft, model: option.value, effort });
+                                }}
+                                className={"flex w-full items-center justify-between gap-2 rounded-lg px-2 py-1.5 text-left transition-colors " +
+                                  (active ? "bg-brand-soft font-medium text-ink" : "text-ink-soft hover:bg-hover")}
+                              >
+                                <span className="truncate" title={option.label}>{option.label}</span>
+                                {active && <Check className="h-3.5 w-3.5 shrink-0 text-brand-ink" />}
+                              </button>
+                            );
+                          })}
+                        </div>
+                        {effortChoices.length > 0 && (
+                          <label className="block border-t border-line px-3 pt-3 pb-1.5">
+                            <span className="flex items-center justify-between gap-2">
+                              <span className="font-medium text-ink-soft">Reasoning effort</span>
+                              <span className="text-brand-ink">{effortLabel}</span>
+                            </span>
+                            <input
+                              type="range"
+                              aria-label="Reasoning effort"
+                              aria-valuetext={effortLabel}
+                              min={0}
+                              max={effortChoices.length}
+                              step={1}
+                              value={effortIndex}
+                              onChange={(event) => setModelDraft({
+                                ...openModelDraft,
+                                effort: effortChoices[event.currentTarget.valueAsNumber - 1]?.value ?? null,
+                              })}
+                              className="mt-1.5 block h-5 w-full cursor-pointer accent-brand"
+                            />
+                          </label>
+                        )}
+                        <div className="flex justify-end border-t border-line px-3 py-2">
                           <button
-                            key={m.handle}
                             type="button"
                             onClick={() => {
-                              setSelectedRecipient(m.handle);
-                              setRecipientOpen(false);
+                              void applyModelSettings();
+                              modelButtonRef.current?.focus();
                             }}
-                            className={`w-full flex items-center justify-between px-2.5 py-1.5 rounded-lg text-left text-xs ${
-                              active
-                                ? "bg-brand-soft text-ink"
-                                : "hover:bg-hover text-ink-soft"
-                            }`}
+                            className="rounded-md bg-brand-soft px-3 py-1.5 font-medium text-brand-ink hover:bg-hover"
                           >
-                            <span className="flex items-center gap-2 min-w-0">
-                              <HarnessAvatar
-                                handle={m.handle}
-                                accentColor={accent}
-                                status={memberStatuses[m.handle]?.status}
-                                size="sm"
-                              />
-                              <span className="font-mono text-ink truncate">
-                                @{m.handle}
-                              </span>
-                            </span>
-                            <span className="flex items-center gap-1.5 shrink-0">
-                              {pct && (
-                                <span className="text-[10px] font-mono px-1.5 py-0.2 rounded bg-inset border border-line text-ink-muted">
-                                  {pct}
-                                </span>
-                              )}
-                              {active && <Check className="w-3 h-3 text-brand-ink" />}
-                            </span>
+                            Done
                           </button>
-                        );
-                      })}
-
-                      {availableMembers.length > 1 && (
-                        <button
-                          type="button"
-                          onClick={() => {
-                            setSelectedRecipient("all");
-                            setRecipientOpen(false);
-                          }}
-                          className={`w-full flex items-center justify-between px-2.5 py-1.5 rounded-lg text-left text-xs ${
-                            selectedRecipient === "all"
-                              ? "bg-brand-soft text-ink"
-                              : "hover:bg-hover text-ink-soft"
-                          }`}
-                        >
-                          <span className="font-mono">@all (All executors)</span>
-                          {selectedRecipient === "all" && (
-                            <Check className="w-3 h-3 text-brand-ink" />
-                          )}
-                        </button>
-                      )}
-                    </div>
-                  </>
-                )}
-              </div>
-
-              {/* Custom Themed Target Model Popover */}
-              {availableMembers.length > 0 && (
-                <div className="relative">
-                  <button
-                    type="button"
-                    aria-label="Target model"
-                    onClick={() => {
-                      const next = !modelOpen;
-                      closeAllMenus();
-                      setModelOpen(next);
-                    }}
-                    className="inline-flex items-center gap-1 px-2 py-1 rounded-lg bg-elevated hover:bg-hover border border-line text-ink-soft hover:text-ink transition-colors"
-                  >
-                    <Cpu className="w-3 h-3 text-brand-ink shrink-0" />
-                    <span className="font-mono truncate max-w-[110px]">
-                      {selectedModelDetail?.label ??
-                        (selectedModelValue || (targetedMember ? "Default" : "Auto"))}
-                    </span>
-                    <ChevronDown className="w-3 h-3 text-ink-muted shrink-0" />
-                  </button>
-
-                  {modelOpen && (
-                    <>
-                      <div
-                        className="fixed inset-0 z-20"
-                        onClick={() => setModelOpen(false)}
-                      />
-                      <div className="absolute bottom-full left-0 mb-1.5 w-72 max-h-72 overflow-y-auto rounded-xl border border-line-strong bg-panel shadow-2xl p-1 z-30 space-y-0.5 text-xs whitespace-normal">
-                        <div className="px-2.5 py-1 text-[10px] uppercase tracking-wider font-semibold text-ink-muted">
-                          Model
                         </div>
-                        <button
-                          type="button"
-                          onClick={() => handleModelSelect(null)}
-                          className={`w-full px-2.5 py-1.5 rounded-lg text-left flex items-center justify-between gap-2 transition-colors ${
-                            !selectedModelValue
-                              ? "bg-brand-soft text-ink font-medium"
-                              : "hover:bg-hover text-ink-soft"
-                          }`}
-                        >
-                          <span className="font-mono">
-                            {targetedMember ? "Model: Default" : "Model: Auto"}
-                          </span>
-                          {!selectedModelValue && (
-                            <Check className="w-3 h-3 text-brand-ink shrink-0" />
-                          )}
-                        </button>
-
-                        {modelDetailsForTarget.map((m) => {
-                          const active = selectedModelValue === m.value;
-                          return (
-                            <button
-                              key={m.value}
-                              type="button"
-                              onClick={() => handleModelSelect(m.value)}
-                              className={`w-full px-2.5 py-1.5 rounded-lg text-left transition-colors ${
-                                active
-                                  ? "bg-brand-soft text-ink"
-                                  : "hover:bg-hover text-ink-soft"
-                              }`}
-                            >
-                              <div className="flex items-center justify-between gap-2">
-                                <span className="flex items-center gap-1.5 font-mono font-medium text-ink">
-                                  <span>{m.label}</span>
-                                  {m.is_default && (
-                                    <span className="px-1.5 py-0.2 rounded bg-inset border border-line text-[9.5px] text-ink-muted">
-                                      default
-                                    </span>
-                                  )}
-                                </span>
-                                {active && (
-                                  <Check className="w-3 h-3 text-brand-ink shrink-0" />
-                                )}
-                              </div>
-                              {m.description && (
-                                <div className="text-[10.5px] text-ink-muted line-clamp-2 mt-0.5">
-                                  {m.description}
-                                </div>
-                              )}
-                            </button>
-                          );
-                        })}
-                      </div>
-                    </>
-                  )}
-                </div>
-              )}
-
-              {/* Custom Themed Reasoning Effort Popover */}
-              {availableMembers.length > 0 && (
-                <div className="relative">
-                  <button
-                    type="button"
-                    aria-label="Reasoning effort"
-                    onClick={() => {
-                      const next = !effortOpen;
-                      closeAllMenus();
-                      setEffortOpen(next);
-                    }}
-                    className="inline-flex items-center gap-1 px-2 py-1 rounded-lg bg-elevated hover:bg-hover border border-line text-ink-soft hover:text-ink transition-colors"
-                  >
-                    <Sparkles className="w-3 h-3 text-warn shrink-0" />
-                    <span>
-                      {selectedEffortValue
-                        ? EFFORT_LABELS[selectedEffortValue] ?? selectedEffortValue
-                        : targetedMember
-                          ? "Effort: Default"
-                          : "Auto"}
-                    </span>
-                    <ChevronDown className="w-3 h-3 text-ink-muted shrink-0" />
-                  </button>
-
-                  {effortOpen && (
-                    <>
-                      <div
-                        className="fixed inset-0 z-20"
-                        onClick={() => setEffortOpen(false)}
-                      />
-                      <div className="absolute bottom-full left-0 mb-1.5 w-48 max-h-64 overflow-y-auto rounded-xl border border-line-strong bg-panel shadow-2xl p-1 z-30 space-y-0.5 text-xs">
-                        <div className="px-2.5 py-1 text-[10px] uppercase tracking-wider font-semibold text-ink-muted">
-                          Reasoning Effort
-                        </div>
-                        <button
-                          type="button"
-                          onClick={() => handleEffortSelect(null)}
-                          className={`w-full px-2.5 py-1.5 rounded-lg text-left flex items-center justify-between gap-2 transition-colors ${
-                            !selectedEffortValue
-                              ? "bg-brand-soft text-ink font-medium"
-                              : "hover:bg-hover text-ink-soft"
-                          }`}
-                        >
-                          <span>{targetedMember ? "Effort: Default" : "Effort: Auto"}</span>
-                          {!selectedEffortValue && (
-                            <Check className="w-3 h-3 text-brand-ink shrink-0" />
-                          )}
-                        </button>
-                        {effortChoicesForTarget.map((c) => {
-                          const active = selectedEffortValue === c.value;
-                          return (
-                            <button
-                              key={c.value}
-                              type="button"
-                              onClick={() => handleEffortSelect(c.value)}
-                              className={`w-full px-2.5 py-1.5 rounded-lg text-left flex items-center justify-between gap-2 transition-colors ${
-                                active
-                                  ? "bg-brand-soft text-ink font-medium"
-                                  : "hover:bg-hover text-ink-soft"
-                              }`}
-                            >
-                              <span>{EFFORT_LABELS[c.value] ?? c.label}</span>
-                              {active && (
-                                <Check className="w-3 h-3 text-brand-ink shrink-0" />
-                              )}
-                            </button>
-                          );
-                        })}
                       </div>
                     </>
                   )}
@@ -1032,7 +804,7 @@ export function Composer({
               )}
 
               {/* Permissions Selector Pill */}
-              <div className="relative">
+              <div className="@min-[48rem]:relative">
                 <button
                   type="button"
                   aria-label="Permission policy"
@@ -1054,7 +826,7 @@ export function Composer({
                       className="fixed inset-0 z-20"
                       onClick={() => setPermOpen(false)}
                     />
-                    <div className="absolute bottom-full left-0 mb-1.5 w-60 rounded-xl border border-line-strong bg-panel shadow-2xl p-1 z-30 space-y-0.5 text-xs whitespace-normal">
+                    <div className="absolute bottom-full left-0 mb-1.5 w-60 max-w-full rounded-xl border border-line-strong bg-panel shadow-2xl p-1 z-30 space-y-0.5 text-xs whitespace-normal @min-[48rem]:max-w-none">
                       <div className="px-2.5 py-1 text-[10px] uppercase tracking-wider font-semibold text-ink-muted">
                         Approval Mode
                       </div>
@@ -1097,29 +869,12 @@ export function Composer({
                 )}
               </div>
 
-              {usingOrchestrator && activeSession && (
-                <button
-                  type="button"
-                  aria-pressed={activeSession.confirm_before_dispatch}
-                  onClick={() => void toggleConfirmFirst()}
-                  className={`hidden md:inline-flex items-center gap-1 px-2 py-1 rounded-lg border transition-colors ${
-                    activeSession.confirm_before_dispatch
-                      ? "bg-warn-soft border-warn/40 text-warn font-medium"
-                      : "bg-elevated border-line text-ink-muted hover:text-ink"
-                  }`}
-                >
-                  {activeSession.confirm_before_dispatch && (
-                    <Check className="w-3 h-3" />
-                  )}
-                  <span>Plan first</span>
-                </button>
-              )}
             </div>
 
-            <div className="flex items-center gap-2 relative shrink-0">
+            <div className="ml-auto flex max-w-full flex-wrap items-center justify-end gap-2 whitespace-nowrap">
               {/* Context Usage Ring & Composition Popover (anchored inward right-0) */}
               {activeContextBreakdown && (
-                <div className="relative">
+                <div className="@min-[48rem]:relative">
                   <button
                     type="button"
                     aria-label="Context usage"
@@ -1142,7 +897,7 @@ export function Composer({
                         className="fixed inset-0 z-20"
                         onClick={() => setContextOpen(false)}
                       />
-                      <div className="absolute bottom-full right-0 mb-2 w-80 rounded-xl border border-line-strong bg-panel shadow-2xl p-3.5 z-30 space-y-3 text-xs whitespace-normal">
+                      <div className="absolute bottom-full right-0 mb-2 w-80 max-w-full rounded-xl border border-line-strong bg-panel shadow-2xl p-3.5 z-30 space-y-3 text-xs whitespace-normal @min-[48rem]:max-w-none">
                         <div className="flex items-center justify-between gap-2">
                           <div className="flex items-center gap-1.5 font-semibold text-ink">
                             <Gauge className="w-3.5 h-3.5 text-brand-ink" />
@@ -1201,6 +956,7 @@ export function Composer({
                 disabled={
                   !text.trim() ||
                   sending ||
+                  savingModel ||
                   (!availableMembers.length && !/^\/(diff|shell|memory|new|archive|compact)\b/i.test(text.trim()))
                 }
                 onClick={() => void handleSend()}

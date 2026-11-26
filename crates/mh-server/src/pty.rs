@@ -113,42 +113,36 @@ async fn resolve_pty_cwd(
 
 fn build_utf8_shell_command(cwd: &std::path::Path) -> CommandBuilder {
     #[cfg(windows)]
-    let (prog, args): (String, Vec<String>) = if let Ok(pwsh) = which::which("pwsh.exe") {
-        (
-            pwsh.to_string_lossy().into_owned(),
-            vec![
-                "-NoLogo".into(),
-                "-NoExit".into(),
-                "-Command".into(),
-                "[Console]::InputEncoding = [System.Text.Encoding]::UTF8; \
-                 [Console]::OutputEncoding = [System.Text.Encoding]::UTF8; \
-                 $OutputEncoding = [System.Text.Encoding]::UTF8; \
-                 chcp 65001 | Out-Null; \
-                 Clear-Host"
-                    .into(),
-            ],
-        )
-    } else if let Ok(ps) = which::which("powershell.exe") {
-        (
-            ps.to_string_lossy().into_owned(),
-            vec![
-                "-NoLogo".into(),
-                "-NoExit".into(),
-                "-Command".into(),
-                "[Console]::InputEncoding = [System.Text.Encoding]::UTF8; \
-                 [Console]::OutputEncoding = [System.Text.Encoding]::UTF8; \
-                 $OutputEncoding = [System.Text.Encoding]::UTF8; \
-                 chcp 65001 | Out-Null; \
-                 Clear-Host"
-                    .into(),
-            ],
-        )
-    } else {
-        (
-            "cmd.exe".into(),
-            vec!["/K".into(), "chcp 65001 >nul".into()],
-        )
-    };
+    let (prog, args): (String, Vec<String>) =
+        if let Ok(ps) = which::which("pwsh.exe").or_else(|_| which::which("powershell.exe")) {
+            (
+                ps.to_string_lossy().into_owned(),
+                vec![
+                    "-NoLogo".into(),
+                    "-NoExit".into(),
+                    "-Command".into(),
+                    r#"[Console]::InputEncoding = [System.Text.Encoding]::UTF8;
+[Console]::OutputEncoding = [System.Text.Encoding]::UTF8;
+$OutputEncoding = [System.Text.Encoding]::UTF8;
+chcp 65001 | Out-Null;
+$global:MetaHarnessOriginalPrompt = $function:prompt;
+function global:prompt {
+    $label = & $global:MetaHarnessOriginalPrompt
+    if ($PWD.Provider.Name -eq 'FileSystem') {
+        [Console]::Write([string][char]27 + ']9;9;' + $PWD.ProviderPath + [char]7)
+    }
+    $label
+}
+Clear-Host"#
+                        .into(),
+                ],
+            )
+        } else {
+            (
+                "cmd.exe".into(),
+                vec!["/K".into(), "chcp 65001 >nul".into()],
+            )
+        };
 
     #[cfg(not(windows))]
     let (prog, args): (String, Vec<String>) = (
@@ -156,8 +150,28 @@ fn build_utf8_shell_command(cwd: &std::path::Path) -> CommandBuilder {
         Vec::new(),
     );
 
-    let mut cmd = CommandBuilder::new(prog);
+    let mut cmd = CommandBuilder::new(&prog);
     cmd.args(args);
+    #[cfg(unix)]
+    match std::path::Path::new(&prog)
+        .file_name()
+        .and_then(|name| name.to_str())
+    {
+        Some("bash") => {
+            let previous = std::env::var("PROMPT_COMMAND").unwrap_or_default();
+            cmd.env(
+                "PROMPT_COMMAND",
+                format!("printf '\\033]9;9;%s\\007' \"$PWD\"\n{previous}"),
+            );
+        }
+        Some("fish") => {
+            cmd.args([
+                "--init-command",
+                "function __mh_report_cwd --on-event fish_prompt; printf '\\e]9;9;%s\\a' $PWD; end",
+            ]);
+        }
+        _ => {}
+    }
     cmd.cwd(dunce::simplified(cwd));
     cmd.env("TERM", "xterm-256color");
     cmd.env("COLORTERM", "truecolor");
@@ -198,6 +212,16 @@ async fn handle_pty_socket(mut socket: WebSocket, cwd: PathBuf, cols: u16, rows:
         return;
     };
     drop(pair.slave);
+
+    let initial_cwd = json!({ "type": "cwd", "path": dunce::simplified(&cwd).to_string_lossy() });
+    if socket
+        .send(Message::Text(initial_cwd.to_string().into()))
+        .await
+        .is_err()
+    {
+        let _ = child.kill();
+        return;
+    }
 
     let Ok(mut reader) = pair.master.try_clone_reader() else {
         let _ = child.kill();
@@ -408,6 +432,14 @@ mod tests {
     #[test]
     fn pty_round_trips_utf8_cjk_text() {
         let tmp = tempfile::tempdir().unwrap();
+        let subdir = tmp.path().join("next directory");
+        std::fs::create_dir(&subdir).unwrap();
+        let expect_cwd_update = cfg!(windows)
+            && (which::which("pwsh.exe").is_ok() || which::which("powershell.exe").is_ok());
+        let expected = format!(
+            "\u{1b}]9;9;{}",
+            dunce::canonicalize(subdir).unwrap().display()
+        );
         let pty_system = native_pty_system();
         let pair = pty_system
             .openpty(PtySize {
@@ -471,15 +503,21 @@ mod tests {
                     || std::time::Instant::now() + std::time::Duration::from_secs(9) < deadline)
             {
                 cmd_sent_at = Some(std::time::Instant::now());
-                let _ = writer
-                    .write_all(b"echo \xE4\xBD\xA0\xE5\xA5\xBD\xE4\xB8\x96\xE7\x95\x8C_PTY_OK\r");
+                let command = if expect_cwd_update {
+                    "cd 'next directory'; echo 你好世界_PTY_OK\r"
+                } else {
+                    "echo 你好世界_PTY_OK\r"
+                };
+                let _ = writer.write_all(command.as_bytes());
                 let _ = writer.flush();
             }
             match rx.recv_timeout(std::time::Duration::from_millis(150)) {
                 Ok(chunk) => {
                     acc.push_str(&chunk);
                     let plain = strip_ansi_sequences(&acc);
-                    if plain.contains("你好世界_PTY_OK") {
+                    if plain.contains("你好世界_PTY_OK")
+                        && (!expect_cwd_update || acc.contains(&expected))
+                    {
                         matched = true;
                         break;
                     }
@@ -497,7 +535,7 @@ mod tests {
 
         assert!(
             matched,
-            "expected UTF-8 CJK string in PTY output; cmd={cmd_prog} early_status={early_status:?} raw={acc:?} stripped={:?}",
+            "expected UTF-8 CJK text and an updated directory from PowerShell; cmd={cmd_prog} early_status={early_status:?} raw={acc:?} stripped={:?}",
             strip_ansi_sequences(&acc)
         );
     }

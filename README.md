@@ -4,7 +4,7 @@
 
 - **Use your existing subscriptions.** Launches local harness CLIs over ACP (`codex`, `claude`, `agy` / `gemini`) with live quota tracking, model/reasoning selectors, and optional separate sign-in profiles.
 - **Isolated parallel Git worktrees.** Each session gets an integration branch (`mh/<session_id>/integration`) and lazy per-agent worktrees (`mh/<session_id>/exec-<handle>`). Clean edits auto-merge without extra LLM calls, leaving your main checkout untouched until you promote.
-- **Real multi-agent coordination.** Address agents directly with `@mentions`, let the **Orchestrator** triage unmentioned prompts across quota headroom and capabilities, or let agents consult peers (`peer_consult`) and inspect each other's trajectories (`trajectory_read`).
+- **Real multi-agent coordination & Agent Skills.** Address agents directly with `@mentions`, let the **Orchestrator** triage unmentioned prompts, or share **Agent Skills** (`/meta-harness-docs`, `.agents/skills/`, custom & Git-installed `SKILL.md` bundles) across every harness with `skill_list` / `skill_read` and `peer_consult` / `trajectory_read`.
 - **Built-in developer tools.** Review unified diffs and promote (`merge` / `squash` / `patch`), preview HTML/code/images/PDFs in-app, run an interactive multi-tab terminal inside each worktree, and retain shared **Project Memory** across sessions.
 
 ![Meta-Harness multi-agent workflow: User to Agent, User to Orchestrator, Orchestrator Dispatch, and Agent-to-Agent collaboration](docs/media/demo.gif)
@@ -60,7 +60,7 @@ npm --prefix web run dev                         # Optional Vite dev server on :
 1. **Launch Meta-Harness** — Open the desktop app or run `meta-harness` from your terminal.
 2. **Check your harnesses & quotas** — Open **Settings → Harnesses & Models** to confirm detected CLIs, inspect live subscription usage, set default models/reasoning effort, or create isolated CLI sign-in profiles.
 3. **Open a repository or start a Quick Session** — Click **Open** in the sidebar to load a local project folder *(Git repos use isolated worktrees; non-Git folders can initialize Git or run in shared-folder mode)*, or stay in **Quick Sessions** for scratch work managed under `~/.meta-harness/workspaces`.
-4. **Chat & orchestrate** — Send any message normally to let the **Orchestrator** plan and route work, or address members directly with `@codex`, `@claude`, `@antigravity`, `@all`, and `/plan` / `/review` / `/diff` / `/shell` / `/memory` slash commands.
+4. **Chat & orchestrate** — Send any message normally to let the **Orchestrator** plan and route work, or address members directly with `@codex`, `@claude`, `@antigravity`, `@all`, built-in `/plan` / `/review` / `/test` / `/fix` / `/compact` commands, or preinstalled skill `/meta-harness-docs`.
 
 ![Meta-Harness Group Chat Workspace](docs/media/workspace-chat.png)
 

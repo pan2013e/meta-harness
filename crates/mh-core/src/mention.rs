@@ -136,11 +136,7 @@ pub fn parse_user_mentions(markdown: &str, valid_handles: &HashSet<String>) -> U
     let cleaned = mask_code_regions(markdown);
     let mut start = cleaned.trim_start();
     while let Some(command) = start.split_whitespace().next() {
-        let name = command.trim_end_matches([',', '.', ';', ':', '!', '?']);
-        if !["/plan", "/review", "/test", "/fix", "/compact"]
-            .iter()
-            .any(|known| name.eq_ignore_ascii_case(known))
-        {
+        if !is_leading_slash_token(command) {
             break;
         }
         start = start[command.len()..].trim_start();
@@ -272,6 +268,36 @@ fn add_target(
     }
 }
 
+/// Extracts distinct `/token` directives outside fenced and inline code regions.
+pub fn parse_slash_tokens(markdown: &str) -> Vec<String> {
+    let cleaned = mask_code_regions(markdown);
+    let mut tokens = Vec::new();
+    for raw in cleaned.split_whitespace() {
+        let stripped = raw
+            .trim_start_matches(['(', '[', '{', '"', '\''])
+            .trim_end_matches([',', '.', ';', ':', '!', '?', ')', ']', '}', '"', '\'']);
+        if is_leading_slash_token(stripped) {
+            let name = stripped[1..].to_ascii_lowercase();
+            if !tokens.contains(&name) {
+                tokens.push(name);
+            }
+        }
+    }
+    tokens
+}
+
+fn is_leading_slash_token(token: &str) -> bool {
+    let name = token.trim_end_matches([',', '.', ';', ':', '!', '?']);
+    let Some(rest) = name.strip_prefix('/') else {
+        return false;
+    };
+    !rest.is_empty()
+        && rest.len() <= 64
+        && rest
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+}
+
 fn is_mention_prefix_boundary(ch: char) -> bool {
     ch.is_whitespace()
         || matches!(
@@ -392,5 +418,18 @@ Real ping: @antigravity
         );
         assert_eq!(routing.mentions.targets.len(), 1);
         assert!(!routing.mentions.has_all);
+
+        let skill_routing = parse_user_mentions(
+            "/meta-harness-docs /plan @codex inspect `/ignored-skill` and explain routing",
+            &handles(),
+        );
+        assert!(!skill_routing.needs_intent);
+        assert_eq!(skill_routing.mentions.targets.len(), 1);
+        assert_eq!(skill_routing.mentions.targets[0].handle, "codex");
+
+        let slash = parse_slash_tokens(
+            "/meta-harness-docs compare with `/code-span` and /plan\n```\n/not-a-skill\n```",
+        );
+        assert_eq!(slash, vec!["meta-harness-docs", "plan"]);
     }
 }

@@ -47,9 +47,10 @@ While working concurrently, harnesses connect through Meta-Harness's embedded MC
 
 ### Composer Controls & Slash Commands
 
-- **Atomic Pills:** `@mentions` and `/commands` convert into indivisible pills (delete cleanly with a single `Backspace` or click `×`).
+- **Atomic Pills:** `@mentions`, `/commands`, and `/skills` convert into indivisible pills (delete cleanly with a single `Backspace` or click `×`).
   - **Workflow pills** *(passed cleanly as directives)*: `/plan`, `/review`, `/test`, `/fix`
   - **Action pills** *(execute workspace actions immediately)*: `/compact` *(condense older chat context into working summary)*, `/diff`, `/shell`, `/memory`, `/new`, `/archive`
+  - **Skill pills** *(preload `SKILL.md` for that turn)*: Any enabled skill such as `/meta-harness-docs` appears in the `/` menu in a distinct skill color; harnesses can also discover and read skills autonomously via `skill_list` / `skill_read` MCP tools or brokered read-only access.
 - **Model & Reasoning Effort Selector:** Click the model chip at the bottom-left of the composer to override the model or reasoning effort for the active route—when addressing multiple agents (e.g., `@codex @claude`), each recipient gets its own tab.
 - **Approval Modes:**
   - **Worktree** (`worktree_smart`) — Default. Allows file reads/writes inside the member worktree and prompts before running shell commands (with optional session-wide allow patterns).
@@ -116,6 +117,7 @@ Click **Settings** in the bottom-left sidebar to manage six sections:
   - Inspect CLI availability, live subscription usage windows, **Check CLI version**, and **Upgrade CLI** where supported.
   - Set adapter-level **Default Model** and **Default Reasoning Effort**.
   - **Separate Profiles:** Click **Create profile & sign in** (or **Use device code** on Codex) to isolate a harness account directory without disturbing your default CLI profile, and switch back anytime with **Use default CLI profile** / **Use saved separate profile**. You can also pin custom directories via `profile_dir` in `harnesses.toml`.
+- **Skills:** Enable/disable installed skills, inspect or edit `SKILL.md` and `references/` files, reset the preinstalled **`Meta-Harness Docs`** (`/meta-harness-docs`) guide, or install additional `SKILL.md` bundles via **Install Folder…**, **Install from Git URL**, or **New Custom Skill**. Repo-local `.agents/skills/` bundles are also discovered automatically.
 - **Global Personas:** Define reusable specialist handles (e.g., `@codex-reviewer`) with custom instructions, adapter binding, and default model/effort. New sessions automatically include templates whose harness is installed, or click **Add to session** for an active chat.
 - **Session:** Reassign the session **Orchestrator**, manage active member models/personas, adjust approval policy, tune **Max Agent Hops** (`2–16`), and prune saved command allow-rules.
 - **Storage & Data:**

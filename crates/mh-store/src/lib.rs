@@ -5,6 +5,7 @@ pub mod migrations;
 pub mod projects;
 pub mod sessions;
 pub mod settings;
+pub mod skills;
 pub mod trajectories;
 
 use std::path::Path;
@@ -16,6 +17,7 @@ pub use error::StoreError;
 pub use memory::{AdapterQuotaPref, RecordEpisodicJobParams};
 pub use messages::NewMessageParams;
 pub use sessions::{CreateSessionParams, PatchSessionParams, UpsertMemberParams};
+pub use skills::SkillStateRow;
 pub use trajectories::{PaginatedTrajectoryRead, StartTrajectoryParams};
 
 #[derive(Clone)]
@@ -254,5 +256,31 @@ mod tests {
         assert_eq!(store.list_sessions(None, true).unwrap().len(), 1);
         assert_eq!(store.delete_archived_sessions().unwrap().len(), 1);
         assert_eq!(store.list_sessions(None, true).unwrap().len(), 0);
+
+        // Skill state persistence
+        store
+            .upsert_skill_state(&SkillStateRow {
+                state_key: "meta-harness-docs".into(),
+                source: mh_core::SkillSource::Builtin,
+                origin: Some("embedded".into()),
+                enabled: true,
+                builtin_hash: Some("abc123".into()),
+                updated_at: 1000,
+            })
+            .unwrap();
+        let st = store.get_skill_state("meta-harness-docs").unwrap().unwrap();
+        assert!(st.enabled);
+        assert_eq!(st.builtin_hash.as_deref(), Some("abc123"));
+        store
+            .set_skill_enabled(
+                "meta-harness-docs",
+                mh_core::SkillSource::Builtin,
+                None,
+                false,
+            )
+            .unwrap();
+        let st2 = store.get_skill_state("meta-harness-docs").unwrap().unwrap();
+        assert!(!st2.enabled);
+        assert_eq!(st2.builtin_hash.as_deref(), Some("abc123"));
     }
 }

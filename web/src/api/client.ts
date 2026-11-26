@@ -26,6 +26,8 @@ import type {
   SessionDiffReport,
   SessionMember,
   SettingsFile,
+  SkillDetail,
+  SkillSummary,
   StorageCleanupResult,
   StorageSummary,
   TrajectoryEvent,
@@ -145,6 +147,67 @@ export const api = {
   exportSettings: () => apiFetch<SettingsFile>("/api/settings"),
   importSettings: (document: unknown) =>
     apiFetch<SettingsFile>("/api/settings", { method: "POST", body: JSON.stringify(document) }),
+  listSkills: (projectId?: string | null) =>
+    apiFetch<{ skills: SkillSummary[]; skills_dir: string }>(
+      `/api/skills${projectId ? `?project_id=${encodeURIComponent(projectId)}` : ""}`
+    ),
+  getSkillDetail: (
+    id: string,
+    opts?: { projectId?: string | null; file?: string }
+  ) => {
+    const params = new URLSearchParams();
+    if (opts?.projectId) params.set("project_id", opts.projectId);
+    if (opts?.file) params.set("file", opts.file);
+    const qs = params.toString();
+    return apiFetch<{ detail: SkillDetail }>(
+      `/api/skills/${encodeURIComponent(id)}${qs ? `?${qs}` : ""}`
+    );
+  },
+  createCustomSkill: (payload: {
+    id?: string;
+    name: string;
+    description: string;
+    content: string;
+  }) =>
+    apiFetch<{ skill: SkillSummary }>("/api/skills", {
+      method: "POST",
+      body: JSON.stringify(payload),
+    }),
+  updateSkillContent: (
+    id: string,
+    payload: { file?: string; content: string }
+  ) =>
+    apiFetch<{ detail: SkillDetail }>(
+      `/api/skills/${encodeURIComponent(id)}/content`,
+      { method: "PUT", body: JSON.stringify(payload) }
+    ),
+  patchSkill: (
+    id: string,
+    payload: { enabled: boolean; project_id?: string | null }
+  ) =>
+    apiFetch<{ skill: SkillSummary }>(
+      `/api/skills/${encodeURIComponent(id)}`,
+      { method: "PATCH", body: JSON.stringify(payload) }
+    ),
+  resetSkill: (id: string) =>
+    apiFetch<{ skill: SkillSummary }>(
+      `/api/skills/${encodeURIComponent(id)}/reset`,
+      { method: "POST" }
+    ),
+  deleteSkill: (id: string) =>
+    apiFetch<{ deleted: boolean }>(`/api/skills/${encodeURIComponent(id)}`, {
+      method: "DELETE",
+    }),
+  installSkillFromFolder: (path: string) =>
+    apiFetch<{ installed: SkillSummary[] }>("/api/skills/install-folder", {
+      method: "POST",
+      body: JSON.stringify({ path }),
+    }),
+  installSkillFromGit: (url: string, subpath?: string) =>
+    apiFetch<{ installed: SkillSummary[] }>("/api/skills/install-git", {
+      method: "POST",
+      body: JSON.stringify({ url, ...(subpath ? { subpath } : {}) }),
+    }),
   saveGlobalPersona: (persona: GlobalPersona) =>
     apiFetch<{ persona: GlobalPersona }>("/api/personas", { method: "POST", body: JSON.stringify(persona) }),
   deleteGlobalPersona: (handle: string) =>

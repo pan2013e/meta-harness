@@ -1,5 +1,27 @@
 export type ThemeId = "obsidian" | "tokyo-night" | "catppuccin" | "daylight";
 
+export type SkillSource = "builtin" | "local" | "git" | "custom" | "project";
+
+export interface SkillSummary {
+  id: string;
+  name: string;
+  description: string;
+  source: SkillSource;
+  origin?: string | null;
+  enabled: boolean;
+  builtin_modified: boolean;
+  skill_dir: string;
+  skill_md_path: string;
+  files: string[];
+  updated_at: number;
+}
+
+export interface SkillDetail {
+  skill: SkillSummary;
+  file_path: string;
+  content: string;
+}
+
 export type IsolationMode = "worktree_per_member" | "shared_cwd";
 export type PermissionPolicy = "worktree_smart" | "strict" | "autonomous_sandbox";
 export type MemberRole = "orchestrator" | "executor" | "both";

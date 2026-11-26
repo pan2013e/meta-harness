@@ -266,5 +266,20 @@ pub fn apply_migrations(conn: &Connection) -> Result<(), StoreError> {
              COMMIT;",
         )?;
     }
+    if current_ver < 6 {
+        conn.execute_batch(
+            "BEGIN;
+             CREATE TABLE IF NOT EXISTS skill_states (
+                 state_key      TEXT PRIMARY KEY COLLATE NOCASE,
+                 source         TEXT NOT NULL DEFAULT 'local',
+                 origin         TEXT,
+                 enabled        INTEGER NOT NULL DEFAULT 1,
+                 builtin_hash   TEXT,
+                 updated_at     INTEGER NOT NULL
+             );
+             INSERT OR IGNORE INTO schema_migrations (version) VALUES (6);
+             COMMIT;",
+        )?;
+    }
     Ok(())
 }

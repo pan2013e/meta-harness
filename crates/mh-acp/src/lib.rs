@@ -21,7 +21,7 @@ pub use client::{AcpClient, PromptTextOutput, TurnStreamListener};
 pub use error::AcpError;
 pub use platform::{
     ProcessTreeGuard, default_shell, find_cli_binary, open_terminal_in_dir, open_url_in_browser,
-    pick_folder_native, probe_executable, resolve_command,
+    pick_folder_native, prepare_isolated_command, probe_executable, resolve_command,
 };
 pub use protocol::{McpEnvVar, McpServerSpec};
 pub use quota::{AdapterProbeStatus, QuotaTracker, probe_installed_adapters};

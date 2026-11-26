@@ -1,7 +1,7 @@
 {
   "name": "meta-harness",
   "productName": "Meta-Harness",
-  "version": "0.4.0",
+  "version": "0.5.0",
   "description": "Local-first multi-agent ACP workspace",
   "author": "Zhiyuan Pan",
   "license": "MIT",

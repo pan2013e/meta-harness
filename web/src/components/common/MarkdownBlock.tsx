@@ -50,6 +50,10 @@ export function MarkdownBlock({
     const p = s.projects.find((item) => item.id === s.activeProjectId);
     return p?.root_path ?? null;
   });
+  const skillSlugsKey = useAppStore((s) =>
+    s.skills.map((sk) => sk.id.toLowerCase()).join(",")
+  );
+  const skillSlugs = new Set(skillSlugsKey ? skillSlugsKey.split(",") : []);
   const sid = explicitSessionId !== undefined ? explicitSessionId : storeSessionId;
 
   const segments = splitFencesAndDetails(content);
@@ -69,7 +73,12 @@ export function MarkdownBlock({
               <span>{seg.summary}</span>
             </summary>
             <div className="mt-2 pt-2 border-t border-line text-ink-soft">
-              <MarkdownProse text={seg.body} sessionId={sid} projectRoot={activeProjectRoot} />
+              <MarkdownProse
+                text={seg.body}
+                sessionId={sid}
+                projectRoot={activeProjectRoot}
+                skillSlugs={skillSlugs}
+              />
             </div>
           </details>
         ) : (
@@ -78,6 +87,7 @@ export function MarkdownBlock({
             text={seg.text}
             sessionId={sid}
             projectRoot={activeProjectRoot}
+            skillSlugs={skillSlugs}
           />
         )
       )}
@@ -195,10 +205,12 @@ function MarkdownProse({
   text,
   sessionId,
   projectRoot,
+  skillSlugs,
 }: {
   text: string;
   sessionId: string | null;
   projectRoot: string | null;
+  skillSlugs: ReadonlySet<string>;
 }) {
   const lines = text.split(/\r?\n/);
   const nodes: ReactNode[] = [];
@@ -229,7 +241,7 @@ function MarkdownProse({
             : "text-[13.5px] font-semibold text-ink-soft mt-1";
       nodes.push(
         <div key={i} className={cls}>
-          {renderInline(headingMatch[2], sessionId, projectRoot)}
+          {renderInline(headingMatch[2], sessionId, projectRoot, skillSlugs)}
         </div>
       );
       i += 1;
@@ -248,7 +260,7 @@ function MarkdownProse({
           className="border-l-2 border-brand pl-3 py-0.5 text-ink-soft italic space-y-1"
         >
           {quoteLines.map((q, qi) => (
-            <div key={qi}>{renderInline(q, sessionId, projectRoot)}</div>
+            <div key={qi}>{renderInline(q, sessionId, projectRoot, skillSlugs)}</div>
           ))}
         </blockquote>
       );
@@ -281,7 +293,7 @@ function MarkdownProse({
               <tr>
                 {headers.map((h, hi) => (
                   <th key={hi} className="px-2.5 py-1.5 font-semibold">
-                    {renderInline(h, sessionId, projectRoot)}
+                    {renderInline(h, sessionId, projectRoot, skillSlugs)}
                   </th>
                 ))}
               </tr>
@@ -291,7 +303,7 @@ function MarkdownProse({
                 <tr key={ri} className="hover:bg-hover/40">
                   {headers.map((_, ci) => (
                     <td key={ci} className="px-2.5 py-1.5 text-ink-soft">
-                      {renderInline(r[ci] ?? "", sessionId, projectRoot)}
+                      {renderInline(r[ci] ?? "", sessionId, projectRoot, skillSlugs)}
                     </td>
                   ))}
                 </tr>
@@ -312,7 +324,7 @@ function MarkdownProse({
       nodes.push(
         <ul key={i} className="list-disc pl-5 space-y-1 text-ink">
           {items.map((it, ii) => (
-            <li key={ii}>{renderInline(it, sessionId, projectRoot)}</li>
+            <li key={ii}>{renderInline(it, sessionId, projectRoot, skillSlugs)}</li>
           ))}
         </ul>
       );
@@ -328,7 +340,7 @@ function MarkdownProse({
       nodes.push(
         <ol key={i} className="list-decimal pl-5 space-y-1 text-ink">
           {items.map((it, ii) => (
-            <li key={ii}>{renderInline(it, sessionId, projectRoot)}</li>
+            <li key={ii}>{renderInline(it, sessionId, projectRoot, skillSlugs)}</li>
           ))}
         </ol>
       );
@@ -350,7 +362,7 @@ function MarkdownProse({
     }
     nodes.push(
       <div key={i} className="whitespace-pre-wrap">
-        {renderInline(para.join("\n"), sessionId, projectRoot)}
+        {renderInline(para.join("\n"), sessionId, projectRoot, skillSlugs)}
       </div>
     );
   }
@@ -361,7 +373,8 @@ function MarkdownProse({
 function renderInline(
   text: string,
   sessionId: string | null,
-  projectRoot: string | null
+  projectRoot: string | null,
+  skillSlugs: ReadonlySet<string>
 ): ReactNode[] {
   const chunks = text.split(/(`[^`]+`)/g);
   return chunks.map((chunk, i) => {
@@ -377,7 +390,7 @@ function renderInline(
     }
 
     const richRegex =
-      /(\*\*[^*\n]+\*\*|\[[^\]]+\]\([^)\s]+\)|\B@[a-zA-Z0-9_-]+(?:\[[a-zA-Z0-9._:-]+\])?)/g;
+      /(\*\*[^*\n]+\*\*|\[[^\]]+\]\([^)\s]+\)|\B@[a-zA-Z0-9_-]+(?:\[[a-zA-Z0-9._:-]+\])?|\B\/[a-zA-Z0-9_-]+(?=$|[\s.,!?;:]))/g;
     const parts = chunk.split(richRegex);
     return (
       <span key={i}>
@@ -442,6 +455,20 @@ function renderInline(
                 {tok}
               </span>
             );
+          }
+          if (tok.startsWith("/")) {
+            const slug = tok.slice(1).toLowerCase();
+            if (skillSlugs.has(slug)) {
+              return (
+                <span
+                  key={j}
+                  className="inline-block px-1.5 py-0.2 rounded-md bg-skill-soft border border-skill/35 text-skill font-medium font-mono text-[12.5px]"
+                >
+                  {tok}
+                </span>
+              );
+            }
+            return <span key={j}>{tok}</span>;
           }
           return <span key={j}>{tok}</span>;
         })}

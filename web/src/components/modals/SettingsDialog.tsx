@@ -10,6 +10,7 @@ import {
   Plus,
   RefreshCw,
   Sliders,
+  Sparkles,
   Terminal,
   Trash2,
   UserPlus,
@@ -23,6 +24,7 @@ import { HarnessMaintenance } from "./HarnessMaintenance";
 import { PersonaModelFields, type PersonaModel } from "./PersonaModelFields";
 import { GlobalPersonas } from "./GlobalPersonas";
 import { SettingsBackup } from "./SettingsBackup";
+import { SkillsSettings } from "./SkillsSettings";
 import { version } from "../../../package.json";
 
 function formatBytes(bytes: number): string {
@@ -40,7 +42,7 @@ function formatBytes(bytes: number): string {
 export function SettingsDialog({ onClose }: { onClose: () => void }) {
   const dialog = useRef<HTMLDialogElement>(null);
   const [section, setSection] = useState<
-    "harnesses" | "session" | "personas" | "storage" | "appearance" | "about"
+    "harnesses" | "skills" | "session" | "personas" | "storage" | "appearance" | "about"
   >("harnesses");
   const [saving, setSaving] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -238,6 +240,7 @@ export function SettingsDialog({ onClose }: { onClose: () => void }) {
               [
                 ["appearance", "Appearance", Palette],
                 ["harnesses", "Harnesses & Models", Terminal],
+                ["skills", "Skills", Sparkles],
                 ["personas", "Global Personas", UserPlus],
                 ["session", "Session", Sliders],
                 ["storage", "Storage & Data", HardDrive],
@@ -716,6 +719,8 @@ export function SettingsDialog({ onClose }: { onClose: () => void }) {
                 )}
               </div>
             )}
+
+            {section === "skills" && <SkillsSettings />}
 
             {section === "personas" && <GlobalPersonas />}
 

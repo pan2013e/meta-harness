@@ -53,6 +53,10 @@ impl AppPaths {
         self.data_dir.join("meta-harness.db")
     }
 
+    pub fn skills_dir(&self) -> PathBuf {
+        self.data_dir.join("skills")
+    }
+
     pub fn standalone_session_root(&self, session_id: &str) -> PathBuf {
         self.workspaces_dir.join(session_id)
     }

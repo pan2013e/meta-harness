@@ -4,6 +4,7 @@ pub mod mcp_bridge;
 pub mod pty;
 pub mod routes;
 mod settings;
+mod skills;
 mod web_preview;
 pub mod ws;
 
@@ -47,6 +48,29 @@ pub fn build_router(state: AppState) -> Router {
             "/api/settings",
             get(settings::export_settings).post(settings::import_settings),
         )
+        .route(
+            "/api/skills",
+            get(skills::list_skills).post(skills::create_custom_skill),
+        )
+        .route(
+            "/api/skills/install-folder",
+            post(skills::install_skill_from_folder),
+        )
+        .route(
+            "/api/skills/install-git",
+            post(skills::install_skill_from_git),
+        )
+        .route(
+            "/api/skills/{id}",
+            get(skills::get_skill_detail)
+                .patch(skills::patch_skill)
+                .delete(skills::delete_skill),
+        )
+        .route(
+            "/api/skills/{id}/content",
+            axum::routing::put(skills::update_skill_content),
+        )
+        .route("/api/skills/{id}/reset", post(skills::reset_skill_handler))
         .route("/api/personas", post(settings::save_persona))
         .route("/api/personas/{handle}", delete(settings::delete_persona))
         .route(

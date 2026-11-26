@@ -74,8 +74,11 @@ impl AcpClient {
         &self,
         callbacks: Arc<dyn BrokerCallbacks>,
         rules: Vec<PermissionRule>,
+        skill_read_roots: Vec<std::path::PathBuf>,
     ) {
-        self.broker.update_turn_context(callbacks, rules).await;
+        self.broker
+            .update_turn_context(callbacks, rules, skill_read_roots)
+            .await;
     }
 
     pub async fn spawn(

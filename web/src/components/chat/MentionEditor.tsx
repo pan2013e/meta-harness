@@ -6,7 +6,7 @@ import {
   useRef,
 } from "react";
 
-export type SlashCommandKind = "workflow" | "action";
+export type SlashCommandKind = "workflow" | "action" | "skill";
 
 export const DEFAULT_SLASH_COMMANDS: ReadonlyMap<string, SlashCommandKind> = new Map([
   ["plan", "workflow"],
@@ -134,7 +134,9 @@ function makeSlashPillElement(
   span.className =
     kind === "workflow"
       ? "inline-flex items-center gap-0.5 align-baseline mx-0.5 px-1.5 py-0.2 rounded-md bg-pos-soft border border-pos/35 text-pos font-mono text-[12.5px] font-semibold select-none"
-      : "inline-flex items-center gap-0.5 align-baseline mx-0.5 px-1.5 py-0.2 rounded-md bg-warn-soft border border-warn/35 text-warn font-mono text-[12.5px] font-semibold select-none";
+      : kind === "skill"
+        ? "inline-flex items-center gap-0.5 align-baseline mx-0.5 px-1.5 py-0.2 rounded-md bg-skill-soft border border-skill/35 text-skill font-mono text-[12.5px] font-semibold select-none"
+        : "inline-flex items-center gap-0.5 align-baseline mx-0.5 px-1.5 py-0.2 rounded-md bg-warn-soft border border-warn/35 text-warn font-mono text-[12.5px] font-semibold select-none";
   span.appendChild(doc.createTextNode(`/${command}`));
 
   const btn = doc.createElement("button");
@@ -145,7 +147,9 @@ function makeSlashPillElement(
   btn.className =
     kind === "workflow"
       ? "ml-0.5 text-pos/75 hover:text-ink leading-none cursor-pointer focus:outline-none"
-      : "ml-0.5 text-warn/75 hover:text-ink leading-none cursor-pointer focus:outline-none";
+      : kind === "skill"
+        ? "ml-0.5 text-skill/75 hover:text-ink leading-none cursor-pointer focus:outline-none"
+        : "ml-0.5 text-warn/75 hover:text-ink leading-none cursor-pointer focus:outline-none";
   btn.textContent = "×";
   span.appendChild(btn);
 

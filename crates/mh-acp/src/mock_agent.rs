@@ -727,8 +727,15 @@ fn strip_context_blocks(raw: &str) -> String {
     let mut s = raw.to_string();
     for (open, close) in [
         ("<persona_instructions", "</persona_instructions>"),
+        (
+            "<session_compacted_summary>",
+            "</session_compacted_summary>",
+        ),
         ("<group_chat_updates", "</group_chat_updates>"),
+        ("<available_skills", "</available_skills>"),
+        ("<activated_skills", "</activated_skills>"),
         ("<orchestrator_telemetry>", "</orchestrator_telemetry>"),
+        ("<slash_commands>", "</slash_commands>"),
     ] {
         while let Some(start) = s.find(open) {
             if let Some(end_rel) = s[start..].find(close) {

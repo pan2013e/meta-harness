@@ -21,6 +21,8 @@
   --color-warn-soft: var(--mh-warn-soft);
   --color-neg: var(--mh-neg);
   --color-neg-soft: var(--mh-neg-soft);
+  --color-skill: var(--mh-skill);
+  --color-skill-soft: var(--mh-skill-soft);
 
   --font-sans: "Plus Jakarta Sans Variable", "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei UI", "Noto Sans CJK SC", system-ui, -apple-system, sans-serif;
   --font-mono: "JetBrains Mono Variable", "Cascadia Mono", "Sarasa Mono SC", "Microsoft YaHei UI", ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
@@ -50,6 +52,8 @@
   --mh-warn-soft: rgba(245, 158, 11, 0.14);
   --mh-neg: #fb7185;
   --mh-neg-soft: rgba(244, 63, 94, 0.14);
+  --mh-skill: #38bdf8;
+  --mh-skill-soft: rgba(56, 189, 248, 0.14);
 }
 
 /* 2. Tokyo Night */
@@ -75,6 +79,8 @@
   --mh-warn-soft: rgba(224, 175, 104, 0.15);
   --mh-neg: #f7768e;
   --mh-neg-soft: rgba(247, 118, 142, 0.14);
+  --mh-skill: #7dcfff;
+  --mh-skill-soft: rgba(125, 207, 255, 0.15);
 }
 
 /* 3. Catppuccin Mocha */
@@ -100,6 +106,8 @@
   --mh-warn-soft: rgba(249, 226, 175, 0.15);
   --mh-neg: #f38ba8;
   --mh-neg-soft: rgba(243, 139, 168, 0.15);
+  --mh-skill: #89dceb;
+  --mh-skill-soft: rgba(137, 220, 235, 0.15);
 }
 
 /* 4. Paper Daylight (high-contrast crisp light mode) */
@@ -125,6 +133,8 @@
   --mh-warn-soft: rgba(217, 119, 6, 0.12);
   --mh-neg: #dc2626;
   --mh-neg-soft: rgba(220, 38, 38, 0.10);
+  --mh-skill: #0284c7;
+  --mh-skill-soft: rgba(2, 132, 199, 0.11);
 }
 
 body {

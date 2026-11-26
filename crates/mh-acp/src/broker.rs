@@ -49,6 +49,8 @@ pub trait BrokerCallbacks: Send + Sync {
     );
 
     async fn record_touched_file(&self, turn_id: &str, rel_path: String);
+
+    async fn record_skill_read(&self, _turn_id: &str, _target: &Path) {}
 }
 
 #[derive(Debug, Clone)]
@@ -57,6 +59,7 @@ pub struct MemberBrokerContext {
     pub member_handle: String,
     pub project_root: PathBuf,
     pub member_worktree: PathBuf,
+    pub skill_read_roots: Arc<RwLock<Vec<PathBuf>>>,
     pub permission_policy: PermissionPolicy,
     pub active_turn_id: Arc<RwLock<Option<String>>>,
     pub rules: Arc<RwLock<Vec<PermissionRule>>>,
@@ -91,9 +94,11 @@ impl WorkspaceBroker {
         &self,
         callbacks: Arc<dyn BrokerCallbacks>,
         rules: Vec<PermissionRule>,
+        skill_read_roots: Vec<PathBuf>,
     ) {
         *self.callbacks.write().await = callbacks;
         *self.ctx.rules.write().await = rules;
+        *self.ctx.skill_read_roots.write().await = skill_read_roots;
     }
 
     async fn callbacks(&self) -> Arc<dyn BrokerCallbacks> {
@@ -107,8 +112,15 @@ impl WorkspaceBroker {
         let target = resolve_member_path(&self.ctx.member_worktree, &params.path);
         let inside_project = is_path_within(&target, &self.ctx.member_worktree)
             || is_path_within(&target, &self.ctx.project_root);
+        let in_skill_root = self
+            .ctx
+            .skill_read_roots
+            .read()
+            .await
+            .iter()
+            .any(|root| is_path_within(&target, root));
 
-        if !inside_project {
+        if !inside_project && !in_skill_root {
             self.prompt_or_allow(
                 "fs_external",
                 &format!("Read external file: {}", target.display()),
@@ -131,6 +143,12 @@ impl WorkspaceBroker {
         }
 
         let content = tokio::fs::read_to_string(&target).await?;
+        if in_skill_root && let Some(turn_id) = self.ctx.active_turn_id.read().await.clone() {
+            self.callbacks()
+                .await
+                .record_skill_read(&turn_id, &target)
+                .await;
+        }
         let sliced = slice_lines(&content, params.line, params.limit);
         Ok(json!({ "content": sliced }))
     }
@@ -449,20 +467,41 @@ impl WorkspaceBroker {
             }));
         }
 
-        // Worktree-smart fast-path for edit/read tool calls strictly inside member worktree
-        if matches!(
-            self.ctx.permission_policy,
-            PermissionPolicy::WorktreeSmart | PermissionPolicy::AutonomousSandbox
-        ) && matches!(kind, "edit" | "read" | "write" | "fs")
-            && let Some(loc_path) = extract_tool_call_path(&params.tool_call)
-        {
+        // Worktree-smart fast-path for edit/read tool calls inside allowed roots
+        if let Some(loc_path) = extract_tool_call_path(&params.tool_call) {
             let resolved = resolve_member_path(&self.ctx.member_worktree, &loc_path);
-            if is_path_within(&resolved, &self.ctx.member_worktree)
+            let in_skill_root = self
+                .ctx
+                .skill_read_roots
+                .read()
+                .await
+                .iter()
+                .any(|root| is_path_within(&resolved, root));
+            let allow_read = kind == "read"
+                && (is_path_within(&resolved, &self.ctx.member_worktree)
+                    || is_path_within(&resolved, &self.ctx.project_root)
+                    || in_skill_root);
+            let allow_worktree_smart = matches!(
+                self.ctx.permission_policy,
+                PermissionPolicy::WorktreeSmart | PermissionPolicy::AutonomousSandbox
+            ) && matches!(kind, "edit" | "read" | "write" | "fs")
+                && is_path_within(&resolved, &self.ctx.member_worktree);
+
+            if (allow_read || allow_worktree_smart)
                 && let Some(allow) = options
                     .iter()
                     .find(|o| o.kind.starts_with("allow"))
                     .map(|o| o.option_id.clone())
             {
+                if kind == "read"
+                    && in_skill_root
+                    && let Some(turn_id) = self.ctx.active_turn_id.read().await.clone()
+                {
+                    self.callbacks()
+                        .await
+                        .record_skill_read(&turn_id, &resolved)
+                        .await;
+                }
                 return Ok(json!({
                     "outcome": {
                         "outcome": "selected",
@@ -725,6 +764,7 @@ mod tests {
     struct TestCallbacks {
         decision: PermissionResolution,
         events: Mutex<Vec<(String, TrajectoryEventKind, Value)>>,
+        skill_reads: Mutex<Vec<PathBuf>>,
         auto_approve_switch_tools: bool,
     }
 
@@ -754,6 +794,10 @@ mod tests {
         }
 
         async fn record_touched_file(&self, _turn_id: &str, _rel_path: String) {}
+
+        async fn record_skill_read(&self, _turn_id: &str, target: &Path) {
+            self.skill_reads.lock().await.push(target.to_path_buf());
+        }
     }
 
     #[tokio::test]
@@ -761,8 +805,15 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let proj = tmp.path().join("proj");
         let wt = proj.join(".meta-harness/worktrees/s1/_exec_codex");
+        let skills_root = tmp.path().join("skills");
         let outside = tmp.path().join("outside.txt");
         std::fs::create_dir_all(&wt).unwrap();
+        std::fs::create_dir_all(skills_root.join("demo-skill")).unwrap();
+        std::fs::write(
+            skills_root.join("demo-skill/SKILL.md"),
+            "# Demo Skill\nRead me.\n",
+        )
+        .unwrap();
 
         let cb = Arc::new(TestCallbacks {
             decision: PermissionResolution::Selected {
@@ -770,6 +821,7 @@ mod tests {
                 allow_pattern: None,
             },
             events: Mutex::new(Vec::new()),
+            skill_reads: Mutex::new(Vec::new()),
             auto_approve_switch_tools: false,
         });
 
@@ -779,6 +831,7 @@ mod tests {
                 member_handle: "codex".into(),
                 project_root: proj,
                 member_worktree: wt.clone(),
+                skill_read_roots: Arc::new(RwLock::new(vec![skills_root.clone()])),
                 permission_policy: PermissionPolicy::WorktreeSmart,
                 active_turn_id: Arc::new(RwLock::new(Some("t1".into()))),
                 rules: Arc::new(RwLock::new(Vec::new())),
@@ -797,6 +850,36 @@ mod tests {
             .unwrap();
         assert!(wt.join("src/lib.rs").exists());
         assert_eq!(cb.events.lock().await.len(), 1);
+
+        // Reading inside skill_read_roots succeeds without prompt and fires callback
+        let read_res = broker
+            .handle_read_text_file(FsReadTextFileParams {
+                session_id: "s1".into(),
+                path: skills_root
+                    .join("demo-skill/SKILL.md")
+                    .to_string_lossy()
+                    .into_owned(),
+                line: None,
+                limit: None,
+            })
+            .await
+            .unwrap();
+        assert!(read_res["content"].as_str().unwrap().contains("Demo Skill"));
+        assert_eq!(cb.skill_reads.lock().await.len(), 1);
+
+        // Writing inside skill_read_roots stays gated!
+        let write_skill_err = broker
+            .handle_write_text_file(FsWriteTextFileParams {
+                session_id: "s1".into(),
+                path: skills_root
+                    .join("demo-skill/SKILL.md")
+                    .to_string_lossy()
+                    .into_owned(),
+                content: "overwrite".into(),
+            })
+            .await
+            .unwrap_err();
+        assert!(matches!(write_skill_err, AcpError::PermissionDenied(_)));
 
         // Outside write triggers prompt -> rejected
         let err = broker
@@ -820,6 +903,7 @@ mod tests {
                 member_handle: "antigravity".into(),
                 project_root: tmp.path().into(),
                 member_worktree: tmp.path().into(),
+                skill_read_roots: Arc::new(RwLock::new(Vec::new())),
                 permission_policy: PermissionPolicy::Strict,
                 active_turn_id: Arc::clone(&active_turn),
                 rules: Arc::new(RwLock::new(Vec::new())),
@@ -830,6 +914,7 @@ mod tests {
                     allow_pattern: None,
                 },
                 events: Mutex::new(Vec::new()),
+                skill_reads: Mutex::new(Vec::new()),
                 auto_approve_switch_tools: true,
             }),
         );

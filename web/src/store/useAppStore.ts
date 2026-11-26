@@ -22,6 +22,7 @@ import type {
   SessionDiffReport,
   SessionMember,
   ShellHistoryEntry,
+  SkillSummary,
   StorageCleanupResult,
   StorageSummary,
   ThemeId,
@@ -140,6 +141,9 @@ interface AppState {
 
   storageSummary: StorageSummary | null;
   storageLoading: boolean;
+  skills: SkillSummary[];
+  skillsDir: string;
+  skillsLoading: boolean;
 
   wsClient: WsHubClient | null;
 
@@ -210,6 +214,8 @@ interface AppState {
   closeDrawer: () => void;
 
   refreshMemory: (query?: string) => Promise<void>;
+  refreshSkills: (projectId?: string | null) => Promise<void>;
+  toggleSkill: (id: string, enabled: boolean) => Promise<void>;
   refreshQuotas: () => Promise<void>;
   refreshQuotasLive: () => Promise<void>;
   handleWsEvent: (ev: WsEvent) => void;
@@ -322,6 +328,9 @@ export const useAppStore = create<AppState>((set, get) => {
     memoryFacts: [],
     storageSummary: null,
     storageLoading: false,
+    skills: [],
+    skillsDir: "",
+    skillsLoading: false,
     wsClient: null,
 
     setTheme: (theme) => {
@@ -415,6 +424,7 @@ export const useAppStore = create<AppState>((set, get) => {
         void get().refreshQuotas()
           .catch((error: unknown) => { if (startup === startupRequest) reportError(error); })
           .finally(() => finish("quota"));
+        void get().refreshSkills(projRes.projects[0]?.id ?? null).catch(() => undefined);
         const request = ++catalogRequest;
         void api.listAdapters().then(({ catalogs }) => {
           if (catalogs && request === catalogRequest) set({ adapterCatalogs: catalogs });
@@ -472,6 +482,7 @@ export const useAppStore = create<AppState>((set, get) => {
         });
         const firstActive = sessions.find((s) => s.archived_at == null);
         if (firstActive) await get().selectSession(firstActive.id);
+        void get().refreshSkills(projectId).catch(() => undefined);
       } catch (error) {
         if (request === projectRequest) reportError(error);
       }
@@ -869,6 +880,25 @@ export const useAppStore = create<AppState>((set, get) => {
       if (request === memoryRequest) {
         set({ memoryJobs: mem.jobs, memoryFacts: mem.facts });
       }
+    },
+
+    refreshSkills: async (projectId?: string | null) => {
+      const pid = projectId !== undefined ? projectId : get().activeProjectId;
+      set({ skillsLoading: true });
+      try {
+        const res = await api.listSkills(pid);
+        set({ skills: res.skills, skillsDir: res.skills_dir });
+      } finally {
+        set({ skillsLoading: false });
+      }
+    },
+
+    toggleSkill: async (id: string, enabled: boolean) => {
+      const pid = get().activeProjectId;
+      const { skill } = await api.patchSkill(id, { enabled, project_id: pid });
+      set((state) => ({
+        skills: state.skills.map((item) => (item.id === skill.id ? skill : item)),
+      }));
     },
 
     refreshQuotas: async () => {

@@ -173,7 +173,12 @@ pub async fn list_fs(Query(q): Query<FsListQuery>) -> ApiResult<Value> {
             continue;
         }
         let name = entry.file_name().to_string_lossy().into_owned();
-        if name.starts_with('.') && name != ".meta-harness" {
+        if name.starts_with('.')
+            && !matches!(
+                name.as_str(),
+                ".meta-harness" | ".agents" | ".claude" | ".codex" | ".gemini"
+            )
+        {
             continue;
         }
         let clean = dunce::simplified(&p).to_string_lossy().into_owned();

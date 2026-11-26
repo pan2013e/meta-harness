@@ -1096,4 +1096,89 @@ describe("UI primitives", () => {
       expect(screen.getByText(/Deleted 2 archived sessions/)).toBeTruthy();
     });
   });
+
+  it("exposes enabled skills in Composer / menu and manages skills in Settings", async () => {
+    if (!HTMLDialogElement.prototype.showModal) {
+      HTMLDialogElement.prototype.showModal = function () {
+        this.open = true;
+      };
+    }
+
+    const builtinSkill = {
+      id: "meta-harness-docs",
+      name: "Meta-Harness Docs",
+      description: "Comprehensive Meta-Harness usage and development guide.",
+      source: "builtin" as const,
+      origin: "embedded",
+      enabled: true,
+      builtin_modified: false,
+      skill_dir: "/data/skills/meta-harness-docs",
+      skill_md_path: "/data/skills/meta-harness-docs/SKILL.md",
+      files: ["SKILL.md", "references/usage-and-workflows.md"],
+      updated_at: 100,
+    };
+
+    useAppStore.setState({
+      skills: [builtinSkill],
+      skillsDir: "/data/skills",
+      probes: [
+        {
+          adapter_id: "codex",
+          display_name: "Codex",
+          accent_color: "#10a37f",
+          installed: true,
+          resolved_command: "/usr/bin/codex",
+          auth_detected: true,
+          auth_hint: "Ready",
+          strengths: [],
+        },
+      ],
+    });
+
+    vi.spyOn(api, "getSkillDetail").mockResolvedValue({
+      detail: {
+        skill: builtinSkill,
+        file_path: "SKILL.md",
+        content: "# Meta-Harness Docs\nBootstrap development guide.",
+      },
+    });
+    vi.spyOn(api, "patchSkill").mockResolvedValue({
+      skill: { ...builtinSkill, enabled: false },
+    });
+
+    render(<SettingsDialog onClose={() => {}} />);
+    fireEvent.click(screen.getByRole("button", { name: "Skills" }));
+
+    expect(screen.getByText("Meta-Harness Docs")).toBeTruthy();
+    expect(screen.getByText("/meta-harness-docs")).toBeTruthy();
+
+    fireEvent.click(screen.getByRole("button", { name: /Inspect \/ Edit Files/i }));
+    await waitFor(() => {
+      expect(screen.getByDisplayValue(/Bootstrap development guide/)).toBeTruthy();
+    });
+
+    fireEvent.click(screen.getByRole("switch", { name: "Enable skill Meta-Harness Docs" }));
+    await waitFor(() => {
+      expect(api.patchSkill).toHaveBeenCalledWith("meta-harness-docs", {
+        enabled: false,
+        project_id: null,
+      });
+    });
+
+    cleanup();
+    const skillCommands = new Map([["meta-harness-docs", "skill" as const]]);
+    const { container } = render(
+      <MentionEditor
+        value="/meta-harness-docs @codex explain"
+        validHandles={new Set(["codex"])}
+        slashCommands={skillCommands}
+        onChange={() => {}}
+        onMentionQuery={() => {}}
+      />
+    );
+    const pill = container.querySelector('[data-slash="meta-harness-docs"]');
+    expect(pill?.getAttribute("data-slash-kind")).toBe("skill");
+    const textbox = screen.getByRole("textbox", { name: "Message group chat" });
+    expect(serializeMentionDom(textbox)).toBe("/meta-harness-docs @codex explain");
+  });
 });

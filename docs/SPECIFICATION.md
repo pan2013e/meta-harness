@@ -164,6 +164,8 @@ The canonical tool schemas are declared in [mh-switch's MCP implementation](../c
 | `memory_recall` | All | Queries project-wide `episodic_jobs` + `project_facts` via SQLite FTS5. |
 | `memory_record_fact` | All | Records or updates a high-level architectural/ownership/performance note (`project_facts`). |
 | `quota_get_status` | All / Orch | Returns adapter-level subscription quota headroom snapshots. |
+| `skill_list` | All | Lists enabled global (`<MH_DATA_DIR>/skills/`) and repo-local (`.agents/skills/`) skills available to the session. |
+| `skill_read` | All | Reads a skill's `SKILL.md` or supporting file with zero approval prompts and emits an inline activity pill. |
 | `models_list_catalog` | Orchestrator | Returns live ACP `configOptions` (`models`, `efforts`) + adapter capability metadata. |
 | `orchestrator_dispatch` | Orchestrator | Configures target executor member(s) (`model`, `reasoning_effort`) and dispatches 1 or more parallel/sequential worktree tasks with a visible Dispatch Card. |
 | `memory_curate_job` | Orchestrator | Saves the curated post-job `EpisodicJob` summary + optional `project_facts` updates after a turn/wave completes. |
@@ -209,6 +211,7 @@ To keep memory high-signal without low-level clutter:
 | `session_permission_rules` | Session-scoped file and command allow patterns. |
 | `episodic_jobs`, `episodic_jobs_fts`, `project_facts` | Project job summaries, searchable FTS5 entries, and durable facts. |
 | `adapter_quota_prefs`, `adapter_model_prefs`, `global_personas` | Adapter-level preferences and reusable persona templates. |
+| `skill_states` | Enable/disable flags, install source/origin metadata, and embedded hash tracking for global and repo-local skills. |
 
 ---
 
@@ -250,7 +253,7 @@ HTML preview documents can load local styles, scripts, and other relative assets
 - Chat renders Markdown, right-aligned user messages, dispatch and approval cards, consult threads, and inline turn activity. Trajectory tool updates and terminal chunks group under the corresponding tool call. The timeline summarizes Meta-Harness switch calls in plain language. Native harness subagents can appear in the parent turn's tool activity. Separate ACP child-session updates do not contribute to the parent transcript or context totals.
 - The composer offers mention and slash-command autocomplete, a per-recipient model and reasoning-effort menu, context and subscription meters, and Worktree, Strict, and Auto approval modes. Context shows the harness-reported total and window when available or an estimated Meta-Harness breakdown. `/memory` opens Project Memory, with an empty state for Quick Sessions.
 - Startup shows connection and harness checks first. Model, quota, and workspace lookups can finish with progress indicators while the main UI is available.
-- Settings contains Appearance, Harnesses & Models, Global Personas, Session, Storage & Data, and About. The browser persists theme selection in local storage.
+- Settings contains Appearance, Harnesses & Models, Skills, Global Personas, Session, Storage & Data, and About. The browser persists theme selection in local storage. **Skills** manages the preinstalled `meta-harness-docs` skill as well as local folder, Git URL, custom inline, and repo-local (`.agents/skills/`) skills.
 
 ### 7.4 Build and versioning
 

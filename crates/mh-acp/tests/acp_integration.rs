@@ -106,6 +106,7 @@ async fn acp_config_options_diff_capture_and_cancel() {
                 adapter: mock_adapter_config(),
                 project_root: tmp.path().to_path_buf(),
                 member_worktree: wt.clone(),
+                skill_read_roots: Vec::new(),
                 permission_policy: PermissionPolicy::WorktreeSmart,
                 existing_acp_session_id: None,
                 extra_env: Vec::new(),

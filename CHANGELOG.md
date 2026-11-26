@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+## 0.5.0
+
+- Add Agent Skills support across group chats (`SKILL.md` bundles in `<MH_DATA_DIR>/skills/` plus repo-local `.agents/skills/` discovery, `/skill-name` composer pills, auto-approved `skill_list` / `skill_read` MCP tools & read-only brokered file access, and inline skill activity pills).
+- Add **Settings → Skills** to install skills from local folders, Git / GitHub URLs, or inline authoring, plus enable/disable toggles, file inspection/editing, built-in reset, and uninstall.
+- Bundle and auto-synchronize the preinstalled **`Meta-Harness Docs`** (`/meta-harness-docs`) skill with full usage, crate architecture, ACP/worktree invariant, and contributor self-bootstrapping guides.
+
 ## 0.4.0
 
 - Archive, restore, and delete linked Codex and compatible Claude Code conversations in their original profiles. Preserve conversation references across context resets and profile changes, and report when a harness keeps its own history.

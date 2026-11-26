@@ -36,10 +36,15 @@ export const MessageRow = memo(function MessageRow({ message, consultReplies }: 
   );
 
   if (message.kind === "activity_pill") {
+    const isSkill = typeof message.metadata.skill_id === "string";
     return (
       <div className="px-6 py-1 flex items-center justify-center">
         <div className="inline-flex items-center gap-1.5 px-3 py-1 rounded-full bg-elevated border border-line text-[11px] text-ink-muted">
-          <Activity className="w-3 h-3 text-brand-ink" />
+          {isSkill ? (
+            <Sparkles className="w-3 h-3 text-sky-400 shrink-0" />
+          ) : (
+            <Activity className="w-3 h-3 text-brand-ink shrink-0" />
+          )}
           <span>{message.content}</span>
         </div>
       </div>

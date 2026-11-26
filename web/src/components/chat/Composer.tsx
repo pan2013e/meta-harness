@@ -85,8 +85,8 @@ function routingMentions(markdown: string, handles: ReadonlySet<string>) {
   const token = /@([a-z0-9_-]+)(?![a-z0-9_/-]|\.[a-z0-9])(?:\[[^\s\]]+\])?/.source;
   const known = (handle: string) => handles.has(handle) || handle === "all" || handle === "orchestrator";
   let remaining = withoutCode.trimStart();
-  const workflow = /^\/(?:plan|review|test|fix|compact)[,.;:!?]*(?:\s+|$)/i;
-  while (workflow.test(remaining)) remaining = remaining.replace(workflow, "");
+  const leadingSlash = /^\/[a-z0-9_-]+[,.;:!?]*(?:\s+|$)/i;
+  while (leadingSlash.test(remaining)) remaining = remaining.replace(leadingSlash, "");
 
   const leading = new Set<string>();
   const address = new RegExp("^" + token, "i");
@@ -168,6 +168,7 @@ export function Composer({
     sessionContext,
     memoryJobs,
     memoryFacts,
+    skills,
     pendingPermissionPolicy,
     setPendingPermissionPolicy,
     createAndSelectSession,
@@ -337,10 +338,46 @@ export function Composer({
     return base.filter((c) => c.handle.toLowerCase().startsWith(mentionQuery));
   }, [mentionQuery, menuDismissed, availableMembers, orchestrator, adapters, quotas]);
 
+  const slashCommandsMap = useMemo(() => {
+    const map = new Map<string, SlashCommandKind>(DEFAULT_SLASH_COMMANDS);
+    for (const skill of skills) {
+      const lower = skill.id.toLowerCase();
+      if (skill.enabled && !map.has(lower)) {
+        map.set(lower, "skill");
+      }
+    }
+    return map;
+  }, [skills]);
+
+  const allSlashItems = useMemo(() => {
+    const skillItems = skills
+      .filter((s) => s.enabled && !DEFAULT_SLASH_COMMANDS.has(s.id.toLowerCase()))
+      .map((s) => ({
+        command: s.id,
+        kind: "skill" as SlashCommandKind,
+        desc: `${s.name} — ${s.description}`,
+      }));
+    return [...SLASH_ITEMS, ...skillItems];
+  }, [skills]);
+
   const slashCandidates = useMemo(() => {
     if (slashQuery === null || menuDismissed) return [];
-    return SLASH_ITEMS.filter((item) => item.command.startsWith(slashQuery));
-  }, [slashQuery, menuDismissed]);
+    const q = slashQuery.toLowerCase();
+    const prefix: typeof allSlashItems = [];
+    const substring: typeof allSlashItems = [];
+    for (const item of allSlashItems) {
+      const cmdLower = item.command.toLowerCase();
+      if (cmdLower.startsWith(q)) {
+        prefix.push(item);
+      } else if (
+        q.length > 0 &&
+        (cmdLower.includes(q) || (item.kind === "skill" && item.desc.toLowerCase().includes(q)))
+      ) {
+        substring.push(item);
+      }
+    }
+    return [...prefix, ...substring];
+  }, [slashQuery, menuDismissed, allSlashItems]);
 
   const raw = text.trim();
   useEffect(() => {
@@ -700,9 +737,9 @@ export function Composer({
         )}
 
         {slashCandidates.length > 0 && (
-          <div className="absolute bottom-full left-0 mb-2 w-80 max-w-full rounded-xl border border-line-strong bg-panel shadow-2xl overflow-hidden z-30 p-1">
+          <div className="absolute bottom-full left-0 mb-2 w-96 max-w-full rounded-xl border border-line-strong bg-panel shadow-2xl overflow-hidden z-30 p-1 max-h-64 overflow-y-auto">
             <div className="px-2.5 py-1 text-[10px] uppercase tracking-wider font-semibold text-ink-muted">
-              Slash command (Tab / Enter)
+              Commands &amp; Skills (Tab / Enter)
             </div>
             {slashCandidates.map((item, idx) => (
               <button
@@ -716,10 +753,12 @@ export function Composer({
                 }`}
               >
                 <span
-                  className={`font-mono font-semibold px-1.5 py-0.2 rounded ${
+                  className={`font-mono font-semibold px-1.5 py-0.2 rounded shrink-0 ${
                     item.kind === "workflow"
                       ? "bg-pos-soft text-pos"
-                      : "bg-warn-soft text-warn"
+                      : item.kind === "skill"
+                        ? "bg-skill-soft text-skill"
+                        : "bg-warn-soft text-warn"
                   }`}
                 >
                   /{item.command}
@@ -735,10 +774,10 @@ export function Composer({
             ref={editorRef}
             value={text}
             validHandles={validHandleSet}
-            slashCommands={DEFAULT_SLASH_COMMANDS}
+            slashCommands={slashCommandsMap}
             placeholder={
               availableMembers.length
-                ? "Message the group… Use @ to mention or / for commands"
+                ? "Message the group… Use @ to mention or / for commands & skills"
                 : "No agent harnesses available. Type / for local commands."
             }
             onChange={setText}

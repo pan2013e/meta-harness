@@ -1117,6 +1117,7 @@ async fn settings_backup_and_global_personas_preserve_session_choices() {
     switch.supervisor.shutdown_all().await;
     srv.abort();
 }
+
 #[tokio::test]
 async fn delegates_body_mentions_and_keeps_intent_routing_out_of_chat() {
     let (base_url, switch, srv, _tmp, _paths) = start_test_server_with_paths().await;
@@ -1411,6 +1412,248 @@ async fn orchestrator_reports_during_work_and_queues_feedback_with_separate_pers
     );
     assert_ne!(monitor.worktree_path, current_orchestrator.worktree_path);
     assert!(monitor.last_seen_msg_seq > current_orchestrator.last_seen_msg_seq);
+
+    switch.supervisor.shutdown_all().await;
+    srv.abort();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn e2e_skills_builtin_install_mcp_access_and_slash_preload() {
+    let (base_url, switch, srv, _tmp, _paths) = start_test_server_with_paths().await;
+    let http = reqwest::Client::new();
+
+    // 1. Preinstalled Meta-Harness Docs skill is automatically present and enabled
+    let list_res: Value = http
+        .get(format!("{base_url}/api/skills"))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let skills = list_res["skills"].as_array().unwrap();
+    let builtin = skills
+        .iter()
+        .find(|s| s["id"] == "meta-harness-docs")
+        .expect("preinstalled meta-harness-docs skill should be listed");
+    assert_eq!(builtin["enabled"], true);
+    assert_eq!(builtin["source"], "builtin");
+    assert_eq!(builtin["builtin_modified"], false);
+
+    let ref_detail: Value = http
+        .get(format!(
+            "{base_url}/api/skills/meta-harness-docs?file=references/usage-and-workflows.md"
+        ))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert!(
+        ref_detail["detail"]["content"]
+            .as_str()
+            .unwrap()
+            .contains("MCP Collaboration Tools")
+    );
+
+    // 2. Create custom inline skill & install local folder skill + repo-local .agents/skills/
+    let custom_resp: Value = http
+        .post(format!("{base_url}/api/skills"))
+        .json(&json!({
+            "id": "custom-audit",
+            "name": "Custom Audit",
+            "description": "Verify invariants.",
+            "content": "# Custom Audit\nCheck invariants carefully.\n"
+        }))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(custom_resp["skill"]["id"], "custom-audit");
+    assert_eq!(custom_resp["skill"]["source"], "custom");
+
+    let local_pkg = tempfile::tempdir().unwrap();
+    std::fs::write(
+        local_pkg.path().join("SKILL.md"),
+        "---\nname: local-helper\ntitle: Local Helper\ndescription: Helps with local utilities.\n---\n# Local Helper\nBody\n",
+    )
+    .unwrap();
+    let folder_resp: Value = http
+        .post(format!("{base_url}/api/skills/install-folder"))
+        .json(&json!({ "path": local_pkg.path().to_string_lossy() }))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(folder_resp["installed"][0]["id"], "local-helper");
+
+    let repo_dir = tempfile::tempdir().unwrap();
+    std::fs::write(repo_dir.path().join("README.md"), "# Repo\n").unwrap();
+    let repo_skill = repo_dir.path().join(".agents/skills/repo-conventions");
+    std::fs::create_dir_all(&repo_skill).unwrap();
+    std::fs::write(
+        repo_skill.join("SKILL.md"),
+        "---\nname: repo-conventions\ntitle: Repo Conventions\ndescription: Repo rules.\n---\n# Repo\nFollow repo conventions.\n",
+    )
+    .unwrap();
+    init_git_repo(repo_dir.path()).await.unwrap();
+
+    let proj_resp: Value = http
+        .post(format!("{base_url}/api/projects"))
+        .json(&json!({ "root_path": repo_dir.path().to_string_lossy() }))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let project_id = proj_resp["project"]["id"].as_str().unwrap().to_string();
+
+    let proj_skills: Value = http
+        .get(format!("{base_url}/api/skills?project_id={project_id}"))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert!(
+        proj_skills["skills"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|s| s["id"] == "repo-conventions" && s["source"] == "project")
+    );
+
+    // 3. Create session; verify executor (`@codex`) auto-approves `skill_read` and emits ActivityPill
+    let sess_resp: Value = http
+        .post(format!("{base_url}/api/projects/{project_id}/sessions"))
+        .json(&json!({
+            "title": "Skill Test Session",
+            "orchestrator_member": "antigravity"
+        }))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let sid = sess_resp["session"]["id"].as_str().unwrap().to_string();
+
+    let skill_args = json!({
+        "skill": "meta-harness-docs",
+        "path": "references/architecture-and-crates.md"
+    });
+    http.post(format!("{base_url}/api/sessions/{sid}/messages"))
+        .json(&json!({
+            "content": format!("@codex [MOCK:MCP tool=\"skill_read\" permission=\"required\" args={skill_args}]")
+        }))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap();
+
+    let msgs = tokio::time::timeout(Duration::from_secs(15), async {
+        loop {
+            let list = switch.store.list_messages(&sid, None, 50).unwrap();
+            if list.iter().any(|m| {
+                m.sender_id == "codex"
+                    && m.metadata["streaming"] == false
+                    && m.content.contains("MCP skill_read ok")
+            }) {
+                break list;
+            }
+            tokio::time::sleep(Duration::from_millis(30)).await;
+        }
+    })
+    .await
+    .unwrap();
+    assert!(
+        msgs.iter().any(|m| m.kind == MessageKind::ActivityPill
+            && m.metadata["skill_id"] == "meta-harness-docs"),
+        "expected ActivityPill when @codex read meta-harness-docs via MCP"
+    );
+    assert!(
+        msgs.iter()
+            .any(|m| m.sender_id == "codex" && m.content.contains("Rust Crate Dependency DAG")),
+        "expected skill_read result to include architecture-and-crates content"
+    );
+
+    // 4. Verify `/meta-harness-docs @claude ...` routes to @claude and preloads skill pill
+    http.post(format!("{base_url}/api/sessions/{sid}/messages"))
+        .json(&json!({
+            "content": "/meta-harness-docs @claude [MOCK:REPLY text=\"Skill preloaded ok\"]"
+        }))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(15), async {
+        loop {
+            let list = switch.store.list_messages(&sid, None, 50).unwrap();
+            if list
+                .iter()
+                .any(|m| m.sender_id == "claude" && m.content == "Skill preloaded ok")
+                && list.iter().any(|m| {
+                    m.kind == MessageKind::ActivityPill
+                        && m.sender_id == "claude"
+                        && m.metadata["skill_id"] == "meta-harness-docs"
+                })
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(30)).await;
+        }
+    })
+    .await
+    .unwrap();
+
+    // 5. Disable custom skill -> MCP skill_read rejects it cleanly, then uninstall
+    http.patch(format!("{base_url}/api/skills/custom-audit"))
+        .json(&json!({ "enabled": false }))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap();
+    let err = execute_mcp_tool(
+        &switch,
+        &sid,
+        "codex",
+        "skill_read",
+        json!({ "skill": "custom-audit" }),
+    )
+    .await
+    .unwrap_err();
+    assert!(matches!(err, SwitchError::Validation(_)));
+
+    http.delete(format!("{base_url}/api/skills/custom-audit"))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap();
 
     switch.supervisor.shutdown_all().await;
     srv.abort();

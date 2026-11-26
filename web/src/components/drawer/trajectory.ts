@@ -33,6 +33,8 @@ const switchActions: Record<string, [action: string, completed: string]> = {
   memory_record_fact: ["save a project note", "saved a project note"],
   quota_get_status: ["check subscription usage", "checked subscription usage"],
   models_list_catalog: ["check available models", "checked available models"],
+  skill_list: ["list installed skills", "listed installed skills"],
+  skill_read: ["read an agent skill", "read an agent skill"],
   orchestrator_dispatch: ["request a task handoff", "requested a task handoff"],
   memory_curate_job: ["save a job summary", "saved a job summary"],
 };

@@ -32,6 +32,7 @@ pub struct MemberSpawnSpec {
     pub adapter: AdapterConfig,
     pub project_root: PathBuf,
     pub member_worktree: PathBuf,
+    pub skill_read_roots: Vec<PathBuf>,
     pub permission_policy: PermissionPolicy,
     pub existing_acp_session_id: Option<String>,
     pub extra_env: Vec<(String, String)>,
@@ -107,7 +108,11 @@ impl AcpSupervisor {
                 *existing.last_used.lock().await = Instant::now();
                 existing
                     .client
-                    .update_turn_context(callbacks, spec.rules.read().await.clone())
+                    .update_turn_context(
+                        callbacks,
+                        spec.rules.read().await.clone(),
+                        spec.skill_read_roots,
+                    )
                     .await;
                 return Ok(Arc::clone(existing));
             }
@@ -127,6 +132,7 @@ impl AcpSupervisor {
             member_handle: spec.member_handle.clone(),
             project_root: spec.project_root.clone(),
             member_worktree: spec.member_worktree.clone(),
+            skill_read_roots: Arc::new(RwLock::new(spec.skill_read_roots.clone())),
             permission_policy: spec.permission_policy,
             active_turn_id: Arc::clone(&active_turn_id),
             rules: spec.rules,
@@ -306,6 +312,7 @@ impl AcpSupervisor {
             member_handle: "orchestrator".into(),
             project_root: cwd.to_path_buf(),
             member_worktree: cwd.to_path_buf(),
+            skill_read_roots: Arc::new(RwLock::new(Vec::new())),
             permission_policy: PermissionPolicy::Strict,
             active_turn_id,
             rules: Arc::new(RwLock::new(Vec::new())),
@@ -512,6 +519,7 @@ async fn probe_agy_profile_catalog(
         member_handle: adapter_id.into(),
         project_root: cwd.to_path_buf(),
         member_worktree: cwd.to_path_buf(),
+        skill_read_roots: Arc::new(RwLock::new(Vec::new())),
         permission_policy: PermissionPolicy::Strict,
         active_turn_id: Arc::new(RwLock::new(None)),
         rules: Arc::new(RwLock::new(Vec::new())),

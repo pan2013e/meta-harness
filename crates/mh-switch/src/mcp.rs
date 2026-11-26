@@ -109,6 +109,23 @@ pub fn list_switch_tools() -> Vec<Value> {
             "inputSchema": { "type": "object", "properties": {}, "additionalProperties": false }
         }),
         json!({
+            "name": "skill_list",
+            "description": "List all enabled Agent Skills available in this session (including preinstalled Meta-Harness Docs, user-installed skills, and repo-local .agents/skills).",
+            "inputSchema": { "type": "object", "properties": {}, "additionalProperties": false }
+        }),
+        json!({
+            "name": "skill_read",
+            "description": "Read a skill's SKILL.md or supporting reference/script file (e.g. 'references/architecture-and-crates.md').",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "skill": { "type": "string", "description": "Skill slug/id (e.g. 'meta-harness-docs')" },
+                    "path": { "type": "string", "description": "Relative file inside the skill folder (defaults to 'SKILL.md')" }
+                },
+                "required": ["skill"]
+            }
+        }),
+        json!({
             "name": "orchestrator_dispatch",
             "description": "Configure executor model/reasoning effort and dispatch one or more tasks into executor worktrees.",
             "inputSchema": {
@@ -354,6 +371,56 @@ pub async fn execute_mcp_tool(
                 }));
             }
             Ok(json!({ "catalog": catalog }))
+        }
+        "skill_list" => {
+            let member_wt = engine
+                .store
+                .get_member(session_id, caller)
+                .ok()
+                .and_then(|m| m.worktree_path)
+                .map(std::path::PathBuf::from);
+            let skills: Vec<mh_core::SkillSummary> = engine
+                .list_session_skills(&session, member_wt.as_deref())?
+                .into_iter()
+                .filter(|s| s.enabled)
+                .collect();
+            Ok(json!({ "skills": skills }))
+        }
+        "skill_read" => {
+            let skill_id = args
+                .get("skill")
+                .or_else(|| args.get("id"))
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| SwitchError::Validation("missing `skill`".into()))?;
+            let rel_path = args.get("path").and_then(|v| v.as_str());
+            let member_wt = engine
+                .store
+                .get_member(session_id, caller)
+                .ok()
+                .and_then(|m| m.worktree_path)
+                .map(std::path::PathBuf::from);
+            let detail = engine.resolve_enabled_skill_read(
+                &session,
+                member_wt.as_deref(),
+                skill_id,
+                rel_path,
+            )?;
+            let statuses = engine.get_member_statuses(session_id).await;
+            let turn_id = statuses.get(caller).and_then(|(_, tid)| tid.clone());
+            engine
+                .emit_skill_activity_pill(
+                    session_id,
+                    caller,
+                    turn_id.as_deref(),
+                    None,
+                    &detail.skill,
+                )
+                .await;
+            Ok(json!({
+                "skill": detail.skill,
+                "file_path": detail.file_path,
+                "content": detail.content,
+            }))
         }
         "orchestrator_dispatch" => {
             let rationale = args

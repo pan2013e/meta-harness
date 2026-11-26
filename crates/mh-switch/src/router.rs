@@ -18,9 +18,10 @@ use mh_acp::{
 use mh_core::{
     AppConfig, AppPaths, ChatMessage, DiffStat, DiscoveredConfigOption, DispatchTaskSpec,
     IsolationMode, MemberContextBreakdown, MemberRole, MemberStatus, MessageKind,
-    PendingPermissionView, SenderKind, Session, SessionContextReport, SessionMember,
+    PendingPermissionView, SenderKind, Session, SessionContextReport, SessionMember, SkillSummary,
     TrajectoryEventKind, TurnModelSelection, TurnStatus, WaitForGraph, WsEvent,
-    context_window_for_model, estimate_tokens, parse_mentions, parse_user_mentions,
+    context_window_for_model, estimate_tokens, parse_mentions, parse_slash_tokens,
+    parse_user_mentions,
 };
 use mh_store::{
     NewMessageParams, PatchSessionParams, RecordEpisodicJobParams, StartTrajectoryParams, Store,
@@ -90,6 +91,7 @@ pub struct SessionRuntime {
     pub pending_dispatches: Mutex<HashMap<String, PendingDispatch>>,
     pub orchestrator_dispatched_turn: Mutex<HashSet<String>>,
     pub curation_recorded_turns: Mutex<HashSet<String>>,
+    pub recorded_skill_uses: Mutex<HashSet<(String, String)>>,
     pub cancel_epoch: RwLock<u64>,
 }
 
@@ -108,6 +110,7 @@ impl Default for SessionRuntime {
             pending_dispatches: Mutex::new(HashMap::new()),
             orchestrator_dispatched_turn: Mutex::new(HashSet::new()),
             curation_recorded_turns: Mutex::new(HashSet::new()),
+            recorded_skill_uses: Mutex::new(HashSet::new()),
             cancel_epoch: RwLock::new(0),
         }
     }
@@ -159,6 +162,7 @@ impl SwitchEngine {
         bridge_token: String,
         app_paths: AppPaths,
     ) -> Arc<Self> {
+        crate::skills::ensure_builtin_skills(&app_paths, &store);
         let (events_tx, _) = broadcast::channel(1024);
         Arc::new(Self {
             config: RwLock::new(config),
@@ -1136,7 +1140,8 @@ impl SwitchEngine {
 
             let rules = Arc::new(RwLock::new(self.store.list_permission_rules(session_id)?));
             let mcp_url = self.internal_mcp_url.read().await.clone();
-            let mcp_spec = if !mcp_url.is_empty() {
+            let has_mcp_bridge = !mcp_url.is_empty();
+            let mcp_spec = if has_mcp_bridge {
                 Some(build_mcp_bridge_spec(
                     &self.self_exe,
                     &mcp_url,
@@ -1147,6 +1152,10 @@ impl SwitchEngine {
             } else {
                 None
             };
+            let session_skills = self
+                .list_session_skills(&session, Some(&work_cwd))
+                .unwrap_or_default();
+            let skill_read_roots = crate::skills::session_skill_read_roots(&session_skills);
 
             let traj = self.store.start_trajectory(StartTrajectoryParams {
                 turn_id: None,
@@ -1173,6 +1182,7 @@ impl SwitchEngine {
                 member_handle: member.handle.clone(),
                 can_use_switch_tools_without_approval: is_orchestrator_context
                     && mcp_spec.is_some(),
+                has_mcp_bridge,
                 worktree: work_cwd.clone(),
                 touched_files: Mutex::new(HashSet::new()),
                 counters: Mutex::new(TurnCounters::default()),
@@ -1186,6 +1196,7 @@ impl SwitchEngine {
                 adapter: adapter_cfg,
                 project_root: project_root.clone(),
                 member_worktree: work_cwd.clone(),
+                skill_read_roots,
                 permission_policy: session.permission_policy,
                 existing_acp_session_id: member
                     .acp_session_id
@@ -1321,9 +1332,26 @@ impl SwitchEngine {
                 .map(|m| m.seq)
                 .unwrap_or(member.last_seen_msg_seq);
 
-            let full_prompt = self
-                .compose_prompt(&session, &member, &unseen, &task.task_brief, &purpose)
+            let (full_prompt, activated_skills) = self
+                .compose_prompt(
+                    &session,
+                    &member,
+                    &unseen,
+                    &task.task_brief,
+                    &purpose,
+                    &session_skills,
+                )
                 .await;
+            for activated in &activated_skills {
+                self.emit_skill_activity_pill(
+                    session_id,
+                    &member.handle,
+                    Some(&turn_id),
+                    Some(chain_id),
+                    activated,
+                )
+                .await;
+            }
 
             // Create visible reply bubble for normal/orchestrator/conflict turns (not silent curation or consults which create consult threads)
             let visible_msg = if !matches!(
@@ -1613,8 +1641,10 @@ impl SwitchEngine {
         unseen: &[ChatMessage],
         task_brief: &str,
         purpose: &TurnPurpose,
-    ) -> String {
+        session_skills: &[SkillSummary],
+    ) -> (String, Vec<SkillSummary>) {
         let mut buf = String::new();
+        let mut activated_summaries = Vec::new();
 
         if !member.persona_prompt.trim().is_empty() {
             buf.push_str(&format!(
@@ -1628,6 +1658,30 @@ impl SwitchEngine {
                 "<session_compacted_summary>\n{}\n</session_compacted_summary>\n",
                 session.working_summary.trim()
             ));
+        }
+
+        if !matches!(purpose, TurnPurpose::MemoryCuration) {
+            let enabled_skills: Vec<&SkillSummary> =
+                session_skills.iter().filter(|s| s.enabled).collect();
+            let available_xml = crate::skills::format_available_skills_xml(&enabled_skills);
+            if !available_xml.is_empty() {
+                buf.push_str(&available_xml);
+            }
+
+            let slash_tokens = parse_slash_tokens(task_brief);
+            let mut preloaded = Vec::new();
+            for token in &slash_tokens {
+                if let Some(skill) = enabled_skills.iter().copied().find(|s| s.id == *token)
+                    && let Ok(detail) = crate::skills::read_skill_file_from_summary(skill, None)
+                {
+                    activated_summaries.push(skill.clone());
+                    preloaded.push((detail.skill, detail.content));
+                }
+            }
+            let activated_xml = crate::skills::format_activated_skills_xml(&preloaded);
+            if !activated_xml.is_empty() {
+                buf.push_str(&activated_xml);
+            }
         }
 
         if !unseen.is_empty() {
@@ -1692,7 +1746,7 @@ impl SwitchEngine {
             }
         }
 
-        buf
+        (buf, activated_summaries)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -2241,6 +2295,11 @@ impl SwitchEngine {
             .sum();
 
         let summary_tokens = estimate_tokens(&session.working_summary);
+        let session_skills = self.list_session_skills(&session, None).unwrap_or_default();
+        let enabled_skills: Vec<&SkillSummary> =
+            session_skills.iter().filter(|s| s.enabled).collect();
+        let skills_tokens =
+            estimate_tokens(&crate::skills::format_available_skills_xml(&enabled_skills));
         let mut breakdowns = Vec::new();
         for m in members {
             if !available.contains(&m.handle) {
@@ -2257,7 +2316,7 @@ impl SwitchEngine {
                 .or_else(|| adapter_pref.and_then(|p| p.default_model));
             let is_orch = session.orchestrator_member.as_deref() == Some(m.handle.as_str());
             let system_and_persona_tokens =
-                280 + summary_tokens + estimate_tokens(&m.persona_prompt);
+                280 + summary_tokens + skills_tokens + estimate_tokens(&m.persona_prompt);
             let memory_and_telemetry_tokens = memory_base_tokens + if is_orch { 320 } else { 80 };
 
             let mut agent_and_tool_tokens = 0u64;
@@ -2654,6 +2713,7 @@ struct SwitchCallbacks {
     session_id: String,
     member_handle: String,
     can_use_switch_tools_without_approval: bool,
+    has_mcp_bridge: bool,
     worktree: PathBuf,
     touched_files: Mutex<HashSet<String>>,
     counters: Mutex<TurnCounters>,
@@ -2689,20 +2749,26 @@ impl TurnCounters {
 #[async_trait]
 impl BrokerCallbacks for SwitchCallbacks {
     fn may_auto_approve_switch_tool(&self, tool: &str) -> bool {
+        let is_registered = crate::list_switch_tools()
+            .iter()
+            .any(|entry| entry["name"].as_str() == Some(tool));
+        if !is_registered {
+            return false;
+        }
+        let Some(engine) = self.engine.upgrade() else {
+            return false;
+        };
+        let Ok(session) = engine.store.get_session(&self.session_id) else {
+            return false;
+        };
+        if session.archived_at.is_some() {
+            return false;
+        }
+        if matches!(tool, "skill_list" | "skill_read") {
+            return self.has_mcp_bridge;
+        }
         self.can_use_switch_tools_without_approval
-            && self.engine.upgrade().is_some_and(|engine| {
-                engine
-                    .store
-                    .get_session(&self.session_id)
-                    .is_ok_and(|session| {
-                        session.archived_at.is_none()
-                            && session.orchestrator_member.as_deref()
-                                == Some(self.member_handle.as_str())
-                    })
-            })
-            && crate::list_switch_tools()
-                .iter()
-                .any(|entry| entry["name"].as_str() == Some(tool))
+            && session.orchestrator_member.as_deref() == Some(self.member_handle.as_str())
     }
 
     async fn request_user_permission(
@@ -2821,6 +2887,19 @@ impl BrokerCallbacks for SwitchCallbacks {
 
     async fn record_touched_file(&self, _turn_id: &str, rel_path: String) {
         self.touched_files.lock().await.insert(rel_path);
+    }
+
+    async fn record_skill_read(&self, turn_id: &str, target: &Path) {
+        if let Some(engine) = self.engine.upgrade() {
+            engine
+                .emit_skill_activity_for_path(
+                    &self.session_id,
+                    &self.member_handle,
+                    Some(turn_id),
+                    target,
+                )
+                .await;
+        }
     }
 }
 

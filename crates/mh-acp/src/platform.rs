@@ -264,9 +264,21 @@ pub fn shell_command_invocation(raw_command: &str) -> (String, Vec<String>) {
 pub fn open_url_in_browser(url: &str) -> Result<(), AcpError> {
     #[cfg(windows)]
     {
-        std::process::Command::new("cmd.exe")
-            .args(["/D", "/C", "start", "", url])
-            .spawn()?;
+        let wide_url: Vec<u16> = url.encode_utf16().chain([0]).collect();
+        // SAFETY: The terminated URL stays alive for the duration of ShellExecuteW.
+        let result = unsafe {
+            windows_sys::Win32::UI::Shell::ShellExecuteW(
+                std::ptr::null_mut(),
+                std::ptr::null(),
+                wide_url.as_ptr(),
+                std::ptr::null(),
+                std::ptr::null(),
+                windows_sys::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL,
+            )
+        };
+        if result as usize <= 32 {
+            return Err(std::io::Error::other("Windows could not open the default browser").into());
+        }
         Ok(())
     }
     #[cfg(target_os = "macos")]
@@ -351,8 +363,16 @@ pub fn prepare_isolated_command(cmd: &mut Command) {
     }
     #[cfg(windows)]
     {
-        let _ = cmd;
+        cmd.creation_flags(windows_sys::Win32::System::Threading::CREATE_NO_WINDOW);
     }
+}
+
+pub(crate) fn background_command(program: &str) -> Command {
+    let mut command = Command::new(program);
+    #[cfg(windows)]
+    command.creation_flags(windows_sys::Win32::System::Threading::CREATE_NO_WINDOW);
+    command.kill_on_drop(true);
+    command
 }
 
 /// Cross-platform child process tree lifetime guard.

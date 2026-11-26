@@ -269,6 +269,22 @@ impl AcpSupervisor {
         self.catalog_cache.lock().await.remove(adapter_id);
     }
 
+    pub async fn model_default_effort(&self, adapter_id: &str, model: &str) -> Option<String> {
+        let lookup = |catalog: &AdapterModelCatalog| {
+            catalog
+                .model_details
+                .iter()
+                .find(|entry| entry.value.eq_ignore_ascii_case(model))
+                .and_then(|entry| entry.default_effort.clone())
+        };
+        let cache = self.catalog_cache.lock().await;
+        if let Some((_, catalog)) = cache.get(adapter_id) {
+            lookup(catalog)
+        } else {
+            lookup(&builtin_adapter_catalog(adapter_id))
+        }
+    }
+
     /// Runs a short-lived ephemeral ACP turn (used for low-effort utility passes such as
     /// automatic session title generation) without disturbing active conversation clients.
     pub async fn run_ephemeral_prompt(
@@ -300,7 +316,7 @@ impl AcpSupervisor {
             client.initialize().await?;
             client.new_session(cwd, Vec::new()).await?;
             if effort.is_some() {
-                let _ = client.apply_model_and_effort(None, effort).await;
+                let _ = client.apply_model_and_effort(None, effort, None).await;
             }
             let (_, out) = client
                 .prompt("ephemeral_title", prompt_text, listener)

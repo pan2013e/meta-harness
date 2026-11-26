@@ -1074,6 +1074,24 @@ pub async fn get_session_context_handler(
     Ok(Json(json!({ "context": report })))
 }
 
+#[derive(Deserialize)]
+pub struct DraftContextRequest {
+    text: String,
+}
+
+pub async fn estimate_draft_context(Json(body): Json<DraftContextRequest>) -> ApiResult<Value> {
+    if body.text.len() > 128 * 1024 {
+        return Err(err_resp(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "Draft exceeds the token count limit.",
+        ));
+    }
+    let tokens = tokio::task::spawn_blocking(move || mh_core::estimate_tokens(&body.text))
+        .await
+        .map_err(|error| err_resp(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
+    Ok(Json(json!({ "tokens": tokens })))
+}
+
 pub async fn compact_session_handler(
     State(state): State<AppState>,
     AxumPath(session_id): AxumPath<String>,
@@ -1375,7 +1393,10 @@ pub async fn get_session_diff_handler(
 pub async fn serve_session_worktree_file(
     State(state): State<AppState>,
     AxumPath((session_id, rel_path)): AxumPath<(String, String)>,
+    Query(query): Query<SessionFileQuery>,
 ) -> Response {
+    use tokio::io::AsyncReadExt;
+
     let Ok(sess) = state.switch.store.get_session(&session_id) else {
         return (StatusCode::NOT_FOUND, "session not found").into_response();
     };
@@ -1395,9 +1416,26 @@ pub async fn serve_session_worktree_file(
     if !is_path_within(&candidate, root) || !candidate.is_file() {
         return (StatusCode::NOT_FOUND, "file not found").into_response();
     }
-    let Ok(bytes) = tokio::fs::read(&candidate).await else {
+    const PREVIEW_LIMIT: usize = 24 * 1024 * 1024;
+    let Ok(file) = tokio::fs::File::open(&candidate).await else {
         return (StatusCode::FORBIDDEN, "cannot read file").into_response();
     };
+    let mut data = Vec::new();
+    let max_bytes = if query.preview {
+        PREVIEW_LIMIT as u64 + 1
+    } else {
+        u64::MAX
+    };
+    if file.take(max_bytes).read_to_end(&mut data).await.is_err() {
+        return (StatusCode::FORBIDDEN, "cannot read file").into_response();
+    }
+    if query.preview && data.len() > PREVIEW_LIMIT {
+        return (
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "File is too large to preview.",
+        )
+            .into_response();
+    }
     let mime = guess_mime(&candidate.to_string_lossy());
     (
         StatusCode::OK,
@@ -1409,9 +1447,15 @@ pub async fn serve_session_worktree_file(
             ),
             (header::X_CONTENT_TYPE_OPTIONS, "nosniff"),
         ],
-        bytes,
+        data,
     )
         .into_response()
+}
+
+#[derive(Deserialize)]
+pub struct SessionFileQuery {
+    #[serde(default)]
+    preview: bool,
 }
 
 pub(crate) fn active_session_workspace(
@@ -2097,6 +2141,10 @@ fn guess_mime(path: &str) -> &'static str {
         "image/png"
     } else if lower.ends_with(".webp") {
         "image/webp"
+    } else if lower.ends_with(".avif") {
+        "image/avif"
+    } else if lower.ends_with(".bmp") {
+        "image/bmp"
     } else if lower.ends_with(".jpg") || lower.ends_with(".jpeg") {
         "image/jpeg"
     } else if lower.ends_with(".gif") {
@@ -2109,6 +2157,8 @@ fn guess_mime(path: &str) -> &'static str {
         "application/json"
     } else if lower.ends_with(".wasm") {
         "application/wasm"
+    } else if lower.ends_with(".pdf") {
+        "application/pdf"
     } else if lower.ends_with(".md") || lower.ends_with(".txt") {
         "text/plain; charset=utf-8"
     } else {

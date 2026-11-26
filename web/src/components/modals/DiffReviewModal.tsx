@@ -8,7 +8,8 @@ import {
   Loader2,
   X,
 } from "lucide-react";
-import { api, sessionFileUrl } from "../../api/client";
+import { api } from "../../api/client";
+import { SessionFileLink } from "../common/SessionFileLink";
 import { useAppStore } from "../../store/useAppStore";
 import type { PromoteMode } from "../../types/api";
 import { DiffViewer, parseUnifiedDiff } from "../common/DiffViewer";
@@ -221,15 +222,14 @@ export function DiffReviewModal({ onClose }: { onClose: () => void }) {
                           <span className="text-neg">-{sec.deletions}</span>
                         </>
                       )}
-                      <a
-                        href={sessionFileUrl(activeSession.id, sec.filename)}
-                        target="_blank"
-                        rel="noreferrer"
+                      <SessionFileLink
+                        sessionId={activeSession.id}
+                        path={sec.filename}
                         title={`Open ${sec.filename}`}
                         className="opacity-0 group-hover:opacity-100 p-0.5 text-ink-muted hover:text-brand-ink"
                       >
                         <ExternalLink className="w-3 h-3" />
-                      </a>
+                      </SessionFileLink>
                     </div>
                   </div>
                 );

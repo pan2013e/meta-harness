@@ -1,6 +1,6 @@
 import { useState, type ReactNode } from "react";
 import { Check, ChevronRight, Copy, ExternalLink, FileCode2 } from "lucide-react";
-import { sessionFileUrl } from "../../api/client";
+import { SessionFileLink } from "./SessionFileLink";
 import { useAppStore } from "../../store/useAppStore";
 
 function extractWorktreeRelativePath(rawHref: string, projectRoot?: string | null): string | null {
@@ -409,18 +409,17 @@ function renderInline(
             const rel = extractWorktreeRelativePath(rawHref, projectRoot);
             if (rel && sessionId) {
               return (
-                <a
+                <SessionFileLink
                   key={j}
-                  href={sessionFileUrl(sessionId, rel)}
-                  target="_blank"
-                  rel="noreferrer"
+                  sessionId={sessionId}
+                  path={rel}
                   title={rawHref}
                   className="inline-flex items-center gap-1 px-1.5 py-0.2 rounded-md bg-brand-soft text-brand-ink hover:underline font-medium text-[12.5px]"
                 >
                   <FileCode2 className="w-3 h-3 shrink-0" />
                   <span>{label}</span>
                   <ExternalLink className="w-2.5 h-2.5 shrink-0 opacity-75" />
-                </a>
+                </SessionFileLink>
               );
             }
             return (

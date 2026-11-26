@@ -76,6 +76,10 @@ export function ChatPane() {
     text: string;
   } | null>(null);
 
+  const [shellSession, setShellSession] = useState<string | null>(null);
+  useEffect(() => {
+    if (shellOpen && activeSession) setShellSession(activeSession.id);
+  }, [shellOpen, activeSession?.id]);
   const activeProject = projects.find((p) => p.id === activeProjectId) ?? null;
   const activeOrchestrator = useAppStore((state) =>
     state.members.find((member) => member.handle === state.activeSession?.orchestrator_member)
@@ -439,9 +443,6 @@ export function ChatPane() {
               <div className="flex h-full flex-col items-center justify-center gap-2 px-6 text-center">
                 <MessageSquare className="mb-1 h-6 w-6 text-brand-ink" />
                 <h3 className="text-base font-semibold">Start a conversation</h3>
-                <p className="text-xs text-ink-muted max-w-md">
-                  Describe your task or mention a harness below. The session title will update automatically after your first message.
-                </p>
               </div>
             ) : (
               <div
@@ -518,12 +519,13 @@ export function ChatPane() {
 
           <Composer key={activeSession.id} />
 
-          {shellOpen && (
-            <Suspense fallback={<div role="status" className="border-t border-line p-3 text-xs text-ink-muted">Loading terminal…</div>}>
+          {(shellOpen || shellSession === activeSession.id) && (
+            <Suspense fallback={shellOpen ? <div role="status" className="border-t border-line p-3 text-xs text-ink-muted">Loading terminal…</div> : null}>
               <WebShellDrawer
                 key={activeSession.id}
                 sessionId={activeSession.id}
                 shared={activeSession.isolation_mode === "shared_cwd"}
+                visible={shellOpen}
                 defaultCwd={
                   activeSession.integration_wt_path ??
                   activeProject?.root_path ??

@@ -86,6 +86,7 @@ interface AppState {
   settingsOpen: boolean;
   memoryModalOpen: boolean;
   diffModalOpen: boolean;
+  filePreview: { sessionId: string; path: string } | null;
   shellOpen: boolean;
   pickingFolder: boolean;
   quotasRefreshing: boolean;
@@ -145,6 +146,7 @@ interface AppState {
   setSettingsOpen: (open: boolean) => void;
   setMemoryModalOpen: (open: boolean) => void;
   setDiffModalOpen: (open: boolean) => void;
+  setFilePreview: (file: { sessionId: string; path: string } | null) => void;
   setShellOpen: (open: boolean) => void;
   setPromoteBanner: (msg: string | null) => void;
   setPendingPermissionPolicy: (policy: PermissionPolicy) => void;
@@ -267,6 +269,7 @@ export const useAppStore = create<AppState>((set, get) => {
     settingsOpen: false,
     memoryModalOpen: false,
     diffModalOpen: false,
+    filePreview: null,
     shellOpen: false,
     pickingFolder: false,
     quotasRefreshing: false,
@@ -324,6 +327,7 @@ export const useAppStore = create<AppState>((set, get) => {
     setSettingsOpen: (open) => set({ settingsOpen: open }),
     setMemoryModalOpen: (open) => set({ memoryModalOpen: open }),
     setDiffModalOpen: (open) => set({ diffModalOpen: open }),
+    setFilePreview: (file) => set({ filePreview: file }),
     setShellOpen: (open) => set({ shellOpen: open }),
     setPromoteBanner: (msg) => set({ promoteBanner: msg }),
     setPendingPermissionPolicy: (policy) => set({ pendingPermissionPolicy: policy }),

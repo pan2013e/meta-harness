@@ -19,7 +19,8 @@ use mh_core::{
     AppConfig, AppPaths, ChatMessage, DiffStat, DiscoveredConfigOption, DispatchTaskSpec,
     IsolationMode, MemberContextBreakdown, MemberRole, MemberStatus, MessageKind,
     PendingPermissionView, SenderKind, Session, SessionContextReport, SessionMember,
-    TrajectoryEventKind, TurnModelSelection, TurnStatus, WaitForGraph, WsEvent, parse_mentions,
+    TrajectoryEventKind, TurnModelSelection, TurnStatus, WaitForGraph, WsEvent,
+    context_window_for_model, estimate_tokens, parse_mentions,
 };
 use mh_store::{
     NewMessageParams, PatchSessionParams, RecordEpisodicJobParams, StartTrajectoryParams, Store,
@@ -1235,9 +1236,22 @@ impl SwitchEngine {
                     }),
             };
 
+            let model_default_effort = if let Some(model) = wanted_model
+                && wanted_effort.is_none()
+            {
+                self.supervisor
+                    .model_default_effort(&member.adapter_id, model)
+                    .await
+            } else {
+                None
+            };
             let (applied_model, applied_effort) = managed
                 .client
-                .apply_model_and_effort(wanted_model, wanted_effort)
+                .apply_model_and_effort(
+                    wanted_model,
+                    wanted_effort,
+                    model_default_effort.as_deref(),
+                )
                 .await;
 
             let new_acp_sid = managed
@@ -2175,11 +2189,11 @@ impl SwitchEngine {
 
         let memory_base_tokens: u64 = jobs
             .iter()
-            .map(|j| ((j.task_brief.len() + j.curated_summary.len()) / 4) as u64)
+            .map(|j| estimate_tokens(&j.task_brief) + estimate_tokens(&j.curated_summary))
             .sum::<u64>()
             + facts
                 .iter()
-                .map(|f| (f.summary.len() / 4) as u64)
+                .map(|f| estimate_tokens(&f.summary))
                 .sum::<u64>();
 
         let active_msgs_slice = match messages
@@ -2191,10 +2205,11 @@ impl SwitchEngine {
         };
         let chat_history_tokens: u64 = active_msgs_slice
             .iter()
-            .map(|m| ((m.content.len() + m.sender_id.len()) / 4).max(1) as u64)
+            .filter(|m| matches!(m.kind, MessageKind::Text | MessageKind::ConsultThread))
+            .map(|m| estimate_tokens(&m.content) + estimate_tokens(&m.sender_id) + 4)
             .sum();
 
-        let summary_tokens = (session.working_summary.len() / 4) as u64;
+        let summary_tokens = estimate_tokens(&session.working_summary);
         let mut breakdowns = Vec::new();
         for m in members {
             if !available.contains(&m.handle) {
@@ -2211,7 +2226,7 @@ impl SwitchEngine {
                 .or_else(|| adapter_pref.and_then(|p| p.default_model));
             let is_orch = session.orchestrator_member.as_deref() == Some(m.handle.as_str());
             let system_and_persona_tokens =
-                280 + summary_tokens + (m.persona_prompt.len() / 4) as u64;
+                280 + summary_tokens + estimate_tokens(&m.persona_prompt);
             let memory_and_telemetry_tokens = memory_base_tokens + if is_orch { 320 } else { 80 };
 
             let mut agent_and_tool_tokens = 0u64;
@@ -2219,14 +2234,13 @@ impl SwitchEngine {
                 .iter()
                 .filter(|t| t.member_handle == m.handle && t.started_at >= session.created_at)
             {
-                agent_and_tool_tokens += (t.summary.len() / 4) as u64;
+                agent_and_tool_tokens += estimate_tokens(&t.summary);
                 if let Ok(ev_page) = self.store.list_trajectory_events(&t.turn_id) {
-                    let chars: usize = ev_page
+                    agent_and_tool_tokens += ev_page
                         .iter()
                         .take(30)
-                        .map(|e| e.payload.to_string().len().min(600))
-                        .sum();
-                    agent_and_tool_tokens += (chars / 4) as u64;
+                        .map(|e| estimate_tokens(&truncate_chars(&e.payload.to_string(), 600)))
+                        .sum::<u64>();
                 }
             }
 
@@ -2235,6 +2249,13 @@ impl SwitchEngine {
                 .supervisor
                 .get_latest_usage(session_id, &m.handle)
                 .await;
+            let catalog_model = catalog.model_details.iter().find(|m| m.is_default);
+            let context_default = context_window_for_model(
+                effective_model
+                    .as_deref()
+                    .or_else(|| catalog_model.map(|item| item.value.as_str())),
+                catalog.default_context_window,
+            );
             let (is_exact, used_tokens, context_window) = match live_usage {
                 Some((used, size)) => (true, used, size),
                 None => (
@@ -2243,7 +2264,7 @@ impl SwitchEngine {
                         + memory_and_telemetry_tokens
                         + chat_history_tokens
                         + agent_and_tool_tokens,
-                    catalog.default_context_window,
+                    context_default,
                 ),
             };
 

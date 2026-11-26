@@ -654,6 +654,7 @@ describe("UI primitives", () => {
               default_effort: "medium",
               supported_efforts: [
                 { value: "low", label: "Low" },
+                { value: "medium", label: "Medium" },
                 { value: "xhigh", label: "Extra High" },
                 { value: "ultra", label: "Ultra" },
               ],
@@ -663,7 +664,7 @@ describe("UI primitives", () => {
               label: "gpt-5.6-luna",
               description: "Fast lightweight model",
               is_default: false,
-              default_effort: null,
+              default_effort: "low",
               supported_efforts: [{ value: "low", label: "Low" }],
             },
           ],
@@ -685,7 +686,7 @@ describe("UI primitives", () => {
         claude: {
           adapter_id: "claude",
           models: [{ value: "sonnet", label: "Sonnet" }],
-          efforts: [{ value: "low", label: "Low" }],
+          efforts: [{ value: "low", label: "Low" }, { value: "medium", label: "Medium" }],
           default_context_window: 200000,
         },
       },
@@ -708,6 +709,8 @@ describe("UI primitives", () => {
     const codexMenu = openMenu("codex");
     fireEvent.click(codexMenu.getByRole("button", { name: "gpt-6-astra" }));
     const slider = codexMenu.getByRole("slider", { name: "Reasoning effort" });
+    expect(slider.getAttribute("aria-valuetext")).toBe("Default · Medium");
+    expect((slider as HTMLInputElement).value).toBe("1");
     fireEvent.change(slider, { target: { value: "3" } });
     expect(slider.getAttribute("aria-valuetext")).toBe("Ultra");
     fireEvent.click(codexMenu.getByRole("button", { name: "Done" }));
@@ -729,7 +732,7 @@ describe("UI primitives", () => {
     expect(sendMessage).toHaveBeenLastCalledWith("Please ask (@Reviewer) and @codex for help", {
       recipient_overrides: {
         codex: { model: "gpt-6-astra", effort: "ultra" },
-        reviewer: { model: "sonnet", effort: "low" },
+        reviewer: { model: "sonnet", effort: "medium" },
       },
     });
 
@@ -738,7 +741,7 @@ describe("UI primitives", () => {
     const resetMenu = openMenu("codex");
     expect(resetMenu.getByRole("slider").getAttribute("aria-valuetext")).toBe("Ultra");
     fireEvent.click(resetMenu.getByRole("button", { name: "gpt-5.6-luna" }));
-    expect(resetMenu.getByRole("slider").getAttribute("aria-valuetext")).toBe("Default");
+    expect(resetMenu.getByRole("slider").getAttribute("aria-valuetext")).toBe("Default · Low");
     fireEvent.click(resetMenu.getByRole("button", { name: "Done" }));
     fireEvent.click(send);
     expect(sendMessage).toHaveBeenLastCalledWith("@orchestrator ask @reviewer to check this", {

@@ -1,3 +1,5 @@
+#![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
+
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -13,6 +15,10 @@ use mh_server::mcp_bridge::run_mcp_bridge;
 use mh_server::{AppState, build_router};
 use mh_store::Store;
 use mh_switch::SwitchEngine;
+use tokio::sync::oneshot;
+
+#[cfg(any(windows, target_os = "macos"))]
+mod tray;
 
 #[derive(Debug, Parser)]
 #[command(
@@ -34,6 +40,11 @@ struct Cli {
     config: Option<PathBuf>,
     #[arg(long)]
     data_dir: Option<PathBuf>,
+    /// Run the server without a system tray icon.
+    #[arg(long, global = true)]
+    no_tray: bool,
+    #[arg(long, global = true, hide = true)]
+    desktop_child: bool,
 }
 
 #[derive(Debug, Subcommand)]
@@ -62,10 +73,50 @@ enum Commands {
     InternalMockAgent,
 }
 
-#[tokio::main]
-async fn main() -> anyhow::Result<()> {
-    let cli = Cli::parse();
+fn main() -> anyhow::Result<()> {
+    #[cfg(all(windows, not(debug_assertions)))]
+    if std::env::args_os().any(|arg| {
+        matches!(
+            arg.to_str(),
+            Some("--help" | "-h" | "--version" | "-V" | "--no-tray")
+        )
+    }) && !std::env::args_os().any(|arg| arg == "--desktop-child")
+    {
+        // The published binary uses the GUI subsystem to stay silent when launched from Explorer.
+        // Attach only to an existing parent console when invoked as an interactive CLI.
+        unsafe {
+            windows_sys::Win32::System::Console::AttachConsole(
+                windows_sys::Win32::System::Console::ATTACH_PARENT_PROCESS,
+            );
+        }
+    }
+    let mut cli = Cli::parse();
+    if cli.desktop_child {
+        anyhow::ensure!(cli.command.is_none(), "Invalid desktop launcher arguments");
+        cli.auth_token = Some(std::env::var("MH_DESKTOP_TOKEN")?);
+        // SAFETY: No async runtime or background threads have started. Keep the desktop
+        // pairing token out of the environment inherited by agents and shells.
+        unsafe {
+            std::env::remove_var("MH_DESKTOP_TOKEN");
+        }
+    }
+    let runtime = tokio::runtime::Runtime::new()?;
+    #[cfg(any(windows, target_os = "macos"))]
+    if !cfg!(debug_assertions)
+        && !cli.no_tray
+        && !cli.desktop_child
+        && matches!(cli.command, None | Some(Commands::Serve { .. }))
+    {
+        return tray::run(cli, runtime);
+    }
+    runtime.block_on(run(cli, None, None))
+}
 
+async fn run(
+    cli: Cli,
+    tray_shutdown: Option<oneshot::Receiver<()>>,
+    tray_ready: Option<oneshot::Sender<String>>,
+) -> anyhow::Result<()> {
     if let Some(Commands::InternalMockAgent) = cli.command {
         mh_acp::mock_agent::run_mock_acp_agent_stdio().await;
         return Ok(());
@@ -111,7 +162,8 @@ async fn main() -> anyhow::Result<()> {
     let mut cfg = AppConfig::load_or_default(config_path.as_deref(), &paths)?;
     mh_server::harness_jobs::restore_profiles(&mut cfg, &paths.data_dir);
     let bind = bind_opt.unwrap_or_else(|| cfg.server.bind.clone());
-    let open_browser = !no_open && cfg.server.open_browser_on_start;
+    let open_browser =
+        !no_open && !cli.desktop_child && tray_ready.is_none() && cfg.server.open_browser_on_start;
 
     let store = Store::open(&paths.db_path())?;
     let quota = Arc::new(QuotaTracker::new());
@@ -168,7 +220,13 @@ async fn main() -> anyhow::Result<()> {
     };
 
     info!("Meta-Harness listening on http://{}", local_addr);
-    if auth.required {
+    if cli.desktop_child {
+        use std::io::Write;
+        println!("MH_READY {display_url}");
+        std::io::stdout().flush()?;
+    } else if let Some(ready) = tray_ready {
+        let _ = ready.send(display_url.clone());
+    } else if auth.required {
         println!("\n  Meta-Harness Remote Pairing URL:\n    {display_url}\n");
     } else {
         println!("\n  Meta-Harness UI:\n    {display_url}\n");
@@ -183,7 +241,7 @@ async fn main() -> anyhow::Result<()> {
 
     let app = build_router(state);
     axum::serve(listener, app)
-        .with_graceful_shutdown(shutdown_signal())
+        .with_graceful_shutdown(shutdown_signal(tray_shutdown, cli.desktop_child))
         .await?;
 
     info!("shutting down ACP child processes...");
@@ -191,6 +249,28 @@ async fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
-async fn shutdown_signal() {
-    let _ = tokio::signal::ctrl_c().await;
+async fn shutdown_signal(tray: Option<oneshot::Receiver<()>>, desktop_child: bool) {
+    use tokio::io::AsyncReadExt;
+
+    tokio::select! {
+        _ = async {
+            if tokio::signal::ctrl_c().await.is_err() {
+                std::future::pending::<()>().await;
+            }
+        } => {}
+        _ = async {
+            if let Some(tray) = tray {
+                let _ = tray.await;
+            } else {
+                std::future::pending::<()>().await;
+            }
+        } => {}
+        _ = async {
+            if desktop_child {
+                let _ = tokio::io::stdin().read(&mut [0]).await;
+            } else {
+                std::future::pending::<()>().await;
+            }
+        } => {}
+    }
 }

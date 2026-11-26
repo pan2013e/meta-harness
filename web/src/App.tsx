@@ -2,6 +2,7 @@ import { useEffect, useState } from "react";
 import { KeyRound, Loader2, X } from "lucide-react";
 import { ChatPane } from "./components/chat/ChatPane";
 import { DiffReviewModal } from "./components/modals/DiffReviewModal";
+import { FilePreviewModal } from "./components/modals/FilePreviewModal";
 import { FolderPickerModal } from "./components/modals/FolderPickerModal";
 import { MemoryModal } from "./components/modals/MemoryModal";
 import { SettingsDialog } from "./components/modals/SettingsDialog";
@@ -18,10 +19,12 @@ export function App() {
     settingsOpen,
     memoryModalOpen,
     diffModalOpen,
+    filePreview,
     setSettingsOpen,
     setFolderModalOpen,
     setMemoryModalOpen,
     setDiffModalOpen,
+    setFilePreview,
     createAndSelectProject,
     toggleSidebar,
     clearError,
@@ -121,6 +124,9 @@ export function App() {
       {settingsOpen && <SettingsDialog onClose={() => setSettingsOpen(false)} />}
       {memoryModalOpen && <MemoryModal onClose={() => setMemoryModalOpen(false)} />}
       {diffModalOpen && <DiffReviewModal onClose={() => setDiffModalOpen(false)} />}
+      {filePreview && (
+        <FilePreviewModal key={JSON.stringify(filePreview)} {...filePreview} onClose={() => setFilePreview(null)} />
+      )}
     </div>
   );
 }

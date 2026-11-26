@@ -2,6 +2,7 @@ import { useEffect, useId, useMemo, useRef, useState } from "react";
 import {
   Check,
   ChevronDown,
+  CircleGauge,
   CornerDownLeft,
   Cpu,
   Gauge,
@@ -13,11 +14,13 @@ import { api } from "../../api/client";
 import { useAppStore } from "../../store/useAppStore";
 import type {
   MemberContextBreakdown,
+  ModelChoiceDetail,
   ModelSelection,
   PermissionPolicy,
+  QuotaSnapshot,
   SessionMember,
 } from "../../types/api";
-import { HarnessAvatar } from "../common/Badges";
+import { HarnessAvatar, QuotaSnapshotSummary } from "../common/Badges";
 import {
   DEFAULT_SLASH_COMMANDS,
   MentionEditor,
@@ -43,9 +46,9 @@ const SLASH_ITEMS: Array<{
 ];
 
 const PERMISSION_LABELS: Record<PermissionPolicy, string> = {
-  worktree_smart: "Worktree-Smart",
+  worktree_smart: "Worktree",
   strict: "Strict",
-  autonomous_sandbox: "Autonomous",
+  autonomous_sandbox: "Auto",
 };
 
 const EFFORT_LABELS: Record<string, string> = {
@@ -104,6 +107,24 @@ function formatCompactTokens(tokens: number): string {
   return `${tokens}`;
 }
 
+function modelContextWindow(model: string | null | undefined, fallback: number): number {
+  return /^gpt-6(?:[.-]|$)/i.test(model ?? "") ? 1_000_000 : fallback;
+}
+
+function formatPercent(pct: number): string {
+  return pct > 0 && pct < 1 ? "<1%" : Math.round(pct) + "%";
+}
+
+function quotaUsed(quota?: QuotaSnapshot): number | null {
+  if (!quota) return null;
+  if ((quota.rate_limited_until ?? 0) > Date.now()) return 100;
+  const remaining = (quota.windows?.length
+    ? quota.windows.map((window) => window.remaining_pct)
+    : [quota.window_5h_remaining_pct, quota.weekly_remaining_pct]
+  ).filter((value): value is number => value != null && Number.isFinite(value));
+  return remaining.length ? Math.max(0, Math.min(100, 100 - Math.min(...remaining))) : null;
+}
+
 export function Composer({
   draftPreset,
   onConsumePreset,
@@ -156,6 +177,8 @@ export function Composer({
   const [modelOverrides, setModelOverrides] = useState<Record<string, ModelSelection>>({});
   const [permOpen, setPermOpen] = useState(false);
   const [contextOpen, setContextOpen] = useState(false);
+  const [quotaOpen, setQuotaOpen] = useState(false);
+  const [draftEstimate, setDraftEstimate] = useState<{ text: string; tokens: number } | null>(null);
   const [contextMemberHandle, setContextMemberHandle] = useState<string | null>(null);
   const editorRef = useRef<MentionEditorHandle | null>(null);
   const modelButtonRef = useRef<HTMLButtonElement | null>(null);
@@ -299,6 +322,19 @@ export function Composer({
   }, [slashQuery, menuDismissed]);
 
   const raw = text.trim();
+  useEffect(() => {
+    if (!raw) return;
+    const controller = new AbortController();
+    const timeout = window.setTimeout(() => {
+      void api.estimateDraftTokens(raw, controller.signal).then(({ tokens }) => {
+        if (!controller.signal.aborted) setDraftEstimate({ text: raw, tokens });
+      }).catch(() => undefined);
+    }, 160);
+    return () => {
+      controller.abort();
+      window.clearTimeout(timeout);
+    };
+  }, [raw]);
   const compactMatch = raw.match(COMPACT_COMMAND);
   const routingText = compactMatch ? compactMatch[1]?.trim() ?? "" : raw;
   const explicitMentions = useMemo(() => routingMentions(routingText), [routingText]);
@@ -327,12 +363,13 @@ export function Composer({
   const openModelDraft = targetKey && openMenu ? openMenu.edits[targetKey] ?? selectedSettings : null;
 
   const liveOptions = targetMember ? memberOptions[targetMember.handle] : undefined;
-  const discoveredEfforts = liveOptions?.find(
+  const liveEffort = liveOptions?.find(
     (option) =>
       option.category === "thought_level" ||
       option.category === "reasoning_effort" ||
       ["reasoning_effort", "thought_level", "effort"].includes(option.id)
-  )?.choices;
+  );
+  const discoveredEfforts = liveEffort?.choices;
   const defaultEffortChoices = discoveredEfforts ?? targetCatalog?.efforts ?? [];
 
   const modelDetailsForTarget = useMemo(() => {
@@ -344,12 +381,16 @@ export function Composer({
       ? targetCatalog.model_details
       : (targetCatalog?.models ?? []).map((model) => ({
           ...model,
+          default_effort: null,
           supported_efforts: targetCatalog?.efforts ?? [],
         }));
-    const merged = new Map(catalogModels.map((model) => [model.value, model]));
+    const merged = new Map<string, Pick<ModelChoiceDetail, "value" | "label" | "default_effort" | "supported_efforts">>(
+      catalogModels.map((model) => [model.value, model])
+    );
     for (const model of discovered) {
       merged.set(model.value, {
         ...model,
+        default_effort: merged.get(model.value)?.default_effort ?? null,
         supported_efforts: merged.get(model.value)?.supported_efforts ?? discoveredEfforts ?? targetCatalog?.efforts ?? [],
       });
     }
@@ -358,6 +399,7 @@ export function Composer({
         merged.set(model, {
           value: model,
           label: model,
+          default_effort: null,
           supported_efforts: discoveredEfforts ?? targetCatalog?.efforts ?? [],
         });
       }
@@ -380,9 +422,22 @@ export function Composer({
   const effortChoices = openModelDraft
     ? [...effortsForModel(openModelDraft.model)].sort((left, right) => effortRank(left.value) - effortRank(right.value))
     : [];
-  const effortIndex = effortChoices.findIndex((choice) => choice.value === openModelDraft?.effort) + 1;
-  const currentEffort = effortChoices[effortIndex - 1];
-  const effortLabel = currentEffort ? EFFORT_LABELS[currentEffort.value] ?? currentEffort.label : "Default";
+  const draftModel = openModelDraft?.model ?? inheritedModel;
+  const defaultEffortChoicesInOrder = [
+    targetMember?.active_effort,
+    targetDefaults?.default_effort,
+    modelDetailsForTarget.find((model) => model.value === draftModel)?.default_effort,
+    draftModel === inheritedModel ? liveEffort?.current_value : null,
+  ];
+  const inheritedEffort = defaultEffortChoicesInOrder.find((value) =>
+    effortChoices.some((choice) => choice.value === value)
+  );
+  const effortIndex = effortChoices.findIndex((choice) => choice.value === (openModelDraft?.effort ?? inheritedEffort));
+  const currentEffort = effortChoices[effortIndex];
+  const effortsLabel = currentEffort ? EFFORT_LABELS[currentEffort.value] ?? currentEffort.label : null;
+  const effortLabel = openModelDraft?.effort && effortsLabel
+    ? effortsLabel
+    : effortsLabel ? "Default · " + effortsLabel : "Harness default";
   const selectedEffortLabel = selectedSettings.effort
     ? EFFORT_LABELS[selectedSettings.effort] ?? selectedSettings.effort
     : null;
@@ -391,6 +446,7 @@ export function Composer({
     setModelMenu(null);
     setPermOpen(false);
     setContextOpen(false);
+    setQuotaOpen(false);
   };
 
   const editModelSettings = (settings: ModelSelection) => {
@@ -410,10 +466,9 @@ export function Composer({
     activeSession?.permission_policy ?? pendingPermissionPolicy;
 
   // Compute displayed Context Breakdown + live Draft tokens
-  const draftTokens = useMemo(
-    () => (text.trim().length > 0 ? Math.max(1, Math.ceil(text.trim().length / 4)) : 0),
-    [text]
-  );
+  const draftTokens = draftEstimate?.text === raw
+    ? draftEstimate.tokens
+    : Math.ceil(Array.from(raw).length / 4);
 
   const contextMembersList: MemberContextBreakdown[] = useMemo(() => {
     if (sessionContext?.members && sessionContext.members.length > 0) {
@@ -422,7 +477,8 @@ export function Composer({
     return availableMembers.map((m) => ({
       handle: m.handle,
       adapter_id: m.adapter_id,
-      model: m.active_model ?? adapterDefaults[m.adapter_id]?.default_model ?? null,
+      model: m.active_model ?? adapterDefaults[m.adapter_id]?.default_model ??
+        adapterCatalogs[m.adapter_id]?.model_details?.find((model) => model.is_default)?.value ?? null,
       used_tokens: 280 + memoryJobs.length * 45 + memoryFacts.length * 25 + 160,
       context_window: adapterCatalogs[m.adapter_id]?.default_context_window ?? 200_000,
       is_exact: false,
@@ -456,8 +512,18 @@ export function Composer({
   const contextTotalWithDraft = activeContextBreakdown
     ? activeContextBreakdown.used_tokens + draftTokens
     : draftTokens;
-  const contextWindow = Math.max(activeContextBreakdown?.context_window ?? 200_000, 1);
-  const contextPct = Math.min(100, Math.round((contextTotalWithDraft / contextWindow) * 100));
+  const contextMember = availableMembers.find((member) => member.handle === activeContextBreakdown?.handle);
+  const contextModel = (contextMember && modelOverrides[recipientKey(contextMember)]?.model) ??
+    activeContextBreakdown?.model;
+  const reportedContext = activeContextBreakdown?.context_window ?? 200_000;
+  const sameModel = contextModel === activeContextBreakdown?.model;
+  const modelFallback = contextMember ? adapterCatalogs[contextMember.adapter_id]?.default_context_window : undefined;
+  const contextWindow = Math.max(activeContextBreakdown?.is_exact && sameModel
+    ? reportedContext : modelContextWindow(contextModel, sameModel ? reportedContext : modelFallback ?? 200_000), 1);
+  const contextPct = Math.min(100, (contextTotalWithDraft / contextWindow) * 100);
+  const quotaIds = [...new Set(recipients.map((member) => member.adapter_id))];
+  const reportedQuotaUse = quotaIds.map((id) => quotaUsed(quotas[id])).filter((value): value is number => value !== null);
+  const usage = reportedQuotaUse.length ? Math.max(...reportedQuotaUse) : null;
 
   const handleSend = async () => {
     if (!raw || sending) return;
@@ -830,7 +896,7 @@ export function Composer({
                                 })}
                               </div>
                               {effortChoices.length > 0 && (
-                                <label className="block border-t border-line px-3 pt-3 pb-1.5">
+                                <div className="border-t border-line px-3 pt-3 pb-1.5">
                                   <span className="flex items-center justify-between gap-2">
                                     <span className="font-medium text-ink-soft">Reasoning effort</span>
                                     <span className="text-brand-ink">{effortLabel}</span>
@@ -840,16 +906,24 @@ export function Composer({
                                     aria-label="Reasoning effort"
                                     aria-valuetext={effortLabel}
                                     min={0}
-                                    max={effortChoices.length}
+                                    max={effortChoices.length - 1}
                                     step={1}
-                                    value={effortIndex}
+                                    value={Math.max(0, effortIndex)}
                                     onChange={(event) => editModelSettings({
                                       ...openModelDraft,
-                                      effort: effortChoices[event.currentTarget.valueAsNumber - 1]?.value ?? null,
+                                      effort: effortChoices[event.currentTarget.valueAsNumber]?.value ?? null,
                                     })}
-                                    className="mt-1.5 block h-5 w-full rounded cursor-pointer accent-brand focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-brand-ink"
+                                    className={`mt-1.5 block h-5 w-full rounded cursor-pointer accent-brand focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-brand-ink ${effortIndex < 0
+                                      ? "[&::-webkit-slider-thumb]:opacity-0 [&::-moz-range-thumb]:opacity-0"
+                                      : ""}`}
                                   />
-                                </label>
+                                  {openModelDraft.effort && (
+                                    <button type="button" className="text-[10px] text-ink-muted hover:text-brand-ink"
+                                      onClick={() => editModelSettings({ ...openModelDraft, effort: null })}>
+                                      Reset to default
+                                    </button>
+                                  )}
+                                </div>
                               )}
                             </>
                           )}
@@ -900,13 +974,13 @@ export function Composer({
                         [
                           [
                             "worktree_smart",
-                            "Worktree-Smart",
+                            "Worktree",
                             "Auto-allow worktree edits; prompt shell",
                           ],
                           ["strict", "Strict", "Prompt all file edits & shell"],
                           [
                             "autonomous_sandbox",
-                            "Autonomous",
+                            "Auto",
                             "Auto-allow inside isolated worktree",
                           ],
                         ] as const
@@ -938,6 +1012,43 @@ export function Composer({
             </div>
 
             <div className="ml-auto flex max-w-full flex-wrap items-center justify-end gap-2 whitespace-nowrap">
+              {quotaIds.length > 0 && (
+                <div className="@min-[48rem]:relative">
+                  <button
+                    type="button"
+                    aria-label="Subscription usage"
+                    aria-expanded={quotaOpen}
+                    title={usage === null ? "Subscription usage unavailable" : formatPercent(usage) + " of subscription used"}
+                    onClick={() => {
+                      const next = !quotaOpen;
+                      closeAllMenus();
+                      setQuotaOpen(next);
+                    }}
+                    className="inline-flex items-center gap-1.5 rounded-lg border border-line bg-elevated px-2 py-1 font-mono text-[11px] text-ink-muted hover:bg-hover hover:text-ink"
+                  >
+                    {usage === null
+                      ? <CircleGauge className="h-[15px] w-[15px]" />
+                      : <ContextRing pct={usage} accent="var(--mh-pos)" />}
+                    <span>{usage === null ? "—" : formatPercent(usage)}</span>
+                  </button>
+                  {quotaOpen && (
+                    <>
+                      <div className="fixed inset-0 z-20" onClick={closeAllMenus} />
+                      <div className="absolute bottom-full right-0 z-30 mb-2 w-64 max-w-full max-h-64 space-y-3 overflow-y-auto rounded-xl border border-line-strong bg-panel p-3 text-xs whitespace-normal shadow-2xl @min-[48rem]:max-w-none">
+                        <h3 className="font-semibold text-ink">Subscription usage</h3>
+                        {quotaIds.map((id) => (
+                          <div key={id} className="space-y-1.5">
+                            <p className="font-medium text-ink-soft">{adapters[id]?.display_name ?? id}</p>
+                            {quotas[id] ? <QuotaSnapshotSummary quota={quotas[id]} compact /> : (
+                              <p className="text-[10px] text-ink-muted">Usage unavailable</p>
+                            )}
+                          </div>
+                        ))}
+                      </div>
+                    </>
+                  )}
+                </div>
+              )}
               {/* Context Usage Ring & Composition Popover (anchored inward right-0) */}
               {activeContextBreakdown && (
                 <div className="@min-[48rem]:relative">
@@ -953,7 +1064,7 @@ export function Composer({
                   >
                     <ContextRing pct={contextPct} />
                     <span>
-                      {contextPct}% · {formatCompactTokens(contextTotalWithDraft)}
+                      {formatPercent(contextPct)} · {formatCompactTokens(contextTotalWithDraft)}
                     </span>
                   </button>
 
@@ -1041,11 +1152,11 @@ export function Composer({
   );
 }
 
-function ContextRing({ pct }: { pct: number }) {
+function ContextRing({ pct, accent = "var(--mh-brand)" }: { pct: number; accent?: string }) {
   const r = 5.5;
   const circ = 2 * Math.PI * r;
   const offset = circ - (Math.max(0, Math.min(100, pct)) / 100) * circ;
-  const stroke = pct >= 85 ? "#ef4444" : pct >= 60 ? "#f59e0b" : "#6366f1";
+  const stroke = pct >= 85 ? "var(--mh-neg)" : pct >= 60 ? "var(--mh-warn)" : accent;
   return (
     <svg width="15" height="15" viewBox="0 0 16 16" aria-hidden="true">
       <circle

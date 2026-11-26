@@ -113,9 +113,10 @@ async fn resolve_pty_cwd(
 
 fn build_utf8_shell_command(cwd: &std::path::Path) -> CommandBuilder {
     #[cfg(windows)]
-    let (prog, args): (String, Vec<String>) =
-        if let Ok(ps) = which::which("pwsh.exe").or_else(|_| which::which("powershell.exe")) {
-            (
+    let (prog, args): (String, Vec<String>) = if let Ok(ps) =
+        which::which("pwsh.exe").or_else(|_| which::which("powershell.exe"))
+    {
+        (
                 ps.to_string_lossy().into_owned(),
                 vec![
                     "-NoLogo".into(),
@@ -130,6 +131,10 @@ function global:prompt {
     $label = & $global:MetaHarnessOriginalPrompt
     if ($PWD.Provider.Name -eq 'FileSystem') {
         [Console]::Write([string][char]27 + ']9;9;' + $PWD.ProviderPath + [char]7)
+        if ($label -is [string] -and $PWD.ProviderPath -match '[\\/]\.meta-harness[\\/]worktrees[\\/][^\\/]+[\\/](?<tree>_integration|_exec_[^\\/]+)(?<tail>[\\/].*)?$') {
+            $short = if ($Matches.tree -eq '_integration') { 'Integration' } else { '@' + $Matches.tree.Substring(6) }
+            $label = $label.Replace($PWD.Path, $short + $Matches.tail)
+        }
     }
     $label
 }
@@ -137,12 +142,12 @@ Clear-Host"#
                         .into(),
                 ],
             )
-        } else {
-            (
-                "cmd.exe".into(),
-                vec!["/K".into(), "chcp 65001 >nul".into()],
-            )
-        };
+    } else {
+        (
+            "cmd.exe".into(),
+            vec!["/K".into(), "chcp 65001 >nul".into()],
+        )
+    };
 
     #[cfg(not(windows))]
     let (prog, args): (String, Vec<String>) = (

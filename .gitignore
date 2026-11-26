@@ -5,6 +5,10 @@
 # Frontend / Node
 /web/node_modules/
 /web/dist/
+/web/public/third-party-licenses.txt
+/desktop/node_modules/
+/desktop/staging/
+/dist/
 npm-debug.log*
 pnpm-debug.log*
 yarn-error.log*

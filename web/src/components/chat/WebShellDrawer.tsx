@@ -2,11 +2,11 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import { FitAddon } from "@xterm/addon-fit";
 import { Terminal as XTerm } from "@xterm/xterm";
 import "@xterm/xterm/css/xterm.css";
-import { Plus, Terminal, Trash2, X } from "lucide-react";
+import { Plus, Terminal, X } from "lucide-react";
 import { ptyWsUrl } from "../../api/client";
 import { useAppStore } from "../../store/useAppStore";
 import type { ThemeId } from "../../types/api";
-import { terminalDirectory } from "./terminalPaths";
+import { terminalDirectory, workspacePathLabel } from "./terminalPaths";
 
 interface TerminalTab {
   id: string;
@@ -55,7 +55,6 @@ function TerminalTabPane({
   active,
   theme,
   heightPx,
-  clearSeq,
   onStatusChange,
   onCwdChange,
 }: {
@@ -64,14 +63,12 @@ function TerminalTabPane({
   active: boolean;
   theme: ThemeId;
   heightPx: number;
-  clearSeq: number;
   onStatusChange: (tabId: string, status: TerminalTab["status"]) => void;
   onCwdChange: (tabId: string, cwd: string) => void;
 }) {
   const hostRef = useRef<HTMLDivElement | null>(null);
   const termRef = useRef<XTerm | null>(null);
-  const fitRef = useRef<FitAddon | null>(null);
-  const wsRef = useRef<WebSocket | null>(null);
+  const resizeRef = useRef<(() => void) | null>(null);
   const [fallbackMsg, setFallbackMsg] = useState<string | null>(null);
 
   const xtermTheme = useMemo(() => getXtermTheme(theme), [theme]);
@@ -81,13 +78,6 @@ function TerminalTabPane({
       termRef.current.options.theme = xtermTheme;
     }
   }, [xtermTheme]);
-
-  useEffect(() => {
-    if (clearSeq > 0) {
-      termRef.current?.clear();
-      termRef.current?.focus();
-    }
-  }, [clearSeq]);
 
   useEffect(() => {
     const host = hostRef.current;
@@ -127,36 +117,40 @@ function TerminalTabPane({
         // ignore layout measurements in minimal headless test DOM
       }
       termRef.current = term;
-      fitRef.current = fitAddon;
 
       const cols = Math.max(20, term.cols || 80);
       const rows = Math.max(6, term.rows || 24);
+      let remoteCols = cols;
+      let remoteRows = rows;
       let connected = false;
       let exited = false;
 
+      const sendResize = () => {
+        if (!fitAddon || !term || disposed || !host.clientWidth || !host.clientHeight) return;
+        try {
+          fitAddon.fit();
+          const cols = Math.max(20, term.cols);
+          const rows = Math.max(6, term.rows);
+          if (ws?.readyState === WebSocket.OPEN && (cols !== remoteCols || rows !== remoteRows)) {
+            ws.send(JSON.stringify({ type: "resize", cols, rows }));
+            remoteCols = cols;
+            remoteRows = rows;
+          }
+        } catch {
+          // The terminal can be between layouts while its drawer is toggled.
+        }
+      };
+      resizeRef.current = sendResize;
+
       if (typeof WebSocket !== "undefined") {
         ws = new WebSocket(ptyWsUrl(sessionId, cols, rows, tab.target));
-        wsRef.current = ws;
 
         ws.onopen = () => {
           if (disposed || !term) return;
           connected = true;
           term.options.disableStdin = false;
           onStatusChange(tab.id, "open");
-          if (fitAddon && term) {
-            try {
-              fitAddon.fit();
-              ws?.send(
-                JSON.stringify({
-                  type: "resize",
-                  cols: Math.max(20, term.cols || 80),
-                  rows: Math.max(6, term.rows || 24),
-                })
-              );
-            } catch {
-              // ignore
-            }
-          }
+          sendResize();
         };
 
         ws.onmessage = (ev) => {
@@ -199,24 +193,6 @@ function TerminalTabPane({
         }
       });
 
-      const sendResize = () => {
-        if (!fitAddon || !term || disposed) return;
-        try {
-          fitAddon.fit();
-          if (ws?.readyState === WebSocket.OPEN) {
-            ws.send(
-              JSON.stringify({
-                type: "resize",
-                cols: Math.max(20, term.cols || 80),
-                rows: Math.max(6, term.rows || 24),
-              })
-            );
-          }
-        } catch {
-          // ignore
-        }
-      };
-
       if (typeof ResizeObserver !== "undefined") {
         observer = new ResizeObserver(() => sendResize());
         observer.observe(host);
@@ -229,8 +205,7 @@ function TerminalTabPane({
         ws?.close();
         term?.dispose();
         termRef.current = null;
-        fitRef.current = null;
-        wsRef.current = null;
+        resizeRef.current = null;
       };
     } catch {
       setFallbackMsg("Interactive WebShell requires canvas support in a live browser.");
@@ -241,24 +216,8 @@ function TerminalTabPane({
   useEffect(() => {
     if (!active) return;
     const raf = window.requestAnimationFrame(() => {
-      try {
-        fitRef.current?.fit();
-        if (
-          wsRef.current?.readyState === WebSocket.OPEN &&
-          termRef.current
-        ) {
-          wsRef.current.send(
-            JSON.stringify({
-              type: "resize",
-              cols: Math.max(20, termRef.current.cols || 80),
-              rows: Math.max(6, termRef.current.rows || 24),
-            })
-          );
-        }
-        termRef.current?.focus();
-      } catch {
-        // ignore
-      }
+      resizeRef.current?.();
+      termRef.current?.focus();
     });
     return () => window.cancelAnimationFrame(raf);
   }, [active, heightPx]);
@@ -288,21 +247,29 @@ export function WebShellDrawer({
   sessionId,
   defaultCwd,
   shared,
+  visible,
 }: {
   sessionId: string;
   defaultCwd: string;
   shared: boolean;
+  visible: boolean;
 }) {
   const { members, probes, theme, setShellOpen } = useAppStore();
   const [heightPx, setHeightPx] = useState(260);
   const [newMenuOpen, setNewMenuOpen] = useState(false);
-  const [clearCounter, setClearCounter] = useState<Record<string, number>>({});
   const seqRef = useRef(1);
   const workspaceLabel = shared ? "Workspace" : "Integration";
   const [tabs, setTabs] = useState<TerminalTab[]>([
     { id: "tab_1", label: workspaceLabel, target: null, status: "connecting" },
   ]);
   const [activeTabId, setActiveTabId] = useState("tab_1");
+  useEffect(() => {
+    if (visible && tabs.length === 0) {
+      const id = `tab_${++seqRef.current}`;
+      setTabs([{ id, label: workspaceLabel, target: null, status: "connecting" }]);
+      setActiveTabId(id);
+    }
+  }, [visible, tabs.length, workspaceLabel]);
 
   const installedIds = useMemo(
     () => new Set(probes.filter((p) => p.installed).map((p) => p.adapter_id)),
@@ -322,11 +289,11 @@ export function WebShellDrawer({
 
   const closeTab = (id: string) => {
     const next = tabs.filter((tab) => tab.id !== id);
+    setTabs(next);
     if (next.length === 0) {
       setShellOpen(false);
       return;
     }
-    setTabs(next);
     if (activeTabId === id) setActiveTabId(next[next.length - 1].id);
   };
 
@@ -352,8 +319,9 @@ export function WebShellDrawer({
   return (
     <section
       aria-label="In-web session shell"
+      hidden={!visible}
       style={{ height: `${heightPx}px` }}
-      className="relative border-t border-line bg-inset flex flex-col shrink-0"
+      className={`relative border-t border-line bg-inset flex-col shrink-0 ${visible ? "flex" : "hidden"}`}
     >
       {/* Top Drag Resize Handle */}
       <div
@@ -463,26 +431,11 @@ export function WebShellDrawer({
             className="hidden lg:inline text-[10.5px] font-mono text-ink-muted truncate max-w-[260px]"
             title={targetLabel}
           >
-            {targetLabel}
+            {workspacePathLabel(targetLabel)}
           </span>
-          {activeTab && (
-            <button
-              type="button"
-              title="Clear active terminal"
-              onClick={() =>
-                setClearCounter((prev) => ({
-                  ...prev,
-                  [activeTab.id]: (prev[activeTab.id] ?? 0) + 1,
-                }))
-              }
-              className="p-1 rounded-md text-ink-muted hover:text-ink hover:bg-hover transition-colors"
-            >
-              <Trash2 className="w-3.5 h-3.5" />
-            </button>
-          )}
           <button
             type="button"
-            aria-label="Close web shell"
+            aria-label="Hide terminal"
             onClick={() => setShellOpen(false)}
             className="p-1 rounded-md text-ink-muted hover:text-ink hover:bg-hover transition-colors"
           >
@@ -497,10 +450,9 @@ export function WebShellDrawer({
             key={tab.id}
             sessionId={sessionId}
             tab={tab}
-            active={tab.id === activeTab?.id}
+            active={visible && tab.id === activeTab?.id}
             theme={theme}
             heightPx={heightPx}
-            clearSeq={clearCounter[tab.id] ?? 0}
             onCwdChange={(tabId, cwd) => setTabs((prev) => prev.map(
               (item) => item.id === tabId && item.cwd !== cwd ? { ...item, cwd } : item
             ))}

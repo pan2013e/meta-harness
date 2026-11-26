@@ -5,6 +5,7 @@ import {
   ChevronRight,
   Crown,
   HardDrive,
+  Info,
   Palette,
   Plus,
   RefreshCw,
@@ -23,6 +24,7 @@ import { SharedAntigravityUsage } from "./SharedAntigravityUsage";
 import { PersonaModelFields, type PersonaModel } from "./PersonaModelFields";
 import { GlobalPersonas } from "./GlobalPersonas";
 import { SettingsBackup } from "./SettingsBackup";
+import { version } from "../../../package.json";
 
 function formatBytes(bytes: number): string {
   if (!Number.isFinite(bytes) || bytes <= 0) return "0 B";
@@ -43,7 +45,7 @@ const PERMISSION_OPTIONS: Array<{
 }> = [
   {
     value: "worktree_smart",
-    label: "Worktree-Smart",
+    label: "Worktree",
     desc: "Auto-allow reads/writes inside worktree; prompt shell commands",
   },
   {
@@ -53,7 +55,7 @@ const PERMISSION_OPTIONS: Array<{
   },
   {
     value: "autonomous_sandbox",
-    label: "Autonomous Sandbox",
+    label: "Auto",
     desc: "Auto-allow local worktree & non-destructive tools",
   },
 ];
@@ -61,7 +63,7 @@ const PERMISSION_OPTIONS: Array<{
 export function SettingsDialog({ onClose }: { onClose: () => void }) {
   const dialog = useRef<HTMLDialogElement>(null);
   const [section, setSection] = useState<
-    "harnesses" | "session" | "personas" | "storage" | "appearance"
+    "harnesses" | "session" | "personas" | "storage" | "appearance" | "about"
   >("harnesses");
   const [saving, setSaving] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -226,9 +228,6 @@ export function SettingsDialog({ onClose }: { onClose: () => void }) {
             <h1 id="settings-title" className="text-base font-semibold tracking-tight">
               Settings
             </h1>
-            <p className="text-[11px] text-ink-muted">
-              Configure harnesses, default models &amp; reasoning effort, storage, session policies, and theme.
-            </p>
           </div>
           <button
             type="button"
@@ -248,11 +247,12 @@ export function SettingsDialog({ onClose }: { onClose: () => void }) {
           >
             {(
               [
-                ["harnesses", "Harnesses & Models", Terminal],
-                ["session", "Session & Personas", Sliders],
-                ["personas", "Global Personas", UserPlus],
-                ["storage", "Storage & Data", HardDrive],
                 ["appearance", "Appearance", Palette],
+                ["harnesses", "Harnesses & Models", Terminal],
+                ["personas", "Global Personas", UserPlus],
+                ["session", "Session", Sliders],
+                ["storage", "Storage & Data", HardDrive],
+                ["about", "About", Info],
               ] as const
             ).map(([id, label, Icon]) => (
               <button
@@ -280,6 +280,33 @@ export function SettingsDialog({ onClose }: { onClose: () => void }) {
               >
                 {error ?? errorBanner}
               </p>
+            )}
+
+            {section === "about" && (
+              <section className="space-y-5 text-sm">
+                <div className="flex items-center gap-3">
+                  <img src="/meta-harness.svg" alt="" className="h-12 w-12" />
+                  <div>
+                    <h2 className="text-base font-semibold">Meta-Harness</h2>
+                    <p className="text-xs text-ink-muted">Version {version}</p>
+                  </div>
+                </div>
+                <div className="space-y-1">
+                  <p>Created by Zhiyuan Pan</p>
+                  <p className="text-ink-muted">© 2026 Zhiyuan Pan</p>
+                  <a className="text-brand-ink underline" href="https://github.com/pan2013e/meta-harness/blob/main/LICENSE" target="_blank" rel="noreferrer">MIT License</a>
+                </div>
+                <div className="space-y-2 border-t border-line pt-4">
+                  <h3 className="font-medium">Open-source software</h3>
+                  <ul className="space-y-1 text-xs text-ink-soft">
+                    <li>Rust, Tokio, Axum and SQLite</li>
+                    <li>React, Tailwind CSS and xterm.js</li>
+                    <li>Monaco Editor and PDF.js</li>
+                    <li>Electron and Chromium in the desktop app</li>
+                  </ul>
+                  <a className="inline-block text-xs text-brand-ink underline" href="/third-party-licenses.txt" download>Third-party license notices</a>
+                </div>
+              </section>
             )}
 
             {section === "storage" && (

@@ -17,3 +17,17 @@ export function terminalDirectory(value: string, osc: 7 | 9): string | null {
   if (/[\u0000-\u001f\u007f]/.test(path)) return null;
   return /^(?:\/|[a-z]:[\\/]|\\\\)/i.test(path) ? path : null;
 }
+
+export function workspacePathLabel(path: string): string {
+  const segments = path.split(/[\\/]+/).filter(Boolean);
+  const worktrees = segments.lastIndexOf("worktrees");
+  if (worktrees >= 1 && segments[worktrees - 1] === ".meta-harness") {
+    const [session, worktree, ...relative] = segments.slice(worktrees + 1);
+    if (session && worktree) {
+      const name = worktree === "_integration" ? "Integration" : worktree.replace(/^_exec_/, "@");
+      return [name, ...relative].join("/");
+    }
+  }
+  if (segments.length > 4) return "…/" + segments.slice(-3).join("/");
+  return path;
+}

@@ -1,0 +1,39 @@
+name: Release build
+
+on:
+  workflow_dispatch:
+    inputs:
+      cli_only:
+        description: Build only the native binary
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+jobs:
+  release:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: |
+            web/package-lock.json
+            desktop/package-lock.json
+      - run: rustup update stable
+      - run: node scripts/build.mjs ${{ inputs.cli_only && '--cli-only' || '' }}
+      - uses: actions/upload-artifact@v7
+        with:
+          name: meta-harness-${{ runner.os }}-${{ runner.arch }}
+          path: |
+            dist/cli
+            dist/desktop/*.exe
+            dist/desktop/*.zip
+            dist/desktop/*.dmg

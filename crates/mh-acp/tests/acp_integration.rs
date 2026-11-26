@@ -124,7 +124,7 @@ async fn acp_config_options_diff_capture_and_cancel() {
     *managed.active_turn_id.write().await = Some("turn_1".into());
     let (m, e) = managed
         .client
-        .apply_model_and_effort(Some("mock-pro"), Some("high"))
+        .apply_model_and_effort(Some("mock-pro"), Some("high"), None)
         .await;
     assert_eq!(m.as_deref(), Some("mock-pro"));
     assert_eq!(e.as_deref(), Some("high"));

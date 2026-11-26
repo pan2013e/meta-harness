@@ -1,0 +1,66 @@
+{
+  "name": "meta-harness",
+  "productName": "Meta-Harness",
+  "version": "0.1.0",
+  "description": "Local-first multi-agent ACP workspace",
+  "author": "Zhiyuan Pan",
+  "license": "MIT",
+  "private": true,
+  "main": "main.cjs",
+  "scripts": {
+    "pack": "electron-builder --dir --publish never",
+    "release": "electron-builder --publish never"
+  },
+  "devDependencies": {
+    "electron": "45.5.0",
+    "electron-builder": "26.18.1"
+  },
+  "build": {
+    "appId": "com.pan2013e.meta-harness",
+    "directories": {
+      "output": "../dist/desktop"
+    },
+    "files": [
+      "main.cjs",
+      "package.json"
+    ],
+    "icon": "../assets/icon.png",
+    "extraResources": [
+      {
+        "from": "staging",
+        "to": "bin",
+        "filter": [
+          "meta-harness*"
+        ]
+      },
+      {
+        "from": "../assets/icon.png",
+        "to": "icon.png"
+      },
+      {
+        "from": "../LICENSE",
+        "to": "LICENSE.txt"
+      }
+    ],
+    "win": {
+      "target": [
+        "nsis",
+        "zip"
+      ],
+      "icon": "../assets/icon.ico"
+    },
+    "mac": {
+      "target": [
+        "dmg",
+        "zip"
+      ],
+      "category": "public.app-category.developer-tools"
+    },
+    "linux": {
+      "target": [
+        "AppImage"
+      ],
+      "category": "Development"
+    }
+  }
+}

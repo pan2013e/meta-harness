@@ -342,6 +342,7 @@ impl AcpClient {
         &self,
         target_model: Option<&str>,
         target_effort: Option<&str>,
+        model_default_effort: Option<&str>,
     ) -> (Option<String>, Option<String>) {
         let opts = self.config_options.read().await.clone();
         let defaults = self.session_defaults.read().await.clone();
@@ -366,17 +367,19 @@ impl AcpClient {
         let opts = self.config_options.read().await.clone();
         let effort_categories = ["thought_level", "reasoning_effort"];
         let effort_ids = ["reasoning_effort", "thought_level", "effort"];
-        if let Some(req_effort) = target_effort.or_else(|| {
-            // A different model can have a different native default effort.
-            let original = find_option_by_category_or_id(&defaults, &["model"], &["model"])
-                .and_then(|option| option.current_value.as_deref());
-            if applied_model.as_deref() != original {
-                return None;
-            }
-            find_option_by_category_or_id(&defaults, &effort_categories, &effort_ids)
-                .and_then(|option| option.current_value.as_deref())
-        }) && let Some(opt) =
-            find_option_by_category_or_id(&opts, &effort_categories, &effort_ids)
+        if let Some(req_effort) = target_effort
+            .or_else(|| {
+                // A different model can have a different native default effort.
+                let original = find_option_by_category_or_id(&defaults, &["model"], &["model"])
+                    .and_then(|option| option.current_value.as_deref());
+                if applied_model.as_deref() != original {
+                    return None;
+                }
+                find_option_by_category_or_id(&defaults, &effort_categories, &effort_ids)
+                    .and_then(|option| option.current_value.as_deref())
+            })
+            .or(model_default_effort.filter(|_| applied_model.is_some()))
+            && let Some(opt) = find_option_by_category_or_id(&opts, &effort_categories, &effort_ids)
         {
             let matched = match_choice(&opt.choices, req_effort).unwrap_or(req_effort);
             if opt.current_value.as_deref() == Some(matched)

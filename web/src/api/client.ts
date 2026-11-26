@@ -100,6 +100,8 @@ export function ptyWsUrl(
 }
 
 export const api = {
+  estimateDraftTokens: (text: string, signal: AbortSignal) =>
+    apiFetch<{ tokens: number }>("/api/context/estimate", { method: "POST", body: JSON.stringify({ text }), signal }),
   authStatus: () =>
     apiFetch<{ required: boolean; authenticated: boolean }>("/api/auth/status"),
   createAuthSession: (token: string) =>

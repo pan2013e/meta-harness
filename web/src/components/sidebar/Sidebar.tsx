@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import {
   Archive,
   ArchiveRestore,
@@ -8,7 +8,6 @@ import {
   FolderGit2,
   FolderOpen,
   GitBranch,
-  Layers,
   MessageSquare,
   MessageSquarePlus,
   MoreHorizontal,
@@ -44,6 +43,10 @@ export function Sidebar() {
   const [archivedOpen, setArchivedOpen] = useState(false);
   const [editingSessionId, setEditingSessionId] = useState<string | null>(null);
   const [editingTitle, setEditingTitle] = useState("");
+  const [deleteTarget, setDeleteTarget] = useState<{ id: string; title: string } | null>(null);
+  const [deleting, setDeleting] = useState(false);
+  const [deleteError, setDeleteError] = useState<string | null>(null);
+  const deleteDialog = useRef<HTMLDialogElement>(null);
   const [contextMenu, setContextMenu] = useState<{
     sessionId: string;
     x: number;
@@ -58,6 +61,25 @@ export function Sidebar() {
     window.addEventListener("keydown", onEscape);
     return () => window.removeEventListener("keydown", onEscape);
   }, [contextMenu]);
+
+  useEffect(() => {
+    if (deleteTarget && !deleteDialog.current?.open) deleteDialog.current?.showModal();
+  }, [deleteTarget]);
+
+  const confirmDelete = async () => {
+    if (!deleteTarget || deleting) return;
+    setDeleting(true);
+    setDeleteError(null);
+    try {
+      await deleteSessionById(deleteTarget.id);
+      deleteDialog.current?.close();
+      setDeleteTarget(null);
+    } catch (error) {
+      setDeleteError(error instanceof Error ? error.message : String(error));
+    } finally {
+      setDeleting(false);
+    }
+  };
 
   if (sidebarCollapsed) {
     return null;
@@ -100,9 +122,7 @@ export function Sidebar() {
       {/* Brand Header */}
       <div className="px-4 h-14 border-b border-line flex items-center justify-between gap-2 shrink-0">
         <div className="flex items-center gap-2.5 min-w-0">
-          <div className="w-7 h-7 rounded-lg bg-brand-soft border border-brand/35 flex items-center justify-center text-brand-ink shrink-0">
-            <Layers className="w-4 h-4" />
-          </div>
+          <img src="/meta-harness.svg" alt="" className="h-7 w-7 shrink-0" />
           <h1 className="text-[13px] font-semibold tracking-tight text-ink truncate">
             Meta-Harness
           </h1>
@@ -174,9 +194,6 @@ export function Sidebar() {
                 >
                   <div className="min-w-0">
                     <div className="font-medium truncate text-ink">Quick Sessions</div>
-                    <div className="text-[10px] font-mono text-ink-muted truncate">
-                      ~/.meta-harness/workspaces
-                    </div>
                   </div>
                   {activeProjectId === null && (
                     <Check className="w-3.5 h-3.5 text-brand-ink shrink-0" />
@@ -455,11 +472,9 @@ export function Sidebar() {
               type="button"
               role="menuitem"
               onClick={() => {
-                const session = contextTarget;
                 setContextMenu(null);
-                if (session && window.confirm(`Permanently delete “${session.title}” and its worktrees?`)) {
-                  runSessionAction(deleteSessionById(session.id));
-                }
+                setDeleteError(null);
+                if (contextTarget) setDeleteTarget({ id: contextTarget.id, title: contextTarget.title });
               }}
               className="w-full flex items-center gap-2 px-2.5 py-1.5 rounded-lg text-left text-neg hover:bg-neg-soft transition-colors"
             >
@@ -468,6 +483,32 @@ export function Sidebar() {
             </button>
           </div>
         </>
+      )}
+      {deleteTarget && (
+        <dialog
+          ref={deleteDialog}
+          aria-labelledby="delete-session-title"
+          aria-describedby="delete-session-description"
+          onClose={() => setDeleteTarget(null)}
+          onCancel={(event) => { if (deleting) event.preventDefault(); }}
+          className="m-auto w-[calc(100%-2rem)] max-w-sm rounded-xl border border-line-strong bg-panel p-5 text-ink shadow-2xl"
+        >
+          <h2 id="delete-session-title" className="font-semibold">Delete session?</h2>
+          <p id="delete-session-description" className="mt-2 break-words text-sm text-ink-soft">
+            “{deleteTarget.title}” and its worktrees will be permanently deleted.
+          </p>
+          {deleteError && <p role="alert" className="mt-3 text-sm text-neg">{deleteError}</p>}
+          <div className="mt-5 flex justify-end gap-2 text-sm">
+            <button type="button" autoFocus disabled={deleting} onClick={() => deleteDialog.current?.close()}
+              className="rounded-lg border border-line bg-elevated px-3 py-1.5 hover:bg-hover">
+              Cancel
+            </button>
+            <button type="button" disabled={deleting} onClick={() => void confirmDelete()}
+              className="rounded-lg bg-neg-soft px-3 py-1.5 font-medium text-neg hover:bg-neg/20 disabled:opacity-50">
+              {deleting ? "Deleting…" : "Delete session"}
+            </button>
+          </div>
+        </dialog>
       )}
     </aside>
   );

@@ -1,7 +1,6 @@
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
-use tokio::process::Command;
 
 use mh_core::{DiffStat, PromoteMode};
 
@@ -81,7 +80,7 @@ pub fn sanitize_ref_component(raw: &str) -> String {
 }
 
 async fn git_output(dir: &Path, args: &[&str]) -> Result<std::process::Output, AcpError> {
-    Ok(Command::new("git")
+    Ok(crate::platform::background_command("git")
         .arg("-C")
         .arg(dunce::simplified(dir))
         .args(args)
@@ -101,7 +100,7 @@ async fn run_git_with_author(
     args: &[&str],
 ) -> Result<(bool, String, String), AcpError> {
     let dir_clean = dunce::simplified(dir);
-    let mut cmd = Command::new("git");
+    let mut cmd = crate::platform::background_command("git");
     cmd.arg("-C").arg(dir_clean).args(args);
 
     // Ensure automated commits succeed even if user hasn't set global git user.name/email in CI
@@ -702,7 +701,7 @@ async fn checked_diff_git(
     snapshot: Option<&Path>,
     args: &[&str],
 ) -> Result<String, AcpError> {
-    let mut command = Command::new("git");
+    let mut command = crate::platform::background_command("git");
     command
         .arg("-C")
         .arg(dunce::simplified(worktree))
@@ -831,7 +830,7 @@ pub async fn promote_session(
                 });
             }
 
-            let mut apply = Command::new("git")
+            let mut apply = crate::platform::background_command("git")
                 .arg("-C")
                 .arg(dunce::simplified(project_root))
                 .args(["apply", "-"])

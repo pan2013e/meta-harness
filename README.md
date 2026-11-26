@@ -88,3 +88,15 @@ meta-harness/
 - **[AGENTS.md](AGENTS.md)** — Mandatory architectural invariants, coding standards, and Windows toolchain instructions for any agent implementing features in this repository.
 - **[docs/SPECIFICATION.md](docs/SPECIFICATION.md)** — End-to-end architecture, Git worktree lifecycle, ACP + MCP switch wire contracts, orchestrator policy, SQLite DDL, and UI layout.
 - **[docs/IMPLEMENTATION_PLAN.md](docs/IMPLEMENTATION_PLAN.md)** — Step-by-step milestone plan (Phase 0 -> Phase 6) with acceptance criteria.
+## Build a desktop release
+
+Install Node.js 24, Git, and the stable Rust toolchain for your OS. On Windows use Visual Studio C++ Build Tools for the MSVC toolchain or put the matching MinGW-w64 tools on PATH for the GNU toolchain. On macOS install the Xcode Command Line Tools.
+
+```sh
+node scripts/build.mjs
+node scripts/build.mjs --cli-only
+```
+
+The full build puts the Electron installer and archive in `dist/desktop` and the standalone native binary in `dist/cli`. Use `--unpacked` to build an unpacked desktop app for local testing. GitHub Actions also offers a **Release build** workflow for Windows and macOS artifacts.
+
+The native release starts in the Windows system tray or macOS menu bar. Choose **Open Meta-Harness** to open it in your browser. Use `--no-tray` for foreground server operation. The Electron app opens in its own window and keeps running in the tray when you close the window. **Quit Meta-Harness** stops the app and its backend. Local packages are unsigned unless signing is configured.

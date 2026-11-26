@@ -37,6 +37,10 @@ pub fn build_router(state: AppState) -> Router {
         .route("/api/fs/list", get(routes::list_fs))
         .route("/api/fs/pick-folder", post(routes::pick_fs_folder))
         .route("/api/adapters", get(routes::list_adapters))
+        .route(
+            "/api/context/estimate",
+            post(routes::estimate_draft_context),
+        )
         .route("/api/adapters/probe", get(routes::probe_adapters))
         .route(
             "/api/settings",

@@ -9,6 +9,7 @@ import {
   Sparkles,
 } from "lucide-react";
 import { api } from "../../api/client";
+import { selectionRangeWithin } from "../../desktop";
 import { useAppStore } from "../../store/useAppStore";
 import type { ChatMessage, DispatchTaskSpec, PendingPermissionView } from "../../types/api";
 import { HarnessAvatar } from "../common/Badges";
@@ -18,14 +19,27 @@ import { TurnActivityTimeline, WaitingForTurn } from "./TurnActivityTimeline";
 interface Props {
   message: ChatMessage;
   consultReplies: ChatMessage[];
+  onQuote?: (sessionId: string, text: string) => void;
 }
 
-export const MessageRow = memo(function MessageRow({ message, consultReplies }: Props) {
+export const MessageRow = memo(function MessageRow({ message, consultReplies, onQuote }: Props) {
   const accent = useAppStore((state) => {
     const member = state.members.find((m) => m.handle === message.sender_id);
     return (member && state.adapters[member.adapter_id]?.accent_color) || "#6366f1";
   });
   const [consultExpanded, setConsultExpanded] = useState(false);
+  const handleTextMenu = (event: React.MouseEvent<HTMLDivElement>) => {
+    const desktop = window.metaHarnessDesktop;
+    if (!desktop?.textMenu) return;
+    const selection = selectionRangeWithin(event.currentTarget);
+    if (!selection || selection.collapsed) return;
+    const text = event.currentTarget.ownerDocument.getSelection()?.toString() ?? "";
+    if (!text.trim()) return;
+    event.preventDefault();
+    void desktop.textMenu("message", text, false).then((action) => {
+      if (action?.type === "quote") onQuote?.(message.session_id, text);
+    }).catch(() => useAppStore.getState().setError("Could not open the message menu."));
+  };
   const streaming = message.metadata.streaming === true;
   const waitingForApproval = useAppStore((state) =>
     streaming && state.pendingPermissions.some((prompt) =>
@@ -154,7 +168,7 @@ export const MessageRow = memo(function MessageRow({ message, consultReplies }: 
               {consultReplies.length > 0 ? "Answered" : "Waiting..."}
             </span>
           </button>
-          <div className="text-ink-soft pl-5">{message.content}</div>
+          <div className="text-ink-soft pl-5" onContextMenu={handleTextMenu}>{message.content}</div>
           {consultExpanded &&
             consultReplies.map((r) => (
               <div
@@ -164,7 +178,9 @@ export const MessageRow = memo(function MessageRow({ message, consultReplies }: 
                 <div className="text-[11px] font-semibold text-brand-ink">
                   @{r.sender_id} replied:
                 </div>
-                <MarkdownBlock content={r.content} sessionId={message.session_id} />
+                <div onContextMenu={handleTextMenu}>
+                  <MarkdownBlock content={r.content} sessionId={message.session_id} />
+                </div>
               </div>
             ))}
         </div>
@@ -194,7 +210,7 @@ export const MessageRow = memo(function MessageRow({ message, consultReplies }: 
             <span className="text-ink-muted">{time}</span>
             <span className="font-medium text-ink-soft">You</span>
           </div>
-          <div className="rounded-2xl rounded-tr-md border border-brand/25 bg-brand-soft px-4 py-2.5">
+          <div onContextMenu={handleTextMenu} className="rounded-2xl rounded-tr-md border border-brand/25 bg-brand-soft px-4 py-2.5">
             <MarkdownBlock content={message.content} sessionId={message.session_id} />
           </div>
         </div>
@@ -245,10 +261,9 @@ export const MessageRow = memo(function MessageRow({ message, consultReplies }: 
           )}
 
           {message.content.trim() && (
-            <MarkdownBlock
-              content={message.content}
-              sessionId={message.session_id}
-            />
+            <div onContextMenu={handleTextMenu}>
+              <MarkdownBlock content={message.content} sessionId={message.session_id} />
+            </div>
           )}
         </div>
       </div>

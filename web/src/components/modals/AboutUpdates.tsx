@@ -3,14 +3,6 @@ import { ArrowDownToLine, RefreshCw } from "lucide-react";
 import { api } from "../../api/client";
 import type { AppUpdateCheck } from "../../types/api";
 
-declare global {
-  interface Window {
-    metaHarnessDesktop?: {
-      installUpdate: (version: string) => Promise<void>;
-    };
-  }
-}
-
 function statusText(result: AppUpdateCheck) {
   switch (result.status) {
     case "current": return "Meta-Harness is up to date.";

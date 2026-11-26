@@ -145,6 +145,14 @@ body {
   -moz-osx-font-smoothing: grayscale;
 }
 
+.desktop-title-bar {
+  app-region: drag;
+}
+
+:root:has(.desktop-title-bar) dialog::backdrop {
+  clip-path: inset(36px 0 0);
+}
+
 code,
 pre,
 kbd,

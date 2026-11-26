@@ -36,19 +36,10 @@ import type {
   WsEvent,
 } from "../types/api";
 
-let bearerToken: string | null = null;
-
-export function setBearerToken(token: string | null) {
-  bearerToken = token;
-}
-
 async function apiFetch<T>(path: string, init?: RequestInit): Promise<T> {
   const headers = new Headers(init?.headers);
   if (!headers.has("Content-Type") && init?.body) {
     headers.set("Content-Type", "application/json");
-  }
-  if (bearerToken) {
-    headers.set("Authorization", `Bearer ${bearerToken}`);
   }
   const resp = await fetch(path, {
     ...init,
@@ -99,9 +90,6 @@ export function ptyWsUrl(
   });
   if (target && target !== "integration") {
     params.set("target", target);
-  }
-  if (bearerToken) {
-    params.set("token", bearerToken);
   }
   return `${proto}//${window.location.host}/api/sessions/${encodeURIComponent(
     sessionId
@@ -512,6 +500,7 @@ export class WsHubClient {
   constructor(
     private readonly onEvent: (ev: WsEvent) => void,
     private readonly onConnected?: () => void,
+    private readonly onSessionExpired?: () => void,
   ) {}
 
   connect(sessionId: string | null) {
@@ -555,7 +544,6 @@ export class WsHubClient {
     const proto = window.location.protocol === "https:" ? "wss:" : "ws:";
     const params = new URLSearchParams();
     if (this.sessionId) params.set("session_id", this.sessionId);
-    if (bearerToken) params.set("token", bearerToken);
     const url = `${proto}//${window.location.host}/api/ws?${params.toString()}`;
     const socket = new WebSocket(url);
     this.ws = socket;
@@ -577,9 +565,14 @@ export class WsHubClient {
       }
     };
 
-    socket.onclose = () => {
+    socket.onclose = (event) => {
       if (this.ws === socket && !this.closed) {
         this.ws = null;
+        if (event.code === 1008 && event.reason === "Authentication expired") {
+          this.closed = true;
+          this.onSessionExpired?.();
+          return;
+        }
         this.reconnectTimer = window.setTimeout(() => this.openSocket(), 1500);
       }
     };

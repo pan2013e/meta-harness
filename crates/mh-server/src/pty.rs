@@ -3,6 +3,7 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 use axum::{
+    Extension,
     extract::{
         Path as AxumPath, Query, State,
         ws::{Message, WebSocket, WebSocketUpgrade},
@@ -18,7 +19,10 @@ use tokio::sync::mpsc;
 use mh_acp::{ensure_member_worktree, member_worktree_path};
 use mh_core::IsolationMode;
 
-use crate::AppState;
+use crate::{
+    AppState,
+    auth::{SessionAccess, close_expired_socket},
+};
 
 #[derive(Debug, Deserialize)]
 pub struct PtyQuery {
@@ -34,11 +38,12 @@ enum ClientPtyMsg {
     Resize { cols: u16, rows: u16 },
 }
 
-pub async fn session_pty_ws_handler(
+pub(crate) async fn session_pty_ws_handler(
     ws: WebSocketUpgrade,
     AxumPath(session_id): AxumPath<String>,
     Query(q): Query<PtyQuery>,
     State(state): State<AppState>,
+    Extension(access): Extension<SessionAccess>,
 ) -> Response {
     let cwd = match resolve_pty_cwd(&state, &session_id, q.target.as_deref()).await {
         Ok(cwd) => cwd,
@@ -46,7 +51,9 @@ pub async fn session_pty_ws_handler(
     };
     let cols = q.cols.unwrap_or(80).clamp(20, 400);
     let rows = q.rows.unwrap_or(24).clamp(6, 200);
-    ws.on_upgrade(move |socket| handle_pty_socket(socket, cwd, cols, rows))
+    ws.max_message_size(1024 * 1024)
+        .max_frame_size(1024 * 1024)
+        .on_upgrade(move |socket| handle_pty_socket(socket, cwd, cols, rows, access))
 }
 
 async fn resolve_pty_cwd(
@@ -187,7 +194,13 @@ Clear-Host"#
     cmd
 }
 
-async fn handle_pty_socket(mut socket: WebSocket, cwd: PathBuf, cols: u16, rows: u16) {
+async fn handle_pty_socket(
+    mut socket: WebSocket,
+    cwd: PathBuf,
+    cols: u16,
+    rows: u16,
+    access: SessionAccess,
+) {
     let pty_system = native_pty_system();
     let Ok(pair) = pty_system.openpty(PtySize {
         rows,
@@ -274,63 +287,69 @@ async fn handle_pty_socket(mut socket: WebSocket, cwd: PathBuf, cols: u16, rows:
         }
     });
 
-    loop {
-        tokio::select! {
-            maybe_out = out_rx.recv() => {
-                match maybe_out {
-                    Some(text) => {
-                        let frame = json!({ "type": "output", "data": text }).to_string();
-                        if socket.send(Message::Text(frame.into())).await.is_err() {
+    let pump = async {
+        loop {
+            tokio::select! {
+                maybe_out = out_rx.recv() => {
+                    match maybe_out {
+                        Some(text) => {
+                            let frame = json!({ "type": "output", "data": text }).to_string();
+                            if socket.send(Message::Text(frame.into())).await.is_err() {
+                                break;
+                            }
+                        }
+                        None => {
+                            let _ = socket
+                                .send(Message::Text(
+                                    json!({ "type": "exit" }).to_string().into(),
+                                ))
+                                .await;
                             break;
                         }
                     }
-                    None => {
-                        let _ = socket
-                            .send(Message::Text(
-                                json!({ "type": "exit" }).to_string().into(),
-                            ))
-                            .await;
-                        break;
-                    }
                 }
-            }
-            ws_msg = socket.recv() => {
-                match ws_msg {
-                    Some(Ok(Message::Text(txt))) => {
-                        if let Ok(parsed) = serde_json::from_str::<ClientPtyMsg>(&txt) {
-                            match parsed {
-                                ClientPtyMsg::Input { data } => {
-                                    if in_tx.try_send(data.into_bytes()).is_err() {
-                                        break;
+                ws_msg = socket.recv() => {
+                    match ws_msg {
+                        Some(Ok(Message::Text(txt))) => {
+                            if let Ok(parsed) = serde_json::from_str::<ClientPtyMsg>(&txt) {
+                                match parsed {
+                                    ClientPtyMsg::Input { data } => {
+                                        if in_tx.try_send(data.into_bytes()).is_err() {
+                                            break;
+                                        }
                                     }
-                                }
-                                ClientPtyMsg::Resize { cols, rows } => {
-                                    if let Ok(m) = master.lock() {
-                                        let _ = m.resize(PtySize {
-                                            rows: rows.clamp(6, 200),
-                                            cols: cols.clamp(20, 400),
-                                            pixel_width: 0,
-                                            pixel_height: 0,
-                                        });
+                                    ClientPtyMsg::Resize { cols, rows } => {
+                                        if let Ok(m) = master.lock() {
+                                            let _ = m.resize(PtySize {
+                                                rows: rows.clamp(6, 200),
+                                                cols: cols.clamp(20, 400),
+                                                pixel_width: 0,
+                                                pixel_height: 0,
+                                            });
+                                        }
                                     }
                                 }
                             }
                         }
-                    }
-                    Some(Ok(Message::Binary(bin))) => {
-                        if in_tx.try_send(bin.to_vec()).is_err() {
-                            break;
+                        Some(Ok(Message::Binary(bin))) => {
+                            if in_tx.try_send(bin.to_vec()).is_err() {
+                                break;
+                            }
                         }
+                        Some(Ok(Message::Ping(p))) => {
+                            let _ = socket.send(Message::Pong(p)).await;
+                        }
+                        Some(Ok(Message::Close(_)) | Err(_)) | None => break,
+                        _ => {}
                     }
-                    Some(Ok(Message::Ping(p))) => {
-                        let _ = socket.send(Message::Pong(p)).await;
-                    }
-                    Some(Ok(Message::Close(_)) | Err(_)) | None => break,
-                    _ => {}
                 }
             }
         }
-    }
+    };
+    let expired = tokio::select! {
+        () = access.expires() => true,
+        () = pump => false,
+    };
 
     drop(in_tx);
     drop(out_rx);
@@ -339,6 +358,9 @@ async fn handle_pty_socket(mut socket: WebSocket, cwd: PathBuf, cols: u16, rows:
         let _ = child.wait();
     })
     .await;
+    if expired {
+        close_expired_socket(&mut socket).await;
+    }
 }
 
 pub fn decode_utf8_stream_chunk(pending: &mut Vec<u8>) -> String {

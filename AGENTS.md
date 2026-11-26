@@ -35,7 +35,7 @@ Every design decision must uphold these core specifications (finalized during de
    - Curate high-level summaries for completed project work using the orchestrator when configured and available, with deterministic records as a fallback. Store job ownership, touched modules, outcomes, and harness/model notes.
 6. **Worktree-Smart Permissions, Low Footprint & Optional Remote Access**:
    - Worktree is the default permission mode. Brokered reads from the project and writes inside the member worktree are allowed. Prompt for external file access and commands requiring approval, and support session-scoped allow patterns.
-   - The standalone CLI serves `127.0.0.1:4410` by default, opens the browser on loopback, and provides tray controls for Windows and macOS releases. Electron runs the same backend on token-protected loopback. Non-loopback standalone binds require authentication.
+   - The standalone CLI serves `127.0.0.1:4410` by default, opens the browser on loopback, and provides tray controls for Windows and macOS releases. Electron runs the same backend on token-protected loopback. Non-loopback standalone binds require HTTPS and authentication. The app refuses to run as root or with an elevated Windows token.
 
 ---
 
@@ -47,7 +47,7 @@ Every design decision must uphold these core specifications (finalized during de
    - Maintain an in-memory **Wait-For Graph** across active `peer_consult` calls: reject any consult edge `A -> B` if `B` transitively waits on `A` (returning a structured MCP tool error advising async `chat_send_message` instead).
    - Provide **Stop All** through `POST /api/sessions/{id}/cancel` to promptly signal cancellation to active ACP turns and pending `peer_consult` calls. Target under 250 ms for cancellation signaling.
 3. **Mention Parsing Hygiene**:
-   - Strip fenced code blocks (` ``` ... ``` `) and inline code spans (`` `...` ``) **before** extracting `@<handle>` tokens so `@decorator`, `@types/react`, or `name@domain.com` never trigger routing.
+   - Mask blockquotes, fenced code blocks (` ``` ... ``` `), and inline code spans (`` `...` ``) before extracting mentions or skill directives. Exclude email addresses and scoped package names from routing.
 4. **Cross-Platform Process, Git & Path Discipline** (Windows, macOS & Linux):
    - Resolve executables cleanly via `which` across all OSes (handling `.cmd` / `.ps1` / `.exe` shims on Windows and executable binaries on macOS/Linux) before spawning subprocesses.
    - Isolate and clean up every spawned child process tree across all OSes: attach to a **Windows Job Object** (`JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`) on Windows, spawn into a dedicated process group (`process_group(0)` + `killpg(SIGTERM -> SIGKILL)`) on macOS & Linux, and set `prctl(PR_SET_PDEATHSIG, SIGTERM)` on Linux so zero orphan agent/Node processes survive server exit.
@@ -55,7 +55,7 @@ Every design decision must uphold these core specifications (finalized during de
    - Resolve per-OS configuration and state paths via `dirs`. Honor `MH_CONFIG_DIR`, `MH_DATA_DIR`, and `MH_WORKSPACE_DIR` for config, data, and Quick Session workspaces.
    - Prune session/member Git worktrees cleanly (`git worktree remove --force`) when a session is archived/deleted so `.git/worktrees` never accumulates stale locks.
 5. **Single Binary MCP Bridge**:
-   - Implement `meta-harness mcp-bridge` inside the main Rust binary (speaking stdio MCP JSON-RPC to the harness and forwarding over localhost HTTP with ephemeral `MH_BRIDGE_TOKEN` to `mh-server`). Zero Python or auxiliary Node scripts.
+   - Implement `meta-harness mcp-bridge` inside the main Rust binary. Forward stdio MCP JSON-RPC over a dedicated loopback HTTP listener with an `MH_BRIDGE_TOKEN` scoped to the session and member. Zero Python or auxiliary Node scripts.
 6. **Token-Conscious Delta Context**:
    - Track `last_seen_msg_seq` per `SessionMember`. Forward unseen group chat messages when reusing ACP state and a bounded recent transcript when starting fresh. Include compact summaries, persona instructions, and relevant telemetry.
 7. **Session Files and Previews**:
@@ -138,7 +138,7 @@ The Electron launcher lives in `desktop/`. Build and version scripts live in `sc
   - `npm run build`
 
 ### Offline Deterministic Integration Testing
-- Use the deterministic mock in `crates/mh-acp/src/mock_agent.rs`. ACP tests launch the `mock-acp-agent` test binary. Server end-to-end tests use `meta-harness internal-mock-agent` and manual quotas to cover the switch without a provider subscription.
+- Use the deterministic mock in `crates/mh-acp/src/mock_agent.rs`. ACP tests launch `mock-acp-agent`. Server end-to-end tests use `mh-test-fixture` for mock ACP and MCP bridge subprocesses, with manual quotas. The fixture is excluded from release packages.
 
 ### Versions and releases
 

@@ -1,4 +1,4 @@
-import { lazy, Suspense, useEffect, useMemo, useRef, useState } from "react";
+import { lazy, Suspense, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useVirtualizer } from "@tanstack/react-virtual";
 import {
   Brain,
@@ -19,7 +19,7 @@ import {
 import { api } from "../../api/client";
 import { useAppStore } from "../../store/useAppStore";
 import type { ChatMessage } from "../../types/api";
-import { Composer } from "./Composer";
+import { Composer, type ComposerPreset } from "./Composer";
 import { MessageRow } from "./MessageRow";
 
 const WebShellDrawer = lazy(async () => ({ default: (await import("./WebShellDrawer")).WebShellDrawer }));
@@ -71,10 +71,13 @@ export function ChatPane() {
   const parentRef = useRef<HTMLDivElement | null>(null);
   const followTail = useRef(true);
   const [projPickerOpen, setProjPickerOpen] = useState(false);
-  const [draftPreset, setDraftPreset] = useState<{
-    seq: number;
-    text: string;
-  } | null>(null);
+  const [draftPreset, setDraftPreset] = useState<ComposerPreset | null>(null);
+  const clearDraftPreset = useCallback(() => setDraftPreset(null), []);
+  const quoteInComposer = useCallback((sessionId: string, text: string) => {
+    if (useAppStore.getState().activeSession?.id === sessionId) {
+      setDraftPreset({ sessionId, text, kind: "quote" });
+    }
+  }, []);
 
   const [shellSession, setShellSession] = useState<string | null>(null);
   useEffect(() => {
@@ -410,7 +413,7 @@ export function ChatPane() {
                       key={promptText}
                       type="button"
                       onClick={() =>
-                        setDraftPreset({ seq: Date.now(), text: promptText })
+                        setDraftPreset({ kind: "starter", text: promptText })
                       }
                       className="rounded-xl border border-line bg-panel/70 hover:bg-hover hover:border-line-strong px-3.5 py-2.5 text-xs text-ink-soft hover:text-ink transition-colors"
                     >
@@ -424,8 +427,8 @@ export function ChatPane() {
 
           <Composer
             key="welcome-composer"
-            draftPreset={draftPreset}
-            onConsumePreset={() => setDraftPreset(null)}
+            draftPreset={draftPreset?.kind === "starter" ? draftPreset : null}
+            onConsumePreset={clearDraftPreset}
           />
         </div>
       ) : (
@@ -469,6 +472,7 @@ export function ChatPane() {
                     >
                       <MessageRow
                         message={msg}
+                        onQuote={quoteInComposer}
                         consultReplies={
                           repliesByParent.get(msg.id) ?? NO_CONSULT_REPLIES
                         }
@@ -517,7 +521,9 @@ export function ChatPane() {
             </div>
           )}
 
-          <Composer key={activeSession.id} />
+          <Composer key={activeSession.id}
+            draftPreset={draftPreset?.kind === "quote" && draftPreset.sessionId === activeSession.id ? draftPreset : null}
+            onConsumePreset={clearDraftPreset} />
 
           {(shellOpen || shellSession === activeSession.id) && (
             <Suspense fallback={shellOpen ? <div role="status" className="border-t border-line p-3 text-xs text-ink-muted">Loading terminal…</div> : null}>

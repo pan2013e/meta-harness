@@ -47,7 +47,10 @@ fn map_switch_err(err: SwitchError) -> (StatusCode, Json<Value>) {
     }
 }
 
-pub async fn health(State(state): State<AppState>) -> Json<Value> {
+pub async fn health(State(state): State<AppState>, request: axum::extract::Request) -> Json<Value> {
+    if !state.auth.authenticated(&request) {
+        return Json(json!({ "status": "ok" }));
+    }
     let active_procs = state.switch.supervisor.active_process_count().await;
     Json(json!({
         "status": "ok",
@@ -1501,12 +1504,21 @@ pub async fn serve_session_worktree_file(
     Query(query): Query<SessionFileQuery>,
     method: Method,
 ) -> Response {
+    let access = if query.preview {
+        FileAccess::Preview
+    } else {
+        FileAccess::Download
+    };
     let mut response =
-        read_session_worktree_file(&state, &session_id, &rel_path, query.preview, method).await;
+        read_session_worktree_file(&state, &session_id, &rel_path, access, method).await;
     if query.preview
         && response.status().is_success()
-        && guess_mime(&rel_path).starts_with("text/html")
-        && let Ok(grant) = header::HeaderValue::from_str(&crate::web_preview::issue(&session_id))
+        && response
+            .headers()
+            .get(header::CONTENT_TYPE)
+            .is_some_and(|value| value.as_bytes().starts_with(b"text/html"))
+        && let Ok(grant) =
+            header::HeaderValue::from_str(&crate::web_preview::issue(&session_id, &rel_path))
     {
         response
             .headers_mut()
@@ -1519,14 +1531,21 @@ pub async fn serve_session_worktree_file(
     response
 }
 
+pub(crate) enum FileAccess<'a> {
+    Download,
+    Preview,
+    SharedPreview { entry: &'a str },
+}
+
 pub(crate) async fn read_session_worktree_file(
     state: &AppState,
     session_id: &str,
     rel_path: &str,
-    preview: bool,
+    access: FileAccess<'_>,
     method: Method,
 ) -> Response {
     use tokio::io::AsyncReadExt;
+    use tokio_util::io::ReaderStream;
 
     let Ok(sess) = state.switch.store.get_session(session_id) else {
         return (StatusCode::NOT_FOUND, "session not found").into_response();
@@ -1534,36 +1553,51 @@ pub(crate) async fn read_session_worktree_file(
     let Ok(repo_root) = state.switch.resolve_session_repo_root(&sess) else {
         return (StatusCode::NOT_FOUND, "session workspace not found").into_response();
     };
-    let root_owned = match active_session_workspace(&sess, &repo_root) {
+    let root = match active_session_workspace(&sess, &repo_root) {
         Ok(root) => root,
         Err(error) => return error.into_response(),
     };
-    let root = root_owned.as_path();
+    let Ok(root) = dunce::canonicalize(root) else {
+        return (StatusCode::NOT_FOUND, "session workspace not found").into_response();
+    };
     let cleaned = rel_path.trim_start_matches(['/', '\\']);
     if cleaned.is_empty() {
         return (StatusCode::BAD_REQUEST, "empty path").into_response();
     }
-    let candidate = root.join(cleaned);
-    if !is_path_within(&candidate, root) || !candidate.is_file() {
+    let Ok(candidate) = dunce::canonicalize(root.join(cleaned)) else {
         return (StatusCode::NOT_FOUND, "file not found").into_response();
+    };
+    if !is_path_within(&candidate, &root) || !candidate.is_file() {
+        return (StatusCode::NOT_FOUND, "file not found").into_response();
+    }
+    let mime = guess_mime(&candidate.to_string_lossy());
+    if let FileAccess::SharedPreview { entry } = access {
+        let entry = root.join(entry.trim_start_matches(['/', '\\']));
+        let scoped = dunce::canonicalize(entry)
+            .ok()
+            .and_then(|entry| {
+                Some((
+                    entry.strip_prefix(&root).ok()?.to_path_buf(),
+                    candidate.strip_prefix(&root).ok()?,
+                ))
+            })
+            .is_some_and(|(entry, file)| crate::web_preview::permits_file(&entry, file, mime));
+        if !scoped {
+            return (StatusCode::NOT_FOUND, "file is outside the preview scope").into_response();
+        }
     }
     const PREVIEW_LIMIT: u64 = 24 * 1024 * 1024;
     let Ok(file) = tokio::fs::File::open(&candidate).await else {
         return (StatusCode::FORBIDDEN, "cannot read file").into_response();
     };
-    let mut data = Vec::new();
-    let size = if method == Method::HEAD {
-        let Ok(metadata) = file.metadata().await else {
-            return (StatusCode::FORBIDDEN, "cannot read file").into_response();
-        };
-        metadata.len()
-    } else {
-        let max_bytes = if preview { PREVIEW_LIMIT + 1 } else { u64::MAX };
-        if file.take(max_bytes).read_to_end(&mut data).await.is_err() {
-            return (StatusCode::FORBIDDEN, "cannot read file").into_response();
-        }
-        data.len() as u64
+    let Ok(metadata) = file.metadata().await else {
+        return (StatusCode::FORBIDDEN, "cannot read file").into_response();
     };
+    if !metadata.is_file() {
+        return (StatusCode::NOT_FOUND, "file not found").into_response();
+    }
+    let size = metadata.len();
+    let preview = !matches!(access, FileAccess::Download);
     if preview && size > PREVIEW_LIMIT {
         return (
             StatusCode::PAYLOAD_TOO_LARGE,
@@ -1571,11 +1605,15 @@ pub(crate) async fn read_session_worktree_file(
         )
             .into_response();
     }
-    let mime = guess_mime(&candidate.to_string_lossy());
     let content_policy = if preview && mime.starts_with("text/html") {
-        "sandbox allow-scripts; default-src 'self' data: blob:; script-src 'self' 'unsafe-inline' blob:; style-src 'self' 'unsafe-inline'; connect-src 'none'; form-action 'none'; frame-src 'none'; object-src 'none'; base-uri 'none'"
+        "sandbox allow-scripts; default-src 'none'; script-src 'self' 'unsafe-inline' blob:; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; font-src 'self' data:; media-src 'self' blob:; form-action 'none'; base-uri 'none'; frame-ancestors 'self'"
     } else {
-        "sandbox allow-scripts allow-forms"
+        "sandbox; default-src 'none'; base-uri 'none'; frame-ancestors 'self'"
+    };
+    let body = if method == Method::HEAD {
+        axum::body::Body::empty()
+    } else {
+        axum::body::Body::from_stream(ReaderStream::new(file.take(size)))
     };
     let mut response = (
         StatusCode::OK,
@@ -1583,8 +1621,12 @@ pub(crate) async fn read_session_worktree_file(
             (header::CONTENT_TYPE, mime),
             (header::CONTENT_SECURITY_POLICY, content_policy),
             (header::X_CONTENT_TYPE_OPTIONS, "nosniff"),
+            (
+                header::CONTENT_DISPOSITION,
+                if preview { "inline" } else { "attachment" },
+            ),
         ],
-        data,
+        body,
     )
         .into_response();
     response
@@ -2236,12 +2278,25 @@ pub async fn internal_mcp_handler(
     headers: axum::http::HeaderMap,
     Json(payload): Json<BridgeCallPayload>,
 ) -> Response {
-    let expected = format!("Bearer {}", state.switch.bridge_token);
+    let expected = state
+        .switch
+        .member_bridge_token(&payload.session_id, &payload.caller);
     let supplied = headers
         .get(header::AUTHORIZATION)
         .and_then(|v| v.to_str().ok())
-        .unwrap_or("");
-    if supplied != expected {
+        .and_then(|value| value.strip_prefix("Bearer "));
+    if !supplied.is_some_and(|token| crate::auth::tokens_equal(token, &expected))
+        || !state
+            .switch
+            .store
+            .get_session(&payload.session_id)
+            .is_ok_and(|session| session.archived_at.is_none())
+        || state
+            .switch
+            .store
+            .get_member(&payload.session_id, &payload.caller)
+            .is_err()
+    {
         return (
             StatusCode::UNAUTHORIZED,
             Json(json!({ "error": "invalid bridge token" })),
@@ -2268,8 +2323,13 @@ pub async fn internal_mcp_handler(
     }
 }
 
-pub async fn serve_embedded_spa(uri: axum::http::Uri) -> Response {
+pub async fn serve_embedded_spa(method: Method, uri: axum::http::Uri) -> Response {
     let raw_path = uri.path().trim_start_matches('/');
+    if !matches!(method, Method::GET | Method::HEAD)
+        || ["api", "internal", "preview"].contains(&raw_path.split('/').next().unwrap_or_default())
+    {
+        return (StatusCode::NOT_FOUND, "route not found").into_response();
+    }
     let path = if raw_path.is_empty() {
         "index.html"
     } else {

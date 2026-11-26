@@ -47,7 +47,7 @@ Never introduce upward or cyclic crate dependencies.
 - `supervisor.rs` — Lazy spawning keyed by `(session_id, member_handle)`, idle hibernation reaper (`idle_process_ttl_secs`), catalog cache, `run_ephemeral_prompt` (for auto-titling & intent classification), and native conversation archive/restore/delete hooks.
 - `broker.rs` — `WorkspaceBroker` handling `fs/read_text_file`, `fs/write_text_file`, `terminal/*`, `session/request_permission` (auto-allowing member worktree edits, project reads, read-only `skill_read_roots`, saved session patterns, and orchestrator/member auto-approved MCP switch tools).
 - `worktree.rs` — Integration & lazy executor worktree lifecycle, auto-commit, fast-forward/merge/conflict detection, peer sync, `merge`/`squash`/`patch` promotion, checkpointing, and pruning.
-- `quota.rs`, `profile.rs`, `maintenance.rs`, `platform.rs`, `mock_agent.rs` — Quota probes (`codex app-server` / OAuth, Claude OAuth / Keychain, Antigravity CLI), CLI version/upgrade/sign-in jobs, isolated `profile_dir`, Win32 Job Objects / POSIX `killpg`, deterministic `internal-mock-agent`.
+- `quota.rs`, `profile.rs`, `maintenance.rs`, `platform.rs`, `mock_agent.rs` — Quota probes, CLI version and sign-in jobs, isolated profiles, process-tree guards, and the deterministic mock ACP agent used in tests.
 
 ### `crates/mh-switch/src/`
 - `router.rs` — `SwitchEngine`, `SessionRuntime`, parallel turn queueing, delta context formatting (`<group_chat_updates>`, `<available_skills>`, `<activated_skills>`, `<orchestrator_telemetry>`, `<slash_commands>`), post-turn Git integration, conflict escalation, memory curation, 429 failover, context usage reporting, `/compact`, auto-title, `<250 ms` `cancel_session`.
@@ -57,7 +57,7 @@ Never introduce upward or cyclic crate dependencies.
 ### `crates/mh-server/src/`
 - `lib.rs` — `WebAssets` (`RustEmbed` of `../../web/dist`) and Axum router mounting `/api/*`, `/preview/{session_id}/{grant}/{*path}`, `/internal/mcp`, and SPA fallback.
 - `routes.rs`, `skills.rs`, `settings.rs`, `harness_jobs.rs` — REST handlers, skill Git/local/custom installers, storage breakdown & cleanup.
-- `mcp_bridge.rs`, `pty.rs`, `web_preview.rs`, `ws.rs`, `auth.rs`, `tray.rs`, `main.rs` — Stdio `mcp-bridge`, portable PTY WebSocket, signed iframe previews with strict CSP, WebSocket hub, LAN cookie/bearer auth, OS tray, CLI entrypoint.
+- `mcp_bridge.rs`, `pty.rs`, `web_preview.rs`, `ws.rs`, `auth.rs`, `privilege.rs`, `release.rs`, `tray.rs`, `main.rs` — Scoped loopback MCP bridge, PTY and chat WebSockets, signed previews, LAN HTTPS and authentication, privilege check, GitHub updates, OS tray, and CLI entrypoint.
 
 ---
 

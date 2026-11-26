@@ -559,7 +559,12 @@ mod tests {
         );
         let state = AppState {
             switch,
-            auth: crate::auth::AuthConfig::from_bind_and_flag("127.0.0.1:4410", None),
+            auth: crate::auth::AuthConfig::for_listener(
+                "127.0.0.1:4410".parse().unwrap(),
+                false,
+                None,
+            )
+            .unwrap(),
             harness_jobs: Default::default(),
         };
         let id = "antigravity".to_string();

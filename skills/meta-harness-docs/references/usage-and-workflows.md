@@ -48,6 +48,7 @@ Injected into every `session/new` / `session/load` via `meta-harness mcp-bridge`
 
 ## 3. Composer Controls, Approvals, Diffs, Terminal, & Memory
 
+- **Desktop menus:** Right-click selected message text to copy it or append a quote in the composer. Quoted text stays out of recipient and skill routing. The composer and terminal offer **Copy** and **Paste**, and the Windows title bar follows the selected theme.
 - **Atomic Pills in Composer:**
   - `@handle` pills delete atomically on Backspace.
   - **Built-in workflow pills (green):** `/plan`, `/review`, `/test`, `/fix` (injected as structured `<slash_commands>` directives).
@@ -75,9 +76,12 @@ Open **Settings** from the bottom-left sidebar:
 - **Global Personas:** Reusable specialist templates (e.g. `@codex-reviewer`) copied into new sessions or added via **Add to session**.
 - **Session:** Reassign orchestrator, tune `max_hops` (`2–16`), edit member models/personas, adjust approval mode, prune session command allow-rules.
 - **Storage & Data:** Itemized disk usage breakdown, **Clear Caches & Orphans**, **Delete Archived Sessions**, and versioned JSON Settings export/import.
-- **About:** App version, 6-char build commit, license/third-party notices.
+- **About:** App version, six-character build commit, license and third-party notices, and release update checks.
 
 ### CLI & Environment Overrides
-- `meta-harness [serve]` flags: `--bind <ADDR:PORT>` (default `127.0.0.1:4410`), `--auth-token <TOKEN>`, `--no-open`, `--no-tray`, `--config <PATH>`, `--data-dir <PATH>`.
+- Run as a standard user. Both app entry points refuse Unix root and elevated Windows launches.
+- `meta-harness [serve]` flags include `--bind <ADDR:PORT>` (default `127.0.0.1:4410`), `--tls-cert <PATH>`, `--tls-key <PATH>`, `--auth-token <TOKEN>`, `--no-open`, `--no-tray`, `--config <PATH>`, and `--data-dir <PATH>`.
 - Env overrides: `MH_CONFIG_DIR`, `MH_DATA_DIR`, `MH_WORKSPACE_DIR` (defaults Quick Sessions to `~/.meta-harness/workspaces`).
-- Non-loopback binds (e.g. `--bind 0.0.0.0:4410`) enforce bearer token authentication or `?token=<TOKEN>` pairing exchanged for an `HttpOnly; SameSite=Lax` session cookie.
+- Direct LAN binds require a trusted HTTPS certificate and key. Use `#token=<TOKEN>` pairing in browsers or `Authorization: Bearer <TOKEN>` for API clients. The browser receives a signed `HttpOnly; SameSite=Strict` session cookie that expires after 24 hours and is `Secure` over HTTPS. The chat and terminal sockets also close at expiry.
+- To use an HTTPS reverse proxy, bind Meta-Harness to loopback, configure a strong `--auth-token`, and forward the original `Host` and WebSocket upgrades. Pairing grants workspace and terminal access.
+- Standalone release binaries provide `install`, `update --check`, `update`, and `uninstall`. Desktop releases use the Windows installer or macOS disk image for updates. Uninstall keeps sessions and settings.

@@ -25,7 +25,7 @@ impl ParsedMentions {
     }
 }
 
-/// Masks fenced code blocks (```` ``` ```` or `~~~`) and inline code spans (`` `...` ``)
+/// Masks blockquotes, fenced code blocks (```` ``` ```` or `~~~`) and inline code spans (`` `...` ``)
 /// with ASCII spaces while leaving surrounding markdown untouched.
 pub fn mask_code_regions(markdown: &str) -> String {
     let lines: Vec<&str> = markdown.split_inclusive('\n').collect();
@@ -44,6 +44,11 @@ pub fn mask_code_regions(markdown: &str) -> String {
             if count >= fence_len && rest_blank {
                 active_fence = None;
             }
+            continue;
+        }
+
+        if trimmed.starts_with('>') {
+            push_masked_line(&mut after_fences, line);
             continue;
         }
 
@@ -124,7 +129,7 @@ fn push_masked_line(out: &mut String, line: &str) {
     }
 }
 
-/// Extracts all valid mentions outside fenced and inline code. Agents use this
+/// Extracts all valid mentions outside quotes and code. Agents use this
 /// when handing off a completed reply or naming peers in an MCP message.
 pub fn parse_mentions(markdown: &str, valid_handles: &HashSet<String>) -> ParsedMentions {
     parse_clean_mentions(&mask_code_regions(markdown), valid_handles)
@@ -268,7 +273,7 @@ fn add_target(
     }
 }
 
-/// Extracts distinct `/token` directives outside fenced and inline code regions.
+/// Extracts distinct `/token` directives outside quotes and code.
 pub fn parse_slash_tokens(markdown: &str) -> Vec<String> {
     let cleaned = mask_code_regions(markdown);
     let mut tokens = Vec::new();
@@ -431,5 +436,16 @@ Real ping: @antigravity
             "/meta-harness-docs compare with `/code-span` and /plan\n```\n/not-a-skill\n```",
         );
         assert_eq!(slash, vec!["meta-harness-docs", "plan"]);
+    }
+
+    #[test]
+    fn quoted_messages_do_not_route_or_activate_skills() {
+        let draft = "> @claude /meta-harness-docs\n> @all\n\n@codex /review Check the quoted reply";
+        let routing = parse_user_mentions(draft, &handles());
+        assert!(!routing.needs_intent && !routing.mentions.has_all);
+        assert_eq!(routing.mentions.targets.len(), 1);
+        assert_eq!(routing.mentions.targets[0].handle, "codex");
+        assert_eq!(parse_slash_tokens(draft), ["review"]);
+        assert!(parse_mentions("> @claude referenced a peer", &handles()).is_unmentioned());
     }
 }

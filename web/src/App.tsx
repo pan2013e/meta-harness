@@ -1,6 +1,7 @@
 import { useEffect, useState } from "react";
 import { KeyRound, Loader2, X } from "lucide-react";
 import { ChatPane } from "./components/chat/ChatPane";
+import { DesktopTitleBar } from "./components/common/DesktopTitleBar";
 import { DiffReviewModal } from "./components/modals/DiffReviewModal";
 import { FilePreviewModal } from "./components/modals/FilePreviewModal";
 import { FolderPickerModal } from "./components/modals/FolderPickerModal";
@@ -16,6 +17,15 @@ const STARTUP_LABELS: Record<StartupTask, string> = {
 };
 
 export function App() {
+  return (
+    <div className="flex h-dvh w-full flex-col overflow-hidden bg-app text-ink">
+      <DesktopTitleBar />
+      <AppContent />
+    </div>
+  );
+}
+
+function AppContent() {
   const {
     authRequired,
     authenticated,
@@ -59,7 +69,7 @@ export function App() {
 
   if (bootstrapping) {
     return (
-      <main className="grid h-dvh w-full place-items-center bg-app px-4">
+      <main className="grid min-h-0 flex-1 place-items-center bg-app px-4">
         <div role="status" className="min-w-60 rounded-2xl border border-line bg-panel px-7 py-6 text-center shadow-sm">
           <img src="/meta-harness.svg" alt="" className="mx-auto mb-3 h-11 w-11" />
           <h1 className="font-semibold text-ink">Meta-Harness</h1>
@@ -74,7 +84,7 @@ export function App() {
 
   if (authRequired && !authenticated) {
     return (
-      <div className="h-screen w-screen bg-app flex items-center justify-center p-4">
+      <div className="flex min-h-0 flex-1 items-center justify-center bg-app p-4">
         <div className="w-full max-w-sm rounded-2xl border border-line-strong bg-panel p-6 space-y-4 shadow-2xl">
           <div className="flex items-center gap-2 text-brand-ink">
             <KeyRound className="w-5 h-5" />
@@ -108,7 +118,7 @@ export function App() {
   }
 
   return (
-    <div className="flex h-dvh w-full flex-col overflow-hidden bg-app text-ink">
+    <div className="flex min-h-0 flex-1 flex-col overflow-hidden">
       {errorBanner && (
         <div className="bg-neg-soft border-b border-neg/35 px-4 py-1.5 text-xs text-neg flex items-center justify-between">
           <span>{errorBanner}</span>

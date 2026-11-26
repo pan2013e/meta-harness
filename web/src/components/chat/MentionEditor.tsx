@@ -5,6 +5,8 @@ import {
   useImperativeHandle,
   useRef,
 } from "react";
+import { selectionRangeWithin } from "../../desktop";
+import { useAppStore } from "../../store/useAppStore";
 
 export type SlashCommandKind = "workflow" | "action" | "skill";
 
@@ -43,7 +45,7 @@ interface MentionEditorProps {
  * Serializes a contentEditable subtree containing atomic `data-mention` and
  * `data-slash` pills back into plain text (preserving `@handle` and `/command`).
  */
-export function serializeMentionDom(root: HTMLElement): string {
+export function serializeMentionDom(root: ParentNode): string {
   const walk = (node: Node): string => {
     if (node.nodeType === 3) {
       return (node.textContent ?? "").replace(/\u200B/g, "");
@@ -174,6 +176,10 @@ function buildFragmentFromValue(
   lines.forEach((line, lineIdx) => {
     if (lineIdx > 0) {
       frag.appendChild(doc.createElement("br"));
+    }
+    if (/^[ \t]*>/.test(line)) {
+      frag.appendChild(doc.createTextNode(line));
+      return;
     }
     const regex = /(^|\s)([@/])([a-zA-Z0-9_-]+)(?=$|[\s.,!?;:])/g;
     let last = 0;
@@ -466,31 +472,47 @@ export const MentionEditor = forwardRef<MentionEditorHandle, MentionEditorProps>
       onKeyDown?.(e);
     };
 
-    const handlePaste = (e: React.ClipboardEvent<HTMLDivElement>) => {
-      e.preventDefault();
-      const plain = e.clipboardData.getData("text/plain");
-      if (!plain || !editorRef.current) return;
-      const doc = editorRef.current.ownerDocument;
-      const sel = window.getSelection();
-      if (sel && sel.rangeCount > 0) {
-        const range = sel.getRangeAt(0);
+    const insertPlainText = (plain: string, range: Range | null) => {
+      const editor = editorRef.current;
+      if (!plain || !editor || disabled) return;
+      const doc = editor.ownerDocument;
+      const selection = doc.getSelection();
+      const fragment = buildFragmentFromValue(plain.replace(/\r\n?/g, "\n"), validHandles, slashCommands, doc);
+      const lastNode = fragment.lastChild;
+      if (range && editor.contains(range.startContainer) && editor.contains(range.endContainer)) {
         range.deleteContents();
-        const frag = buildFragmentFromValue(plain, validHandles, slashCommands, doc);
-        const lastNode = frag.lastChild;
-        range.insertNode(frag);
-        if (lastNode) {
-          const after = doc.createRange();
-          after.setStartAfter(lastNode);
-          after.collapse(true);
-          sel.removeAllRanges();
-          sel.addRange(after);
-        }
+        range.insertNode(fragment);
       } else {
-        editorRef.current.appendChild(
-          buildFragmentFromValue(plain, validHandles, slashCommands, doc)
-        );
+        editor.appendChild(fragment);
+      }
+      if (selection && lastNode) {
+        const after = doc.createRange();
+        after.setStartAfter(lastNode);
+        after.collapse(true);
+        selection.removeAllRanges();
+        selection.addRange(after);
       }
       emitCurrent();
+    };
+
+    const handlePaste = (event: React.ClipboardEvent<HTMLDivElement>) => {
+      event.preventDefault();
+      insertPlainText(event.clipboardData.getData("text/plain"), selectionRangeWithin(event.currentTarget));
+    };
+
+    const handleTextMenu = (event: React.MouseEvent<HTMLDivElement>) => {
+      const desktop = window.metaHarnessDesktop;
+      if (!desktop?.textMenu) return;
+      event.preventDefault();
+      const editor = event.currentTarget;
+      const range = selectionRangeWithin(editor)?.cloneRange() ?? null;
+      const selected = range && !range.collapsed ? serializeMentionDom(range.cloneContents()) : "";
+      void desktop.textMenu("composer", selected, !disabled).then((action) => {
+        if (action?.type === "paste" && editorRef.current === editor && editor.getAttribute("contenteditable") === "true") {
+          editor.focus();
+          insertPlainText(action.text, range);
+        }
+      }).catch(() => useAppStore.getState().setError("Could not open the composer menu."));
     };
 
     const isEmpty = value.length === 0;
@@ -514,6 +536,7 @@ export const MentionEditor = forwardRef<MentionEditorHandle, MentionEditorProps>
           suppressContentEditableWarning
           onInput={emitCurrent}
           onClick={handleClick}
+          onContextMenu={handleTextMenu}
           onKeyDown={handleLocalKeyDown}
           onPaste={handlePaste}
           className="min-h-[46px] w-full bg-transparent text-[13.5px] leading-relaxed text-ink focus:outline-none whitespace-pre-wrap break-words"

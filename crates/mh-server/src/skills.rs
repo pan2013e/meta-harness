@@ -785,7 +785,19 @@ async fn clone_git_repo(
     branch: Option<&str>,
     dest: &Path,
 ) -> Result<(), (StatusCode, Json<Value>)> {
-    let mut args = vec!["clone".to_string(), "--depth".into(), "1".into()];
+    let mut args = [
+        "-c",
+        "core.hooksPath=/dev/null",
+        "-c",
+        "core.fsmonitor=false",
+        "clone",
+        "--no-recurse-submodules",
+        "--depth",
+        "1",
+    ]
+    .into_iter()
+    .map(str::to_string)
+    .collect::<Vec<_>>();
     if let Some(br) = branch.filter(|s| !s.is_empty()) {
         args.push("--branch".into());
         args.push(br.to_string());

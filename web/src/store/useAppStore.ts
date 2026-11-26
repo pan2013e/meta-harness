@@ -1,5 +1,5 @@
 import { create } from "zustand";
-import { api, setBearerToken, WsHubClient } from "../api/client";
+import { api, WsHubClient } from "../api/client";
 import type {
   AdapterConfig,
   AdapterModelCatalog,
@@ -373,14 +373,18 @@ export const useAppStore = create<AppState>((set, get) => {
       applyThemeToDom(get().theme);
       try {
         const urlParams = new URLSearchParams(window.location.search);
-        const tokenParam = urlParams.get("token");
-        if (tokenParam) {
+        const fragment = new URLSearchParams(window.location.hash.slice(1));
+        const tokenParam = fragment.get("token") ?? urlParams.get("token");
+        if (tokenParam !== null) {
           urlParams.delete("token");
+          const hasPairingFragment = fragment.has("token");
+          fragment.delete("token");
+          const hash = hasPairingFragment ? (fragment.size ? `#${fragment}` : "") : window.location.hash;
           const cleanUrl =
             window.location.pathname +
             (urlParams.toString() ? `?${urlParams.toString()}` : "");
-          window.history.replaceState({}, "", cleanUrl + window.location.hash);
-          await api.createAuthSession(tokenParam);
+          window.history.replaceState({}, "", cleanUrl + hash);
+          if (tokenParam) await api.createAuthSession(tokenParam);
         }
 
         const auth = await api.authStatus();
@@ -406,7 +410,8 @@ export const useAppStore = create<AppState>((set, get) => {
           () => {
             const sessionId = sessionLoad?.id ?? get().activeSession?.id;
             if (sessionId) void get().selectSession(sessionId);
-          }
+          },
+          () => set({ authenticated: false, authRequired: true, errorBanner: "Session expired. Enter the access token again." })
         );
         ws.connect(null);
 
@@ -455,7 +460,6 @@ export const useAppStore = create<AppState>((set, get) => {
       set({ bootstrapping: true, startupPhase: "connecting", errorBanner: null });
       try {
         await api.createAuthSession(token);
-        setBearerToken(null);
         await get().init();
       } catch (error) {
         set({ bootstrapping: false });

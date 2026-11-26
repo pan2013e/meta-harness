@@ -2,6 +2,17 @@
 
 ## Unreleased
 
+## 0.7.0
+
+- Refuse privileged launches in the desktop app and standalone CLI. Close browser-authenticated sockets at session expiry.
+- Disable Git hooks and filesystem monitor callbacks in managed operations. Managed diffs use Git's built-in output.
+
+- Require HTTPS for direct LAN access. Exchange fragment-based pairing links for expiring browser sessions and keep credentials out of API and WebSocket query strings.
+- Keep the MCP bridge on loopback and bind its credentials to the session and member. Limit HTML preview grants to the opened site and static assets.
+
+- Add desktop context menus for copying or quoting selected messages and for copying or pasting in the composer and terminal.
+- Match the Windows title bar and native window controls to the selected app theme.
+
 ## 0.6.0
 
 - Check for GitHub release updates in Settings → About. Verify desktop downloads and hand installation to the Windows installer or macOS disk image.

@@ -30,7 +30,7 @@ Read the targeted reference guide under this skill's directory (via `skill_read`
    - Workspaces, Quick Sessions, Archive/Restore/Delete + Codex/Claude conversation sync
    - `@mention` & Orchestrator routing, `orchestrator_dispatch`, `peer_consult`, `trajectory_read`, Activity Timelines
    - Composer pills (`@handle`, `/plan` `/review` `/test` `/fix`, `/compact` `/diff` `/shell` `/memory` `/new` `/archive`, `/skill-name`), model/effort overrides, approval modes (`Worktree`, `Strict`, `Auto`), and shortcuts (`Alt+A`, `Alt+R`, `Ctrl+B`, `Ctrl+\``)
-   - Settings panels (Appearance, Harnesses & Models, Separate Profiles, Skills, Global Personas, Session, Storage & Data, About), CLI flags, env vars, and LAN bearer-token pairing
+   - Settings panels, desktop clipboard and quote menus, release updates, and HTTPS LAN pairing
 
 2. **[references/architecture-and-crates.md](references/architecture-and-crates.md)** — Repository layout, crate dependency DAG, and symbol map:
    - Strictly unidirectional Rust crates: `mh-core` -> `mh-store` -> `mh-acp` -> `mh-switch` -> `mh-server`
@@ -45,14 +45,14 @@ Read the targeted reference guide under this skill's directory (via `skill_read`
 4. **[references/dev-testing-and-release.md](references/dev-testing-and-release.md)** — Bootstrapping Meta-Harness development inside Meta-Harness:
    - Windows (MSVC/WinLibs), macOS, and Linux toolchain setup
    - Safe self-hosting rules when developing Meta-Harness in its own worktrees (avoid killing your own running binary/port!)
-   - Offline deterministic testing with `mock-acp-agent` / `internal-mock-agent` (`[MOCK:*]` tags)
+   - Offline deterministic testing with `mock-acp-agent` and `mh-test-fixture` (`[MOCK:*]` tags)
    - Required Rust (`fmt`, `clippy`, `test`) & Web (`typecheck`, `test`, `build`) quality gates, `node scripts/version.mjs`, `CHANGELOG.md`, and `node scripts/build.mjs`
 
 ---
 
 ## Self-Bootstrapping Quick Checklist (Developing Meta-Harness with Meta-Harness)
 
-1. Always verify `cargo` (`rustc` stable), `node` (`24`), `npm`, and `git` are installed; follow [AGENTS.md](AGENTS.md) as the authoritative engineering contract.
+1. Verify that stable Rust, Node.js 24, npm, and Git are installed. Follow the `AGENTS.md` at the root of the Meta-Harness checkout.
 2. When building/testing the web UI + backend together, build `web/` first (`npm --prefix web run build`) before `cargo test` / `cargo build` so `RustEmbed` in `crates/mh-server` picks up updated static assets.
-3. Preserve modularity and unidirectional crate boundaries: do not add reverse imports (e.g., `mh-acp` must never depend on `mh-switch` or `mh-server`), avoid `.unwrap()` / `.expect()` on runtime I/O or external JSON, and test backend logic offline using `internal-mock-agent`.
-4. Before finishing any change, bump versions together if shipping a commit (`node scripts/version.mjs <patch|minor|major> --check`), update `CHANGELOG.md` under `## [Unreleased]`, and run all Rust and frontend gates cleanly.
+3. Preserve unidirectional crate boundaries, handle runtime I/O and external JSON errors, and test backend logic offline with the mock ACP subprocess fixtures.
+4. Before committing, bump versions together with `node scripts/version.mjs <patch|minor|major>` and verify them with `node scripts/version.mjs --check`. Update `CHANGELOG.md` and run the Rust and frontend checks.

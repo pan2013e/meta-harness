@@ -238,6 +238,19 @@ function TerminalTabPane({
     <div
       ref={hostRef}
       data-testid={`xterm-pane-${tab.id}`}
+      onContextMenuCapture={(event) => {
+        const desktop = window.metaHarnessDesktop;
+        const terminal = termRef.current;
+        if (!desktop?.textMenu || !terminal) return;
+        event.preventDefault();
+        event.stopPropagation();
+        void desktop.textMenu("terminal", terminal.getSelection(), !terminal.options.disableStdin).then((action) => {
+          if (action?.type === "paste" && termRef.current === terminal && !terminal.options.disableStdin) {
+            terminal.focus();
+            terminal.paste(action.text);
+          }
+        }).catch(() => useAppStore.getState().setError("Could not open the terminal menu."));
+      }}
       className={`${active ? "block" : "hidden"} h-full w-full px-2 py-1.5`}
     />
   );

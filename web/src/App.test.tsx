@@ -30,6 +30,23 @@ afterEach(() => {
 });
 
 describe("Startup and file previews", () => {
+  it("exchanges a pairing fragment after removing credentials from the browser URL", async () => {
+    const original = window.location.href;
+    window.history.replaceState({}, "", "/?layout=wide#token=pairing-fixture");
+    const exchange = vi.spyOn(api, "createAuthSession").mockImplementation(async () => {
+      expect(window.location.search).toBe("?layout=wide");
+      expect(window.location.hash).toBe("");
+      return { authenticated: true };
+    });
+    vi.spyOn(api, "authStatus").mockResolvedValue({ required: true, authenticated: false });
+    try {
+      await useAppStore.getState().init();
+      expect(exchange).toHaveBeenCalledExactlyOnceWith("pairing-fixture");
+    } finally {
+      window.history.replaceState({}, "", original);
+    }
+  });
+
   it("keeps the composer available while model and quota lookups finish", async () => {
     let connect!: () => void;
     let loadModels!: () => void;
@@ -187,6 +204,19 @@ describe("Session navigation", () => {
     expect(close).toHaveBeenCalledOnce();
   });
 
+  it("returns to pairing when the server closes an expired browser session", () => {
+    const socket = { readyState: 1, send: vi.fn(), close: vi.fn(), onclose: (_event: CloseEvent) => {} };
+    const open = vi.fn(function () { return socket; });
+    vi.stubGlobal("WebSocket", Object.assign(open, { OPEN: 1 }));
+    const onExpired = vi.fn();
+    const client = new WsHubClient(vi.fn(), undefined, onExpired);
+    client.connect(null);
+    socket.onclose(new CloseEvent("close", { code: 1008, reason: "Authentication expired" }));
+    expect(onExpired).toHaveBeenCalledOnce();
+    expect(open).toHaveBeenCalledOnce();
+    client.disconnect();
+  });
+
   it("backfills a running turn on return and merges its streamed steps", async () => {
     const turn: TurnTrajectory = {
       turn_id: "running", session_id: "first", member_handle: "codex", adapter_id: "codex",
@@ -279,6 +309,50 @@ describe("Session navigation", () => {
 });
 
 describe("UI primitives", () => {
+  it("quotes only the selected message text and keeps the existing draft", async () => {
+    const textMenu = vi.fn().mockResolvedValue({ type: "quote" });
+    vi.stubGlobal("metaHarnessDesktop", { textMenu });
+    const message: ChatMessage = {
+      id: "reply", seq: 1, session_id: "s_quoted", chain_id: "chain", parent_msg_id: null,
+      sender_kind: "member", sender_id: "codex", recipients: [], kind: "text",
+      content: "Before @claude after", turn_id: null, metadata: {}, created_at: 0,
+    };
+    const starter = { kind: "starter", text: "My existing draft" } as const;
+    const onQuote = vi.fn();
+    const { rerender } = render(<><MessageRow message={message} consultReplies={[]} onQuote={onQuote} /><Composer draftPreset={starter} /></>);
+    const excerpt = screen.getByText("@claude");
+    const selection = document.getSelection();
+    const range = document.createRange();
+    range.selectNodeContents(excerpt);
+    selection?.removeAllRanges();
+    selection?.addRange(range);
+    fireEvent.contextMenu(excerpt);
+    await waitFor(() => expect(onQuote).toHaveBeenCalledWith("s_quoted", "@claude"));
+    expect(textMenu).toHaveBeenCalledWith("message", "@claude", false);
+
+    rerender(<><MessageRow message={message} consultReplies={[]} /><Composer draftPreset={{ kind: "quote", sessionId: "s_quoted", text: "@claude\n/review" }} /></>);
+    const editor = screen.getByRole("textbox", { name: "Message group chat" });
+    expect(serializeMentionDom(editor).trimEnd()).toBe("My existing draft\n\n> @claude\n> /review");
+    expect(editor.querySelector("[data-mention], [data-slash]")).toBeNull();
+  });
+
+  it("copies composer pills as plain text and pastes at the captured selection", async () => {
+    const onChange = vi.fn();
+    const textMenu = vi.fn().mockResolvedValue({ type: "paste", text: "more\r\ntext" });
+    vi.stubGlobal("metaHarnessDesktop", { textMenu });
+    render(<MentionEditor value="@codex check this" validHandles={new Set(["codex"])} onChange={onChange} onMentionQuery={() => {}} />);
+    const editor = screen.getByRole("textbox", { name: "Message group chat" });
+    const pill = editor.querySelector("[data-mention]")!;
+    const range = document.createRange();
+    range.selectNode(pill);
+    const selection = document.getSelection();
+    selection?.removeAllRanges();
+    selection?.addRange(range);
+    fireEvent.contextMenu(editor);
+    await waitFor(() => expect(onChange).toHaveBeenCalledWith("more\ntext check this"));
+    expect(textMenu).toHaveBeenCalledWith("composer", "@codex", true);
+  });
+
   it("installs only the desktop version returned by an explicit update check", async () => {
     const installUpdate = vi.fn().mockResolvedValue(undefined);
     vi.stubGlobal("metaHarnessDesktop", { installUpdate });

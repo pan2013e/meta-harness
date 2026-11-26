@@ -12,7 +12,7 @@ Meta-Harness combines four architectural layers inside a single low-footprint Ru
 
 ```mermaid
 flowchart TB
-    subgraph Browser["Web Frontend (127.0.0.1 Default / Optional Token LAN)"]
+    subgraph Browser["Web Frontend (Loopback by Default / HTTPS on LAN)"]
         ChatUI["Group Chat, Collapsible Consults & @Mention Composer"]
         GitBar["Session Header, Diff Review, Terminal & Promote"]
         Drawer["Turn Activity, Project Memory & Settings"]
@@ -109,8 +109,8 @@ sequenceDiagram
        {
          "name": "meta-harness-switch",
          "command": "C:/path/to/meta-harness.exe",
-         "args": ["mcp-bridge", "--url", "http://127.0.0.1:4410/internal/mcp", "--session", "s_01", "--caller", "codex"],
-         "env": [{ "name": "MH_BRIDGE_TOKEN", "value": "<ephemeral_bridge_token>" }]
+         "args": ["mcp-bridge", "--url", "http://127.0.0.1:49152/internal/mcp", "--session", "s_01", "--caller", "codex"],
+         "env": [{ "name": "MH_BRIDGE_TOKEN", "value": "<session_member_token>" }]
        }
      ]
    }
@@ -219,10 +219,11 @@ To keep memory high-signal without low-level clutter:
 
 ### 7.1 Launch and pairing
 
+- The CLI and Electron use standard user privileges. Unix root and elevated Windows processes are refused before the server starts.
 - The standalone binary defaults to `127.0.0.1:4410` and opens the browser when bound to loopback. `--no-open` or `server.open_browser_on_start = false` suppresses the browser. Windows and macOS releases use a native tray unless started with `--no-tray`.
-- A non-loopback bind requires authentication. The CLI uses a generated token by default, or the value supplied through `--auth-token`. A pairing URL with `?token=...` is exchanged through `POST /api/auth/session` for an `HttpOnly; SameSite=Lax` cookie. Authenticated API clients can use a bearer header.
+- A non-loopback bind requires HTTPS and authentication. A pairing URL with `#token=...` is exchanged through `POST /api/auth/session` for a signed browser credential scoped to the request authority. The cookie is `HttpOnly`, `SameSite=Strict`, and `Secure` over HTTPS. Its 24-hour expiry applies to active chat and terminal WebSockets. API clients can use a bearer header. The internal MCP endpoint listens separately on loopback with credentials scoped to a session member.
 - Electron launches an owned backend on a dynamically allocated loopback port with its own token. The backend signals its listening URL to Electron, which opens the UI in an isolated renderer. Electron closes the child on quit.
-- `GET /api/health` reports the server version, six-character build commit when available, OS, architecture, and active subprocess count.
+- `GET /api/health` reports liveness publicly and includes version, build, platform, and process details for authorized clients.
 
 ### 7.2 REST and WebSocket interfaces
 

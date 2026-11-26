@@ -229,7 +229,13 @@ pub fn build_router(state: AppState) -> Router {
             "/preview/{session_id}/{grant}/{*path}",
             get(web_preview::read),
         )
-        .route("/internal/mcp", post(routes::internal_mcp_handler))
         .fallback(routes::serve_embedded_spa)
+        .with_state(state)
+        .layer(middleware::from_fn(auth::browser_response_headers))
+}
+
+pub fn build_bridge_router(state: AppState) -> Router {
+    Router::new()
+        .route("/internal/mcp", post(routes::internal_mcp_handler))
         .with_state(state)
 }

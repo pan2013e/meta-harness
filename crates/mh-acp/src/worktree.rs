@@ -79,13 +79,26 @@ pub fn sanitize_ref_component(raw: &str) -> String {
     }
 }
 
+fn workspace_git(dir: &Path, args: &[&str]) -> tokio::process::Command {
+    let mut command = crate::platform::background_command("git");
+    command.arg("-C").arg(dunce::simplified(dir)).args([
+        "-c",
+        "core.hooksPath=/dev/null",
+        "-c",
+        "core.fsmonitor=false",
+    ]);
+    if args.first() == Some(&"diff") {
+        command
+            .args(["diff", "--no-ext-diff", "--no-textconv"])
+            .args(&args[1..]);
+    } else {
+        command.args(args);
+    }
+    command
+}
+
 async fn git_output(dir: &Path, args: &[&str]) -> Result<std::process::Output, AcpError> {
-    Ok(crate::platform::background_command("git")
-        .arg("-C")
-        .arg(dunce::simplified(dir))
-        .args(args)
-        .output()
-        .await?)
+    Ok(workspace_git(dir, args).output().await?)
 }
 
 async fn run_git(dir: &Path, args: &[&str]) -> Result<(bool, String, String), AcpError> {
@@ -99,9 +112,7 @@ async fn run_git_with_author(
     dir: &Path,
     args: &[&str],
 ) -> Result<(bool, String, String), AcpError> {
-    let dir_clean = dunce::simplified(dir);
-    let mut cmd = crate::platform::background_command("git");
-    cmd.arg("-C").arg(dir_clean).args(args);
+    let mut cmd = workspace_git(dir, args);
 
     // Ensure automated commits succeed even if user hasn't set global git user.name/email in CI
     let has_name = run_git(dir, &["config", "user.name"])
@@ -649,7 +660,7 @@ async fn diff_worktree_snapshot(
         Some(tempfile::tempdir()?)
     };
     let snapshot = alternate.as_ref().map(tempfile::TempDir::path);
-    let mut args = vec!["diff", "--no-ext-diff"];
+    let mut args = vec!["diff"];
     if let Some(path) = snapshot {
         let source_objects = checked_diff_git(
             worktree,
@@ -685,12 +696,8 @@ async fn checked_diff_git(
     snapshot: Option<&Path>,
     args: &[&str],
 ) -> Result<String, AcpError> {
-    let mut command = crate::platform::background_command("git");
-    command
-        .arg("-C")
-        .arg(dunce::simplified(worktree))
-        .env("GIT_OPTIONAL_LOCKS", "0")
-        .args(args);
+    let mut command = workspace_git(worktree, args);
+    command.env("GIT_OPTIONAL_LOCKS", "0");
     if let Some(path) = snapshot {
         command.env("GIT_INDEX_FILE", dunce::simplified(&path.join("index")));
         command.env(
@@ -814,10 +821,7 @@ pub async fn promote_session(
                 });
             }
 
-            let mut apply = crate::platform::background_command("git")
-                .arg("-C")
-                .arg(dunce::simplified(project_root))
-                .args(["apply", "-"])
+            let mut apply = workspace_git(project_root, &["apply", "-"])
                 .stdin(std::process::Stdio::piped())
                 .stdout(std::process::Stdio::piped())
                 .stderr(std::process::Stdio::piped())
@@ -926,6 +930,46 @@ pub async fn prune_session_worktrees(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn automated_worktree_commits_skip_repository_hooks() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        init_git_repo(root).await.unwrap();
+        let integration = ensure_session_integration_worktree(root, "hook-check")
+            .await
+            .unwrap();
+        let hooks = root.join(".git/test-hooks");
+        std::fs::create_dir(&hooks).unwrap();
+        let hook = hooks.join("pre-commit");
+        std::fs::write(&hook, "#!/bin/sh\nexit 45\n").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        assert!(
+            run_git(
+                root,
+                &[
+                    "config",
+                    "--local",
+                    "core.hooksPath",
+                    &hooks.to_string_lossy()
+                ]
+            )
+            .await
+            .unwrap()
+            .0
+        );
+        std::fs::write(integration.path.join("change.txt"), "Fixture change\n").unwrap();
+        assert!(
+            commit_worktree_if_dirty(&integration.path, "mock", "Automatic commit")
+                .await
+                .unwrap()
+                .is_some()
+        );
+    }
 
     #[tokio::test]
     async fn first_worktree_preserves_staged_files_and_the_unborn_branch_name() {

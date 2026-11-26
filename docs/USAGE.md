@@ -51,6 +51,8 @@ While working concurrently, harnesses connect through Meta-Harness's embedded MC
 
 ### Composer Controls & Slash Commands
 
+In the desktop app, right-click selected chat text to copy it or quote it in the composer. The composer and terminal have **Copy** and **Paste** menus. Quoted mentions and slash directives stay in the draft as reference text. The Windows title bar follows the selected theme.
+
 - **Atomic Pills:** `@mentions`, `/commands`, and `/skills` convert into indivisible pills (delete cleanly with a single `Backspace` or click `×`).
   - **Workflow pills** *(passed cleanly as directives)*: `/plan`, `/review`, `/test`, `/fix`
   - **Action pills** *(execute workspace actions immediately)*: `/compact` *(condense older chat context into working summary)*, `/diff`, `/shell`, `/memory`, `/new`, `/archive`
@@ -134,6 +136,8 @@ Click **Settings** in the bottom-left sidebar to manage six sections:
 
 ## 7. CLI Flags, Environment Overrides, & Remote Access
 
+Launch Meta-Harness as a standard user. The app refuses Unix root and elevated Windows launches.
+
 ```sh
 meta-harness [OPTIONS]
 meta-harness serve [OPTIONS]
@@ -141,12 +145,19 @@ meta-harness serve [OPTIONS]
 
 | Flag / Env Var | Description | Default |
 | :--- | :--- | :--- |
-| `--bind <ADDR:PORT>` | Bind address for HTTP/WebSocket server | `127.0.0.1:4410` |
-| `--auth-token <TOKEN>` | Explicit bearer token for non-loopback binds | Random generated token |
+| `--bind <ADDR:PORT>` | Listen on this address for web and terminal traffic | `127.0.0.1:4410` |
+| `--tls-cert <PATH>`, `--tls-key <PATH>` | PEM certificate chain and private key for HTTPS | Required for a non-loopback bind |
+| `--auth-token <TOKEN>` | Require pairing with a supplied token of at least 24 characters | Random generated token when binding outside loopback |
 | `--no-open` | Do not automatically launch a browser tab | Opens on loopback |
 | `--no-tray` | Run in the foreground without system tray / menu bar icon | Tray enabled on Windows/macOS releases |
 | `--config <PATH>` | Path to `harnesses.toml` configuration | Auto-discovered |
 | `--data-dir <PATH>` | Override SQLite database & app data directory | OS app-data dir |
 | `MH_CONFIG_DIR`, `MH_DATA_DIR`, `MH_WORKSPACE_DIR` | Override config, data, and Quick Session directories | OS standard dirs / `~/.meta-harness/workspaces` |
 
-When `--bind` is set to a non-loopback address (for example `0.0.0.0:4410` over LAN or Tailscale), Meta-Harness requires pairing via `?token=<TOKEN>` (exchanged for an `HttpOnly` session cookie) or an `Authorization: Bearer <TOKEN>` header.
+Direct LAN access requires HTTPS. Supply a certificate trusted by your clients and use the hostname or IP address on that certificate when opening the pairing URL. The `#token=…` fragment is exchanged for a browser session that expires after 24 hours. Chat and terminal WebSockets close at expiry, and the browser prompts for pairing again. API clients can send `Authorization: Bearer <TOKEN>` over HTTPS.
+
+```sh
+meta-harness serve --bind harness.example:4410 --tls-cert fullchain.pem --tls-key key.pem
+```
+
+For an existing HTTPS reverse proxy, keep Meta-Harness on `127.0.0.1`, set a strong `--auth-token`, and forward the original `Host` header and WebSocket upgrades. Open the proxy's HTTPS URL and enter the token at the pairing prompt. Pairing grants access to the workspace and the server user's terminal.

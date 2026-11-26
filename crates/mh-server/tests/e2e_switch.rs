@@ -8,12 +8,12 @@ use tokio::net::TcpListener;
 use mh_acp::{AcpSupervisor, QuotaTracker, ensure_member_worktree, init_git_repo};
 use mh_core::{AdapterConfig, AppConfig, AppPaths, DispatchTaskSpec, MessageKind, PromoteMode};
 use mh_server::auth::AuthConfig;
-use mh_server::{AppState, build_router};
+use mh_server::{AppState, build_bridge_router, build_router};
 use mh_store::Store;
 use mh_switch::{SwitchEngine, SwitchError, TurnPurpose, execute_mcp_tool};
 
 fn mock_app_config() -> AppConfig {
-    let exe = env!("CARGO_BIN_EXE_meta-harness").to_string();
+    let exe = env!("CARGO_BIN_EXE_mh-test-fixture").to_string();
     let mut cfg = AppConfig::default();
     let mut adapters = BTreeMap::new();
     for (id, name) in [
@@ -28,7 +28,7 @@ fn mock_app_config() -> AppConfig {
                 accent_color: "#6366f1".into(),
                 enabled: true,
                 command: exe.clone(),
-                args: vec!["internal-mock-agent".into()],
+                args: vec!["mock-agent".into()],
                 fallback_commands: Vec::new(),
                 quota_provider: "manual".into(),
                 exact_quota_probe_opt_in: false,
@@ -54,7 +54,7 @@ async fn start_test_server(
     let store = Store::open_in_memory().unwrap();
     let supervisor = AcpSupervisor::new(300);
     let quota = Arc::new(QuotaTracker::new());
-    let exe = std::path::PathBuf::from(env!("CARGO_BIN_EXE_meta-harness"));
+    let exe = std::path::PathBuf::from(env!("CARGO_BIN_EXE_mh-test-fixture"));
     let bridge_token = "test_bridge_secret_123".to_string();
 
     let switch = SwitchEngine::new(
@@ -67,11 +67,14 @@ async fn start_test_server(
         bridge_token,
     );
 
-    let auth = if auth_required {
-        AuthConfig::from_bind_and_flag("0.0.0.0:4410", Some("lan_secret_xyz".into()))
-    } else {
-        AuthConfig::from_bind_and_flag("127.0.0.1:4410", None)
-    };
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let auth = AuthConfig::for_listener(
+        address,
+        false,
+        auth_required.then(mh_server::auth::generate_random_hex_token),
+    )
+    .unwrap();
 
     let state = AppState {
         switch: Arc::clone(&switch),
@@ -79,14 +82,16 @@ async fn start_test_server(
         harness_jobs: Default::default(),
     };
 
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let port = listener.local_addr().unwrap().port();
-    let base_url = format!("http://127.0.0.1:{port}");
+    let base_url = format!("http://{address}");
     switch
         .set_internal_mcp_url(format!("{base_url}/internal/mcp"))
         .await;
 
-    let app = build_router(state);
+    let app = if auth_required {
+        build_router(state)
+    } else {
+        build_router(state.clone()).merge(build_bridge_router(state))
+    };
     let handle = tokio::spawn(async move {
         let _ = axum::serve(listener, app).await;
     });
@@ -113,6 +118,164 @@ async fn lan_auth_guard_enforces_bearer_token() {
         .await
         .unwrap();
     assert_eq!(authed.status(), reqwest::StatusCode::OK);
+
+    let projects_url = format!("{base_url}/api/projects");
+    let query_only = http
+        .get(&projects_url)
+        .query(&[("token", &auth.token)])
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(query_only.status(), reqwest::StatusCode::UNAUTHORIZED);
+
+    let paired = http
+        .post(format!("{base_url}/api/auth/session"))
+        .header(
+            reqwest::header::ORIGIN,
+            base_url.replacen("http://", "https://", 1),
+        )
+        .json(&json!({"token": auth.token}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(paired.status(), reqwest::StatusCode::OK);
+    assert_eq!(
+        paired.headers()[reqwest::header::CACHE_CONTROL],
+        "private, no-store"
+    );
+    let cookie = paired.headers()[reqwest::header::SET_COOKIE]
+        .to_str()
+        .unwrap();
+    assert!(!cookie.contains(&auth.token));
+    assert!(cookie.contains("Path=/api/; HttpOnly; SameSite=Strict; Secure"));
+    let session_cookie = cookie.split(';').next().unwrap();
+    let paired_projects = http
+        .get(&projects_url)
+        .header(reqwest::header::COOKIE, session_cookie)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(paired_projects.status(), reqwest::StatusCode::OK);
+    let blocked_origin = http
+        .get(&projects_url)
+        .header(reqwest::header::COOKIE, session_cookie)
+        .header("Sec-Fetch-Site", "cross-site")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(blocked_origin.status(), reqwest::StatusCode::FORBIDDEN);
+
+    let bridge = http
+        .post(format!("{base_url}/internal/mcp"))
+        .json(&json!({"action":"list"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(bridge.status(), reqwest::StatusCode::NOT_FOUND);
+
+    switch.supervisor.shutdown_all().await;
+    srv.abort();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn preview_grants_and_mcp_credentials_are_scoped() {
+    let (base_url, switch, srv, _tmp, paths) = start_test_server_with_paths().await;
+    let http = reqwest::Client::new();
+    let created: Value = http
+        .post(format!("{base_url}/api/sessions"))
+        .json(&json!({"isolation_mode":"shared_cwd"}))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let session = created["session"]["id"].as_str().unwrap();
+    let workspace = paths.standalone_session_root(session);
+    std::fs::create_dir_all(workspace.join("site")).unwrap();
+    std::fs::write(workspace.join("site/index.html"), "<p>Preview fixture</p>").unwrap();
+    std::fs::write(
+        workspace.join("site/theme.css"),
+        "p { color: rebeccapurple; }",
+    )
+    .unwrap();
+    std::fs::write(workspace.join("notes.txt"), "Synthetic non-preview file").unwrap();
+    std::fs::write(
+        workspace.join("site/test.svg"),
+        "<svg xmlns=\"http://www.w3.org/2000/svg\"/>",
+    )
+    .unwrap();
+
+    let file_url = format!("{base_url}/api/sessions/{session}/files");
+    let entry = http
+        .head(format!("{file_url}/site/index.html?preview=true"))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap();
+    let grant = entry.headers()["x-meta-harness-preview"].to_str().unwrap();
+    let preview = format!("{base_url}/preview/{session}/{grant}");
+    let css = http
+        .get(format!("{preview}/site/theme.css"))
+        .header(reqwest::header::ORIGIN, "null")
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap();
+    assert_eq!(
+        css.headers()[reqwest::header::ACCESS_CONTROL_ALLOW_ORIGIN],
+        "null"
+    );
+    assert!(css.text().await.unwrap().contains("rebeccapurple"));
+    let outside = http
+        .get(format!("{preview}/notes.txt"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(outside.status(), reqwest::StatusCode::NOT_FOUND);
+    let svg = http
+        .get(format!("{file_url}/site/test.svg?preview=true"))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap();
+    assert!(
+        svg.headers()[reqwest::header::CONTENT_SECURITY_POLICY]
+            .to_str()
+            .unwrap()
+            .starts_with("sandbox;")
+    );
+    let download = http
+        .get(format!("{file_url}/notes.txt"))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap();
+    assert_eq!(
+        download.headers()[reqwest::header::CONTENT_DISPOSITION],
+        "attachment"
+    );
+
+    let token = switch.member_bridge_token(session, "codex");
+    let list_tools = |caller| {
+        http.post(format!("{base_url}/internal/mcp"))
+            .bearer_auth(&token)
+            .json(&json!({"session_id": session, "caller": caller, "action":"list"}))
+    };
+    assert_eq!(
+        list_tools("codex").send().await.unwrap().status(),
+        reqwest::StatusCode::OK
+    );
+    assert_eq!(
+        list_tools("claude").send().await.unwrap().status(),
+        reqwest::StatusCode::UNAUTHORIZED
+    );
 
     switch.supervisor.shutdown_all().await;
     srv.abort();
@@ -246,7 +409,7 @@ async fn e2e_parallel_worktrees_consult_cycle_trajectory_orchestrator_and_promot
     // 3. Wait for members to go idle before testing peer_consult & trajectory_read
     tokio::time::sleep(Duration::from_millis(400)).await;
 
-    // Peer consult over real `meta-harness mcp-bridge` subprocess!
+    // Peer consult over the real MCP bridge protocol in the test subprocess.
     http.post(format!("{base_url}/api/sessions/{session_id}/messages"))
         .json(&json!({
             "content": "@codex [MOCK:MCP tool=\"peer_consult\" args={\"target\":\"claude\",\"question\":\"Verify API shape\"}]"
@@ -634,7 +797,7 @@ async fn start_test_server_with_paths() -> (
     let store = Store::open(&paths.db_path()).unwrap();
     let supervisor = AcpSupervisor::new(300);
     let quota = Arc::new(QuotaTracker::new());
-    let exe = std::path::PathBuf::from(env!("CARGO_BIN_EXE_meta-harness"));
+    let exe = std::path::PathBuf::from(env!("CARGO_BIN_EXE_mh-test-fixture"));
     let bridge_token = "test_bridge_secret_123".to_string();
 
     let switch = SwitchEngine::new_with_paths(
@@ -648,21 +811,21 @@ async fn start_test_server_with_paths() -> (
         paths.clone(),
     );
 
-    let auth = AuthConfig::from_bind_and_flag("127.0.0.1:4410", None);
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let auth = AuthConfig::for_listener(address, false, None).unwrap();
     let state = AppState {
         switch: Arc::clone(&switch),
         auth,
         harness_jobs: Default::default(),
     };
 
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let port = listener.local_addr().unwrap().port();
-    let base_url = format!("http://127.0.0.1:{port}");
+    let base_url = format!("http://{address}");
     switch
         .set_internal_mcp_url(format!("{base_url}/internal/mcp"))
         .await;
 
-    let app = build_router(state);
+    let app = build_router(state.clone()).merge(build_bridge_router(state));
     let handle = tokio::spawn(async move {
         let _ = axum::serve(listener, app).await;
     });

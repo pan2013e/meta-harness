@@ -125,7 +125,7 @@ pub struct SwitchEngine {
     pub events_tx: broadcast::Sender<WsEvent>,
     pub self_exe: PathBuf,
     pub internal_mcp_url: RwLock<String>,
-    pub bridge_token: String,
+    bridge_token: String,
     pub app_paths: AppPaths,
     pub skill_mutations: Mutex<()>,
     pub workspace_paths_lock: Mutex<()>,
@@ -193,6 +193,16 @@ impl SwitchEngine {
 
     pub async fn set_internal_mcp_url(&self, url: String) {
         *self.internal_mcp_url.write().await = url;
+    }
+
+    pub fn member_bridge_token(&self, session_id: &str, member: &str) -> String {
+        use ring::hmac;
+        let key = hmac::Key::new(hmac::HMAC_SHA256, self.bridge_token.as_bytes());
+        let mut signature = hmac::Context::with_key(&key);
+        signature.update(&(session_id.len() as u64).to_be_bytes());
+        signature.update(session_id.as_bytes());
+        signature.update(member.as_bytes());
+        hex::encode(signature.sign().as_ref())
     }
 
     pub async fn runtime(&self, session_id: &str) -> Arc<SessionRuntime> {
@@ -1207,7 +1217,7 @@ impl SwitchEngine {
                     &mcp_url,
                     session_id,
                     &member.handle,
-                    &self.bridge_token,
+                    &self.member_bridge_token(session_id, &member.handle),
                 ))
             } else {
                 None

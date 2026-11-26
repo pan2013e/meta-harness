@@ -23,6 +23,8 @@ Install **Git** and at least one supported ACP harness CLI signed in with your o
 - **Claude Code** (`claude` / `@agentclientprotocol/claude-agent-acp`)
 - **Antigravity / Gemini** (`agy acp` or `gemini --acp`)
 
+Run the desktop app and standalone binary from a standard user account. Meta-Harness refuses privileged launches.
+
 ### Option 1: Prebuilt Desktop App or Standalone Binary (Recommended)
 
 Download the installer or standalone binary for your platform and architecture from [GitHub Releases](https://github.com/pan2013e/meta-harness/releases).
@@ -36,6 +38,8 @@ Desktop users can open **Settings → About → Check for updates**. **Update an
 For the standalone binary, use `meta-harness update --check` to check the release feed and `meta-harness update` to download and replace the binary. Quit and restart any running instance to use the new version. `meta-harness uninstall` removes a copy installed with `install`. If you installed to a custom directory, pass the same `--bin-dir` to `uninstall`. Removing the desktop or standalone binary keeps your sessions, profiles, and settings.
 
 The standalone binary serves the web UI at `http://127.0.0.1:4410` and opens your browser automatically. Pass `--no-tray` or `--no-open` for headless operation.
+
+Direct LAN listening requires HTTPS. The usage guide covers certificates, pairing, and loopback deployment behind an HTTPS reverse proxy. [Remote access setup](docs/USAGE.md#7-cli-flags-environment-overrides--remote-access)
 
 ### Option 2: Build from Source
 

@@ -66,7 +66,7 @@ function recipientKey(member: SessionMember): string {
 }
 
 function routingMentions(markdown: string, handles: ReadonlySet<string>) {
-  // Match the router's mention boundaries and ignore fenced and inline code.
+  // Keep quoted mentions and code out of the inferred recipients.
   let fence: string | undefined;
   const withoutFences = markdown.split("\n").map((line) => {
     if (fence) {
@@ -74,6 +74,7 @@ function routingMentions(markdown: string, handles: ReadonlySet<string>) {
       if (closing?.startsWith(fence)) fence = undefined;
       return "";
     }
+    if (/^[ \t]*>/.test(line)) return "";
     const opening = line.match(/^[ \t]*(`{3,}|~{3,})(.*)$/);
     if (opening && (opening[1][0] === "~" || !opening[2].includes("`"))) {
       fence = opening[1];
@@ -147,11 +148,13 @@ function quotaUsed(quota?: QuotaSnapshot): number | null {
   return remaining.length ? Math.max(0, Math.min(100, 100 - Math.min(...remaining))) : null;
 }
 
+export type ComposerPreset = { kind: "starter"; text: string } | { kind: "quote"; text: string; sessionId: string };
+
 export function Composer({
   draftPreset,
   onConsumePreset,
 }: {
-  draftPreset?: { seq: number; text: string } | null;
+  draftPreset?: ComposerPreset | null;
   onConsumePreset?: () => void;
 }) {
   const {
@@ -208,11 +211,19 @@ export function Composer({
 
   useEffect(() => {
     if (draftPreset?.text) {
-      setText(draftPreset.text);
+      if (draftPreset.kind === "quote") {
+        const quote = draftPreset.text.trim().replace(/\r\n?/g, "\n").split("\n").map((line) => `> ${line}`).join("\n");
+        setText((draft) => {
+          const separator = !draft || draft.endsWith("\n\n") ? "" : draft.endsWith("\n") ? "\n" : "\n\n";
+          return `${draft}${separator}${quote}\n\n`;
+        });
+      } else {
+        setText(draftPreset.text);
+      }
       onConsumePreset?.();
       editorRef.current?.focus();
     }
-  }, [draftPreset?.seq, draftPreset?.text, onConsumePreset]);
+  }, [draftPreset, onConsumePreset]);
 
   const installedProbes = useMemo(
     () => probes.filter((p) => p.installed),

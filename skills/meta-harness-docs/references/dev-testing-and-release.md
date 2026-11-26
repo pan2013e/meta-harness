@@ -38,17 +38,18 @@ Because Meta-Harness uses Git worktrees (`.meta-harness/worktrees/<session_id>/_
 
 ---
 
-## 3. Deterministic Offline Testing (`internal-mock-agent`)
+## 3. Deterministic Offline Testing
 
 Meta-Harness supports deterministic integration testing without external AI subscriptions or network access:
 
-- `crates/mh-acp/src/mock_agent.rs` (`meta-harness internal-mock-agent` / `mock-acp-agent` test binary) speaks full ACP stdio JSON-RPC 2.0 and supports prompt directives (after stripping context XML blocks like `<available_skills>`, `<activated_skills>`, `<group_chat_updates>`, `<orchestrator_telemetry>`):
+- `crates/mh-acp/src/mock_agent.rs` speaks ACP stdio JSON-RPC 2.0 through `mock-acp-agent` and `mh-test-fixture mock-agent`. It supports prompt directives after stripping context XML blocks such as `<available_skills>` and `<group_chat_updates>`:
   - `[MOCK:REPLY text="..."]` — Return fixed final output.
   - `[MOCK:WRITE path="src/foo.rs" content="..."]` — Exercise `fs/write_text_file` & unified diff capture.
   - `[MOCK:SH cmd="..."]` — Exercise brokered `terminal/create` + `terminal/wait_for_exit`.
   - `[MOCK:MCP tool="skill_read" args={"skill":"meta-harness-docs"}]` (with optional `permission=required`) — Exercise `meta-harness mcp-bridge` tool calls & auto-approval checks.
   - `[MOCK:ORCH_AUTO]`, `[MOCK:CURATE]`, `[MOCK:SLEEP ms=... until="..."]`, `[MOCK:429]`, `[MOCK:CHILD_UPDATE]` — Cover quota-aware dispatch, memory curation, `<250 ms` cancellation, 429 failover, and child-session filtering.
 - See `crates/mh-server/tests/e2e_switch.rs` and `crates/mh-acp/tests/acp_integration.rs` for full end-to-end fixtures.
+- Server integration tests launch the mock agent and bridge from `mh-test-fixture`. Release builds package only the `meta-harness` executable and enforce the startup privilege check.
 
 ---
 
@@ -77,8 +78,9 @@ cargo test --locked --workspace
   node scripts/version.mjs --check
   ```
   *(Keeps `Cargo.toml`, `Cargo.lock`, `web/package.json`, `desktop/package.json`, and lockfiles synchronized. Omit `--locked` only intentionally when updating `Cargo.lock`.)*
-- Document notable user-visible changes under `## [Unreleased]` in `CHANGELOG.md` and update `docs/SPECIFICATION.md` / `docs/USAGE.md` when contracts or UI workflows change.
+- Record notable changes under `## Unreleased` in `CHANGELOG.md`. Move them to the versioned section for milestone releases, and update `docs/SPECIFICATION.md`, `docs/USAGE.md`, and this bundled skill when their workflows change.
 - **Release packages:**
   - `node scripts/build.mjs` -> Electron desktop installer/archive (`dist/desktop`) + standalone binary (`dist/cli`).
   - `node scripts/build.mjs --cli-only` -> Standalone binary (`dist/cli`).
   - Pass `--unpacked` during local packaging verification.
+  - Run the **Release build** workflow from the matching version tag with publishing enabled to attach verified Windows and macOS update assets to a GitHub release.

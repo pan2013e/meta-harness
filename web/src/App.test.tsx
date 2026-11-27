@@ -110,14 +110,34 @@ it("delivers enabled desktop notifications for activity in another session", () 
 });
 
 it("shows direct fallback and recovery from a manual proxy check", async () => {
-  vi.spyOn(api, "proxyStatus").mockResolvedValue({ host: "proxy.example:8080", checked_at: 1, proxy_not_used: true });
-  const check = vi.spyOn(api, "checkProxy").mockResolvedValue({ host: "proxy.example:8080", checked_at: 2, proxy_not_used: false });
+  const fallback = { host: "proxy.example:8080", checked_at: 1, proxy_not_used: true, desktop_override: true, generation: 1 };
+  vi.spyOn(api, "proxyStatus").mockResolvedValue(fallback);
+  const check = vi.spyOn(api, "checkProxy").mockResolvedValue({ ...fallback, checked_at: 2, proxy_not_used: false, generation: 2 });
   render(<NetworkSettings />);
   await screen.findByText("Proxy not used");
   expect(screen.queryByRole("alert")).toBeNull();
   fireEvent.click(screen.getByRole("button", { name: "Check now" }));
   await screen.findByText("Proxy active");
   expect(check).toHaveBeenCalledTimes(1);
+});
+
+it("requires confirmation before saving an unreachable desktop proxy", async () => {
+  const automatic = { host: null, checked_at: null, proxy_not_used: false, desktop_override: false, generation: 1 };
+  const direct = { host: "proxy.example:8080", checked_at: 2, proxy_not_used: true, desktop_override: true, generation: 2 };
+  vi.spyOn(api, "proxyStatus").mockResolvedValue(automatic);
+  const saveProxy = vi.fn().mockResolvedValueOnce({ saved: false, status: automatic })
+    .mockResolvedValueOnce({ saved: true, status: direct });
+  vi.stubGlobal("metaHarnessDesktop", { saveProxy });
+  render(<NetworkSettings />);
+  await screen.findByText("Meta-Harness is currently using automatic proxy settings.");
+  fireEvent.change(screen.getByRole("textbox", { name: "Proxy URL" }), { target: { value: "proxy.example:8080" } });
+  fireEvent.click(screen.getByRole("button", { name: "Save proxy" }));
+  await screen.findByText(/failed the internet check/);
+  expect(screen.getByText("Meta-Harness is currently using automatic proxy settings.")).toBeTruthy();
+  expect(saveProxy).toHaveBeenCalledExactlyOnceWith("proxy.example:8080", false);
+  fireEvent.click(screen.getByRole("button", { name: "Save anyway" }));
+  await screen.findByText("Proxy not used");
+  expect(saveProxy).toHaveBeenLastCalledWith("proxy.example:8080", true);
 });
 
 it("switches away from a session while its background deletion is pending", async () => {
@@ -222,8 +242,13 @@ describe("Startup and file previews", () => {
       return { required: false, authenticated: true };
     });
     vi.spyOn(api, "listAdapters").mockImplementation(async (_refresh, summary) => {
-      if (!summary) await models;
-      return { adapters: {} };
+      if (summary) return { adapters: {} };
+      await models;
+      return { adapters: {}, probes: [{
+        adapter_id: "antigravity", display_name: "Antigravity", accent_color: "#6366f1",
+        installed: true, resolved_command: "agy",
+        auth_detected: true, auth_hint: "Antigravity sign-in verified for this profile", strengths: [],
+      }] };
     });
     vi.spyOn(api, "listQuotas").mockImplementation(async () => {
       await quota;
@@ -233,9 +258,9 @@ describe("Startup and file previews", () => {
     vi.spyOn(api, "listStandaloneSessions").mockResolvedValue({ sessions: [] });
     vi.spyOn(api, "probeAdapters").mockResolvedValue({
       probes: [{
-        adapter_id: "codex", display_name: "Codex", accent_color: "#10a37f",
-        installed: true, resolved_command: "/usr/bin/codex",
-        auth_detected: true, auth_hint: "Ready", strengths: [],
+        adapter_id: "antigravity", display_name: "Antigravity", accent_color: "#6366f1",
+        installed: true, resolved_command: "agy",
+        auth_detected: false, auth_hint: "Separate profile sign-in is unverified.", strengths: [],
       }],
     });
     vi.spyOn(WsHubClient.prototype, "connect").mockImplementation(() => undefined);
@@ -248,6 +273,7 @@ describe("Startup and file previews", () => {
 
     loadModels();
     await waitFor(() => expect(screen.getByRole("status").textContent).toBe("Checking subscription usage"));
+    expect(useAppStore.getState().probes[0].auth_detected).toBe(true);
     loadQuota();
     await waitFor(() => expect(screen.queryByRole("status")).toBeNull());
   });

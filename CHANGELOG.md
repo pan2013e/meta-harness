@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+## 0.10.1
+
+- Validate and test desktop proxy URLs before saving. Apply proxy changes and restore automatic settings without a restart.
+- Replace the abbreviated dependency list in About with the third-party license viewer entry.
+- Verify Antigravity separate profiles through ACP so Windows Credential Manager sign-ins are recognized and the active profile's model catalog can load.
+
 ## 0.10.0
 
 - Check explicit outbound proxies at startup, every minute, and on demand from Settings. Switch to direct routing when the check fails and resume proxy routing after recovery.

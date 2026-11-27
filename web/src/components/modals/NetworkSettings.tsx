@@ -9,6 +9,7 @@ export function NetworkSettings() {
   const [loading, setLoading] = useState(true);
   const [saving, setSaving] = useState(false);
   const [checking, setChecking] = useState(false);
+  const [unreachable, setUnreachable] = useState(false);
 
   useEffect(() => {
     const abort = new AbortController();
@@ -19,7 +20,10 @@ export function NetworkSettings() {
       try {
         const next = await api.proxyStatus(abort.signal);
         if (!abort.signal.aborted) {
-          setStatus((previous) => (previous?.checked_at ?? 0) > (next.checked_at ?? 0) ? previous : next);
+          setStatus((previous) => previous && (
+            previous.generation > next.generation ||
+            (previous.generation === next.generation && (previous.checked_at ?? 0) > (next.checked_at ?? 0))
+          ) ? previous : next);
         }
       } catch {
         if (initial && !abort.signal.aborted) notifyInApp("Could not read the server proxy status.", "error");
@@ -37,7 +41,7 @@ export function NetworkSettings() {
     if (checking) return;
     setChecking(true);
     try {
-      setStatus(await api.checkProxy());
+      setStatus(await (desktop?.checkProxy?.() ?? api.checkProxy()));
     } catch (cause) {
       reportInAppError(cause);
     } finally {
@@ -45,29 +49,40 @@ export function NetworkSettings() {
     }
   };
 
-  const save = async (proxy: string | null) => {
+  const save = async (proxy: string | null, allowUnreachable = false) => {
     if (!desktop?.saveProxy || saving) return;
     setSaving(true);
     try {
-      await desktop.saveProxy(proxy);
+      const result = await desktop.saveProxy(proxy, allowUnreachable);
+      setUnreachable(!result.saved);
+      if (result.saved) {
+        setStatus(result.status);
+        setValue("");
+        notifyInApp(proxy ? "Proxy settings saved." : "Automatic proxy settings restored.", "success");
+      }
     } catch (cause) {
       reportInAppError(cause);
+    } finally {
       setSaving(false);
     }
   };
+
+  const route = status?.proxy_not_used
+    ? "a direct connection"
+    : status?.host ? `the proxy at ${status.host}` : "automatic proxy settings";
 
   return (
     <form className="settings-card space-y-4 text-sm" onSubmit={(event) => { event.preventDefault(); if (value.trim()) void save(value.trim()); }}>
       <div>
         <h2 className="settings-heading">Outbound proxy</h2>
-        <p className="mt-1 text-xs text-ink-muted">
-          {desktop?.saveProxy ? "An explicit proxy is checked every minute." : "Set an explicit server proxy with meta-harness --proxy <URL> to enable health checks."}
-        </p>
+        {!desktop?.saveProxy && <p className="mt-1 text-xs text-ink-muted">
+          Set an explicit server proxy with <code>meta-harness --proxy &lt;URL&gt;</code> to enable health checks.
+        </p>}
       </div>
       <div className="flex flex-wrap items-center justify-between gap-2">
         <div className="space-y-1 text-xs text-ink-soft">
           <p role="status" className="flex flex-wrap items-center gap-2">
-            {loading ? "Reading proxy status…" : status?.host ?? "Using startup environment or system proxy settings"}
+            {loading ? "Reading proxy status…" : status ? `Meta-Harness is currently using ${route}.` : "Proxy status unavailable."}
             {status?.host && (status.proxy_not_used ? (
               <span className="rounded-md bg-warn-soft px-1.5 py-0.5 text-warn" title="The connectivity check failed. New connections use the direct route.">Proxy not used</span>
             ) : <span className="rounded-md bg-pos-soft px-1.5 py-0.5 text-pos">Proxy active</span>)}
@@ -82,15 +97,22 @@ export function NetworkSettings() {
       </div>
       {desktop?.saveProxy && <label className="block space-y-1 text-xs text-ink-soft">
         <span>Proxy URL</span>
-        <input type="text" autoComplete="off" autoCapitalize="none" spellCheck={false} value={value} maxLength={2048}
-          onChange={(event) => setValue(event.target.value)} placeholder="http://proxy.example:8080"
+        <input type="text" autoComplete="off" autoCapitalize="none" spellCheck={false} value={value} maxLength={2048} disabled={saving}
+          onChange={(event) => { setValue(event.target.value); setUnreachable(false); }} placeholder="http://proxy.example:8080"
           className="w-full rounded-lg border border-line bg-inset px-3 py-2 text-sm text-ink" />
       </label>}
       {desktop?.saveProxy && <div className="flex flex-wrap gap-2 text-xs">
-        <button type="submit" disabled={loading || saving || !value.trim()}
-          className="rounded-lg bg-brand px-3 py-1.5 font-medium text-white hover:bg-brand-hover disabled:opacity-50">Save and restart</button>
-        {status?.host && <button type="button" disabled={saving} onClick={() => void save(null)}
-          className="rounded-lg border border-line bg-elevated px-3 py-1.5 hover:bg-hover disabled:opacity-50">Use automatic proxy and restart</button>}
+        <button type="submit" disabled={loading || saving || checking || !value.trim()}
+          className="rounded-lg bg-brand px-3 py-1.5 font-medium text-white hover:bg-brand-hover disabled:opacity-50">
+          {saving ? "Checking proxy…" : "Save proxy"}
+        </button>
+        {status?.desktop_override && <button type="button" className="settings-button" disabled={saving || checking}
+          onClick={() => void save(null)}>Restore automatic settings</button>}
+      </div>}
+      {unreachable && <div className="flex flex-wrap items-center gap-2 rounded-lg bg-warn-soft px-3 py-2 text-xs text-warn">
+        <p role="status" className="flex-1">This proxy failed the internet check. If saved, Meta-Harness will connect directly until the proxy recovers.</p>
+        <button type="button" className="settings-button" disabled={saving || checking}
+          onClick={() => void save(value.trim(), true)}>Save anyway</button>
       </div>}
     </form>
   );

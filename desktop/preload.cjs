@@ -9,6 +9,7 @@ if (process.isMainFrame) {
     setTitleBarColors: (color, symbolColor) => ipcRenderer.invoke("meta-harness:title-bar-colors", color, symbolColor),
     selectProjectFolder: () => ipcRenderer.invoke("meta-harness:project-folder"),
     notify: (body) => ipcRenderer.invoke("meta-harness:notify", body),
-    saveProxy: (value) => ipcRenderer.invoke("meta-harness:save-proxy", value),
+    checkProxy: () => ipcRenderer.invoke("meta-harness:check-proxy"),
+    saveProxy: (value, allowUnreachable) => ipcRenderer.invoke("meta-harness:save-proxy", value, allowUnreachable),
   });
 }

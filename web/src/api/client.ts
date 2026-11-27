@@ -105,6 +105,8 @@ export interface OutboundProxyStatus {
   host: string | null;
   checked_at: number | null;
   proxy_not_used: boolean;
+  desktop_override: boolean;
+  generation: number;
 }
 
 export const api = {
@@ -134,6 +136,7 @@ export const api = {
     apiFetch<{
       adapters: Record<string, AdapterConfig>;
       catalogs?: Record<string, AdapterModelCatalog>;
+      probes?: AdapterProbeStatus[] | null;
       defaults?: Record<string, AdapterModelPref>;
       global_personas?: GlobalPersona[];
       saved_profiles?: string[];

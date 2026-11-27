@@ -1,3 +1,5 @@
+import type { OutboundProxyStatus } from "./api/client";
+
 type TextMenuAction = { type: "quote" } | { type: "paste"; text: string } | { type: "paste_image"; data: string } | { type: "paste_error"; message: string } | null;
 
 declare global {
@@ -10,7 +12,8 @@ declare global {
       setTitleBarColors: (color: string, symbolColor: string) => Promise<void>;
       selectProjectFolder: () => Promise<string | null>;
       notify: (body: string) => Promise<boolean>;
-      saveProxy: (value: string | null) => Promise<void>;
+      checkProxy: () => Promise<OutboundProxyStatus>;
+      saveProxy: (value: string | null, allowUnreachable?: boolean) => Promise<{ saved: boolean; status: OutboundProxyStatus }>;
     };
   }
 }

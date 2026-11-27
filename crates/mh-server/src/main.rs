@@ -142,17 +142,22 @@ fn main() -> anyhow::Result<()> {
         eprintln!("{message}");
         std::process::exit(privilege::REFUSAL_EXIT_CODE);
     }
+    let mut desktop_network_settings = None;
     if cli.desktop_child {
         anyhow::ensure!(cli.command.is_none(), "Invalid desktop launcher arguments");
         cli.auth_token = Some(std::env::var("MH_DESKTOP_TOKEN")?);
+        desktop_network_settings =
+            std::env::var_os("MH_DESKTOP_NETWORK_SETTINGS").map(PathBuf::from);
         // SAFETY: No async runtime or background threads have started. Keep the desktop
         // pairing token out of the environment inherited by agents and shells.
         unsafe {
             std::env::remove_var("MH_DESKTOP_TOKEN");
+            std::env::remove_var("MH_DESKTOP_NETWORK_SETTINGS");
         }
     }
     if !matches!(cli.command, Some(Commands::McpBridge { .. })) {
-        mh_core::outbound_proxy::initialize(cli.proxy.as_deref()).map_err(anyhow::Error::msg)?;
+        mh_server::proxy_health::initialize(cli.proxy.as_deref(), desktop_network_settings)
+            .map_err(anyhow::Error::msg)?;
     }
     let runtime = tokio::runtime::Runtime::new()?;
     #[cfg(any(windows, target_os = "macos"))]

@@ -309,13 +309,7 @@ export function SettingsDialog({ onClose }: { onClose: () => void }) {
                 </div>
                 {(buildInfo?.release_build || window.metaHarnessDesktop?.windowsStore) && <AboutUpdates />}
                 <div className="space-y-2 border-t border-line pt-4">
-                  <h3 className="font-medium">Open-source software</h3>
-                  <ul className="space-y-1 text-xs text-ink-soft">
-                    <li>Rust, Tokio, Axum and SQLite</li>
-                    <li>React, Tailwind CSS and xterm.js</li>
-                    <li>Monaco Editor and PDF.js</li>
-                    <li>Electron and Chromium in the desktop app</li>
-                  </ul>
+                  <h3 className="font-medium">Licenses</h3>
                   <button type="button" className="settings-button" onClick={() => setShowLicenses(true)}>Third-party license notices</button>
                 </div>
               </section>

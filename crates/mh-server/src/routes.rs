@@ -273,9 +273,15 @@ pub async fn list_adapters(
             .then_some(id)
         })
         .collect::<Vec<_>>();
+    let probes = if query.summary {
+        None
+    } else {
+        Some(state.switch.supervisor.adapter_probe_status(&cfg).await)
+    };
     Ok(Json(json!({
         "adapters": cfg.adapters,
         "catalogs": catalogs,
+        "probes": probes,
         "defaults": defaults,
         "global_personas": personas,
         "saved_profiles": saved_profiles,
@@ -328,7 +334,7 @@ pub async fn update_adapter_defaults(
 
 pub async fn probe_adapters(State(state): State<AppState>) -> Json<Value> {
     let cfg = state.switch.config.read().await.clone();
-    let probes = probe_installed_adapters(&cfg);
+    let probes = state.switch.supervisor.adapter_probe_status(&cfg).await;
     Json(json!({ "probes": probes }))
 }
 

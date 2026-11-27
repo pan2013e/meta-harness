@@ -1,7 +1,8 @@
 const { app, BrowserWindow, Menu, Notification, Tray, clipboard, dialog, ipcMain, nativeImage, session, shell } = require("electron");
 const { execFile, spawn } = require("node:child_process");
 const { randomBytes } = require("node:crypto");
-const { readFile, rename, writeFile } = require("node:fs/promises");
+const { readFile } = require("node:fs/promises");
+const { request } = require("node:http");
 const { homedir } = require("node:os");
 const { delimiter, join } = require("node:path");
 const { createInterface } = require("node:readline");
@@ -134,6 +135,7 @@ function nativeEnvironment() {
 }
 
 async function loadProxySettings() {
+  configuredProxy = undefined;
   try {
     const { proxy } = JSON.parse(await readFile(proxySettingsPath(), "utf8"));
     if (typeof proxy === "string" && proxy.trim()) configuredProxy = parseProxy(proxy).href;
@@ -162,10 +164,46 @@ async function applyBrowserProxy() {
   if (rules.length) {
     const bypass = process.env.NO_PROXY || process.env.no_proxy;
     await session.defaultSession.setProxy({
+      mode: "fixed_servers",
       proxyRules: rules.join(";"),
       proxyBypassRules: [bypass, "localhost", "127.0.0.1", "[::1]"].filter(Boolean).join(","),
     });
+  } else {
+    await session.defaultSession.setProxy({ mode: "system" });
   }
+}
+
+function backendProxyRequest(method, settings) {
+  const address = new URL(backendUrl);
+  const token = new URLSearchParams(address.hash.slice(1)).get("token");
+  const body = settings ? JSON.stringify(settings) : undefined;
+  return new Promise((resolve, reject) => {
+    const req = request(new URL("/api/settings/proxy", address), {
+      method,
+      agent: false,
+      headers: {
+        Authorization: `Bearer ${token}`,
+        ...(body && { "Content-Type": "application/json" }),
+      },
+    }, (response) => {
+      let content = "";
+      response.setEncoding("utf8");
+      response.on("data", (data) => { content += data; });
+      response.on("error", reject);
+      response.on("end", () => {
+        try {
+          const value = JSON.parse(content);
+          if (response.statusCode !== 200) throw new Error(value.error || "Could not update the proxy settings.");
+          resolve(value);
+        } catch (error) {
+          reject(error);
+        }
+      });
+    });
+    req.on("error", reject);
+    req.setTimeout(15000, () => req.destroy(new Error("The proxy check timed out.")));
+    req.end(body);
+  });
 }
 
 function showTextMenu(event, kind, selection, canPaste) {
@@ -257,7 +295,7 @@ async function prepareDesktopUpdate(event, version) {
 
 function startBackend() {
   const token = randomBytes(24).toString("hex");
-  const env = { ...nativeEnvironment(), MH_DESKTOP_TOKEN: token };
+  const env = { ...process.env, MH_DESKTOP_TOKEN: token, MH_DESKTOP_NETWORK_SETTINGS: proxySettingsPath() };
   if (process.platform === "darwin") {
     env.PATH = [env.PATH, "/opt/homebrew/bin", "/usr/local/bin", join(homedir(), ".local", "bin"), join(homedir(), ".cargo", "bin")]
       .filter(Boolean).join(delimiter);
@@ -283,11 +321,12 @@ function startBackend() {
   startupTimer = setTimeout(() => showStartupError(new Error("The local backend did not become ready.")), 30000);
   const output = createInterface({ input: backend.stdout });
   output.on("line", (line) => {
-    const proxyLine = /^MH_PROXY (direct|enabled)$/.exec(line.trim());
+    const proxyLine = /^MH_PROXY (direct|enabled|automatic)$/.exec(line.trim());
     if (proxyLine) {
       proxyNotUsed = proxyLine[1] === "direct";
       if (backendUrl && !quitting) {
         browserProxyChange = browserProxyChange.then(async () => {
+          await loadProxySettings();
           await applyBrowserProxy();
           await session.defaultSession.closeAllConnections();
         }).catch(() => console.warn("Could not update the desktop network route."));
@@ -330,16 +369,14 @@ if (process.getuid?.() === 0 || process.geteuid?.() === 0) {
     notification.show();
     return true;
   });
-  ipcMain.handle("meta-harness:save-proxy", async (event, value) => {
+  ipcMain.handle("meta-harness:check-proxy", (event) => {
+    if (!fromMainWindow(event) || quitting) throw new Error("The desktop app is closing.");
+    return backendProxyRequest("POST");
+  });
+  ipcMain.handle("meta-harness:save-proxy", (event, value, allowUnreachable) => {
     if (!fromMainWindow(event) || quitting) throw new Error("The desktop app is closing.");
     if (value !== null && (typeof value !== "string" || value.length > 2048)) throw new Error("Invalid proxy URL.");
-    const proxy = value === null ? null : parseProxy(value).href;
-    const path = proxySettingsPath();
-    const staged = path + ".tmp";
-    await writeFile(staged, JSON.stringify({ proxy }), { mode: 0o600 });
-    await rename(staged, path);
-    app.relaunch();
-    app.quit();
+    return backendProxyRequest("PUT", { proxy: value, allow_unreachable: allowUnreachable === true });
   });
   app.on("second-instance", openWindow);
   app.on("activate", openWindow);

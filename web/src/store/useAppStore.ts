@@ -468,8 +468,12 @@ export const useAppStore = create<AppState>((set, get) => {
           .catch((error: unknown) => { if (startup === startupRequest) reportError(error); })
           .finally(() => finish("quota"));
         const request = ++catalogRequest;
-        void api.listAdapters().then(({ catalogs }) => {
-          if (catalogs && request === catalogRequest) set({ adapterCatalogs: catalogs });
+        void api.listAdapters().then(({ catalogs, probes }) => {
+          if (request !== catalogRequest) return;
+          set({
+            adapterCatalogs: catalogs ?? get().adapterCatalogs,
+            probes: probes ?? get().probes,
+          });
         }).catch(() => undefined).finally(() => finish("models"));
 
         await get().selectProject(projRes.projects[0]?.id ?? null);
@@ -963,26 +967,26 @@ export const useAppStore = create<AppState>((set, get) => {
       const request = ++catalogRequest;
       set({ quotasRefreshing: true });
       try {
-        const [{ quotas }, { probes }, catalog] = await Promise.all([
-          api.refreshQuotasLive(),
-          api.probeAdapters(),
-          api.listAdapters(true),
+        await Promise.all([
+          api.refreshQuotasLive().then(({ quotas }) => {
+            if (request !== catalogRequest) return;
+            set({ quotas: Object.fromEntries(quotas.map((quota) => [quota.adapter_id, quota])) });
+          }),
+          api.listAdapters(true).then(async (catalog) => {
+            const probes = catalog.probes ?? (await api.probeAdapters()).probes;
+            if (request !== catalogRequest) return;
+            set({
+              probes,
+              adapters: catalog.adapters,
+              adapterCatalogs: catalog.catalogs ?? get().adapterCatalogs,
+              savedProfiles: catalog.saved_profiles ?? get().savedProfiles,
+            });
+          }),
         ]);
-        const map: Record<string, QuotaSnapshot> = {};
-        for (const q of quotas) map[q.adapter_id] = q;
-        if (request === catalogRequest) {
-          set({
-            quotas: map,
-            probes,
-            adapters: catalog.adapters,
-            adapterCatalogs: catalog.catalogs ?? get().adapterCatalogs,
-            savedProfiles: catalog.saved_profiles ?? get().savedProfiles,
-          });
-        }
       } catch (e) {
         reportInAppError(e);
       } finally {
-        set({ quotasRefreshing: false });
+        if (request === catalogRequest) set({ quotasRefreshing: false });
       }
     },
 

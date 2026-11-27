@@ -41,7 +41,9 @@ pub fn build_router(state: AppState) -> Router {
         .route("/api/update", get(release::check_handler))
         .route(
             "/api/settings/proxy",
-            get(proxy_health::status).post(proxy_health::check),
+            get(proxy_health::status)
+                .post(proxy_health::check)
+                .put(proxy_health::update),
         )
         .route("/api/auth/status", get(auth_status))
         .route("/api/auth/session", post(create_auth_session))

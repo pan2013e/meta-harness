@@ -6,9 +6,9 @@ use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use mh_core::{
-    AdapterConfig, AdapterModelCatalog, ChatImage, ConfigOptionChoice, DiscoveredConfigOption,
-    ModelChoiceDetail, PendingPermissionView, PermissionPolicy, PermissionRule,
-    TrajectoryEventKind,
+    AdapterConfig, AdapterModelCatalog, AppConfig, ChatImage, ConfigOptionChoice,
+    DiscoveredConfigOption, ModelChoiceDetail, PendingPermissionView, PermissionPolicy,
+    PermissionRule, TrajectoryEventKind,
 };
 use serde_json::{Value, json};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, Lines};
@@ -23,6 +23,7 @@ use crate::platform::{
     ProcessTreeGuard, find_cli_binary, prepare_isolated_command, resolve_command,
 };
 use crate::protocol::{McpEnvVar, McpServerSpec, PromptResult, SWITCH_MCP_SERVER_NAME};
+use crate::quota::{AdapterProbeStatus, probe_installed_adapters};
 
 #[derive(Debug, Clone)]
 pub struct MemberSpawnSpec {
@@ -78,12 +79,37 @@ impl ManagedMemberClient {
 
 type ClientMap = HashMap<(String, String), Arc<ManagedMemberClient>>;
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum AgyProfileAuth {
+    Verified,
+    SignInRequired,
+    Unavailable,
+}
+
+struct CachedCatalog {
+    checked_at: Instant,
+    profile_dir: Option<PathBuf>,
+    catalog: AdapterModelCatalog,
+    agy_auth: Option<AgyProfileAuth>,
+}
+
+impl CachedCatalog {
+    fn is_current(&self, adapter: &AdapterConfig) -> bool {
+        let ttl = if self.agy_auth == Some(AgyProfileAuth::Unavailable) {
+            Duration::from_secs(30)
+        } else {
+            Duration::from_secs(600)
+        };
+        self.profile_dir == adapter.profile_dir && self.checked_at.elapsed() < ttl
+    }
+}
+
 /// Manages lazy spawning, reuse, cancellation, and idle hibernation of ACP agent subprocesses
 /// keyed by `(session_id, member_handle)`.
 pub struct AcpSupervisor {
     clients: Arc<Mutex<ClientMap>>,
     closed_sessions: Arc<RwLock<HashSet<String>>>,
-    catalog_cache: Mutex<HashMap<String, (Instant, AdapterModelCatalog)>>,
+    catalog_cache: Mutex<HashMap<String, CachedCatalog>>,
     adapter_activity: Mutex<HashMap<String, Arc<RwLock<()>>>>,
     idle_ttl: Duration,
 }
@@ -321,6 +347,35 @@ impl AcpSupervisor {
         self.catalog_cache.lock().await.remove(adapter_id);
     }
 
+    pub async fn adapter_probe_status(&self, config: &AppConfig) -> Vec<AdapterProbeStatus> {
+        let mut probes = probe_installed_adapters(config);
+        let cached = self.catalog_cache.lock().await;
+        for probe in probes.iter_mut().filter(|probe| probe.installed) {
+            let Some(entry) = cached.get(&probe.adapter_id) else {
+                continue;
+            };
+            if !entry.is_current(&config.adapters[&probe.adapter_id]) {
+                continue;
+            }
+            match entry.agy_auth {
+                Some(AgyProfileAuth::Verified) => {
+                    probe.auth_detected = true;
+                    probe.auth_hint = "Antigravity sign-in verified for this profile".into();
+                }
+                Some(AgyProfileAuth::SignInRequired) => {
+                    probe.auth_detected = false;
+                    probe.auth_hint = "Antigravity requires sign-in for this profile".into();
+                }
+                Some(AgyProfileAuth::Unavailable) => {
+                    probe.auth_hint =
+                        "Antigravity could not verify this profile. Refresh to retry.".into();
+                }
+                None => {}
+            }
+        }
+        probes
+    }
+
     pub async fn model_default_effort(&self, adapter_id: &str, model: &str) -> Option<String> {
         let lookup = |catalog: &AdapterModelCatalog| {
             catalog
@@ -330,8 +385,8 @@ impl AcpSupervisor {
                 .and_then(|entry| entry.default_effort.clone())
         };
         let cache = self.catalog_cache.lock().await;
-        if let Some((_, catalog)) = cache.get(adapter_id) {
-            lookup(catalog)
+        if let Some(entry) = cache.get(adapter_id) {
+            lookup(&entry.catalog)
         } else {
             lookup(&builtin_adapter_catalog(adapter_id))
         }
@@ -439,14 +494,15 @@ impl AcpSupervisor {
         {
             let cache = self.catalog_cache.lock().await;
             if !refresh
-                && let Some((ts, cat)) = cache.get(adapter_id)
-                && ts.elapsed() < Duration::from_secs(600)
+                && let Some(entry) = cache.get(adapter_id)
+                && entry.is_current(adapter)
             {
-                return cat.clone();
+                return entry.catalog.clone();
             }
         }
 
         let mut catalog = builtin_adapter_catalog(adapter_id);
+        let mut agy_auth = None;
         let Ok(_activity) = self.adapter_activity(adapter_id).await.try_read_owned() else {
             return catalog;
         };
@@ -482,11 +538,24 @@ impl AcpSupervisor {
             }
         }
         if adapter.quota_provider == "google_local"
-            && let Ok((command, _)) = resolve_adapter_command(adapter)
+            && let Ok((command, args)) = resolve_adapter_command(adapter)
             && crate::profile::is_agy(&command)
         {
             let live = if adapter.profile_dir.is_some() {
-                probe_agy_profile_catalog(adapter, adapter_id).await
+                match probe_agy_profile_catalog(adapter, adapter_id, &command, args).await {
+                    Ok(live) => {
+                        agy_auth = Some(AgyProfileAuth::Verified);
+                        live
+                    }
+                    Err(AcpError::AuthenticationRequired) => {
+                        agy_auth = Some(AgyProfileAuth::SignInRequired);
+                        None
+                    }
+                    Err(_) => {
+                        agy_auth = Some(AgyProfileAuth::Unavailable);
+                        None
+                    }
+                }
             } else {
                 crate::antigravity::run_agy(&command, None, &["models"])
                     .await
@@ -497,10 +566,15 @@ impl AcpSupervisor {
             }
         }
 
-        self.catalog_cache
-            .lock()
-            .await
-            .insert(adapter_id.to_string(), (Instant::now(), catalog.clone()));
+        self.catalog_cache.lock().await.insert(
+            adapter_id.to_string(),
+            CachedCatalog {
+                checked_at: Instant::now(),
+                profile_dir: adapter.profile_dir.clone(),
+                catalog: catalog.clone(),
+                agy_auth,
+            },
+        );
         catalog
     }
 
@@ -547,19 +621,16 @@ impl AcpSupervisor {
 async fn probe_agy_profile_catalog(
     adapter: &AdapterConfig,
     adapter_id: &str,
-) -> Option<AdapterModelCatalog> {
-    if !crate::quota::has_google_cli_auth(adapter.profile_dir.as_deref(), true) {
-        return None;
-    }
-    let temp = tempfile::tempdir().ok()?;
-    let (command, mut args) = resolve_adapter_command(adapter).ok()?;
+    command: &str,
+    mut args: Vec<String>,
+) -> Result<Option<AdapterModelCatalog>, AcpError> {
+    // Windows agy can authenticate through Credential Manager without a profile token file.
+    let temp = tempfile::tempdir()?;
     let mut env = vec![
         ("AGY_CLI_DISABLE_AUTO_UPDATE".into(), "true".into()),
         ("AGY_CLI_NONINTERACTIVE_HEADLESS".into(), "true".into()),
     ];
-    crate::profile::apply_profile(adapter, &command, &mut args, &mut env)
-        .await
-        .ok()?;
+    crate::profile::apply_profile(adapter, command, &mut args, &mut env).await?;
     let cwd = temp.path();
     let context = MemberBrokerContext {
         session_id: "catalog".into(),
@@ -572,19 +643,23 @@ async fn probe_agy_profile_catalog(
         rules: Arc::new(RwLock::new(Vec::new())),
     };
     let client = AcpClient::spawn(
-        &command,
+        command,
         &args,
         cwd,
         &env,
         context,
         Arc::new(EphemeralCallbacks),
     )
-    .await
-    .ok()?;
+    .await?;
     let result = tokio::time::timeout(Duration::from_secs(10), async {
-        client.initialize().await.ok()?;
-        let response = client.new_session(cwd, Vec::new()).await.ok()?;
-        let models = response.models?;
+        client.initialize().await?;
+        client.new_session(cwd, Vec::new()).await
+    })
+    .await;
+    client.shutdown().await;
+    let response =
+        result.map_err(|_| AcpError::Timeout("Antigravity profile verification".into()))??;
+    let catalog = response.models.and_then(|models| {
         let rows = models
             .get("availableModels")?
             .as_array()?
@@ -599,12 +674,8 @@ async fn probe_agy_profile_catalog(
             .collect::<Vec<_>>()
             .join("\n");
         crate::antigravity::model_catalog(&rows, adapter_id)
-    })
-    .await
-    .ok()
-    .flatten();
-    client.shutdown().await;
-    result
+    });
+    Ok(catalog)
 }
 
 fn format_effort_label(val: &str) -> String {

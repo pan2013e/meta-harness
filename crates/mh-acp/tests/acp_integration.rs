@@ -10,7 +10,7 @@ use mh_acp::{
     TurnStreamListener,
 };
 use mh_core::{
-    AdapterConfig, DiscoveredConfigOption, PendingPermissionView, PermissionPolicy,
+    AdapterConfig, AppConfig, DiscoveredConfigOption, PendingPermissionView, PermissionPolicy,
     TrajectoryEventKind,
 };
 
@@ -83,6 +83,43 @@ fn mock_adapter_config() -> AdapterConfig {
         args: Vec::new(),
         ..Default::default()
     }
+}
+
+#[tokio::test]
+async fn antigravity_profile_is_verified_by_acp_without_a_token_file() {
+    let tmp = tempfile::tempdir().unwrap();
+    let command = tmp
+        .path()
+        .join(format!("agy{}", std::env::consts::EXE_SUFFIX));
+    std::fs::copy(env!("CARGO_BIN_EXE_mock-acp-agent"), &command).unwrap();
+    let adapter = AdapterConfig {
+        command: command.to_string_lossy().into_owned(),
+        args: vec!["acp".into()],
+        quota_provider: "google_local".into(),
+        profile_dir: Some(tmp.path().join("separate")),
+        ..Default::default()
+    };
+    let mut config = AppConfig {
+        adapters: [("antigravity".into(), adapter.clone())].into(),
+        ..Default::default()
+    };
+    let supervisor = AcpSupervisor::new(300);
+    let before = supervisor.adapter_probe_status(&config).await;
+    assert!(before[0].installed);
+    assert!(!before[0].auth_detected);
+    supervisor
+        .resolve_adapter_catalog("antigravity", &adapter, true)
+        .await;
+    let verified = supervisor.adapter_probe_status(&config).await;
+    assert!(verified[0].auth_detected);
+    assert_eq!(
+        verified[0].auth_hint,
+        "Antigravity sign-in verified for this profile"
+    );
+
+    config.adapters.get_mut("antigravity").unwrap().profile_dir =
+        Some(tmp.path().join("different-profile"));
+    assert!(!supervisor.adapter_probe_status(&config).await[0].auth_detected);
 }
 
 #[tokio::test]

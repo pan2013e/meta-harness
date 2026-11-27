@@ -6,7 +6,7 @@ use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use mh_core::{
-    AdapterConfig, AdapterModelCatalog, ConfigOptionChoice, DiscoveredConfigOption,
+    AdapterConfig, AdapterModelCatalog, ChatImage, ConfigOptionChoice, DiscoveredConfigOption,
     ModelChoiceDetail, PendingPermissionView, PermissionPolicy, PermissionRule,
     TrajectoryEventKind,
 };
@@ -18,11 +18,11 @@ use tracing::{debug, info};
 
 use crate::AcpError;
 use crate::broker::{BrokerCallbacks, MemberBrokerContext, PermissionResolution};
-use crate::client::{AcpClient, TurnStreamListener};
+use crate::client::{AcpClient, PromptTextOutput, TurnStreamListener};
 use crate::platform::{
     ProcessTreeGuard, find_cli_binary, prepare_isolated_command, resolve_command,
 };
-use crate::protocol::{McpEnvVar, McpServerSpec, SWITCH_MCP_SERVER_NAME};
+use crate::protocol::{McpEnvVar, McpServerSpec, PromptResult, SWITCH_MCP_SERVER_NAME};
 
 #[derive(Debug, Clone)]
 pub struct MemberSpawnSpec {
@@ -47,8 +47,32 @@ pub struct ManagedMemberClient {
     pub last_used: Mutex<Instant>,
     member_worktree: PathBuf,
     permission_policy: PermissionPolicy,
+    approval_provider: Option<&'static str>,
     adapter_id: String,
     profile_dir: Option<PathBuf>,
+}
+
+impl ManagedMemberClient {
+    pub async fn prompt(
+        &self,
+        turn_id: &str,
+        text: &str,
+        images: &[ChatImage],
+        listener: Arc<dyn TurnStreamListener>,
+    ) -> Result<(PromptResult, PromptTextOutput), AcpError> {
+        if let Some(provider) = self.approval_provider {
+            tokio::time::timeout(
+                Duration::from_secs(10),
+                self.client
+                    .apply_approval_mode(provider, self.permission_policy),
+            )
+            .await
+            .map_err(|_| AcpError::Timeout("Applying the harness approval mode".into()))??;
+        }
+        self.client
+            .prompt_with_images(turn_id, text, images, listener)
+            .await
+    }
 }
 
 type ClientMap = HashMap<(String, String), Arc<ManagedMemberClient>>;
@@ -125,6 +149,9 @@ impl AcpSupervisor {
 
         let started = Instant::now();
         let (command, mut args) = resolve_adapter_command(&spec.adapter)?;
+        let approval_provider =
+            crate::approval::acp_provider(&spec.adapter.quota_provider, &command, &args);
+        crate::approval::apply_launch_mode(&command, &mut args, spec.permission_policy);
         let mut extra_env = spec.extra_env;
         crate::profile::apply_profile(&spec.adapter, &command, &mut args, &mut extra_env).await?;
         let active_turn_id = Arc::new(RwLock::new(None));
@@ -194,6 +221,7 @@ impl AcpSupervisor {
             last_used: Mutex::new(Instant::now()),
             member_worktree: spec.member_worktree,
             permission_policy: spec.permission_policy,
+            approval_provider,
             adapter_id: spec.adapter_id,
             profile_dir: spec.adapter.profile_dir,
         });
@@ -318,7 +346,7 @@ impl AcpSupervisor {
             project_root: cwd.to_path_buf(),
             member_worktree: cwd.to_path_buf(),
             skill_read_roots: Arc::new(RwLock::new(Vec::new())),
-            permission_policy: PermissionPolicy::Strict,
+            permission_policy: PermissionPolicy::RequireApproval,
             active_turn_id,
             rules: Arc::new(RwLock::new(Vec::new())),
         };
@@ -525,7 +553,7 @@ async fn probe_agy_profile_catalog(
         project_root: cwd.to_path_buf(),
         member_worktree: cwd.to_path_buf(),
         skill_read_roots: Arc::new(RwLock::new(Vec::new())),
-        permission_policy: PermissionPolicy::Strict,
+        permission_policy: PermissionPolicy::RequireApproval,
         active_turn_id: Arc::new(RwLock::new(None)),
         rules: Arc::new(RwLock::new(Vec::new())),
     };

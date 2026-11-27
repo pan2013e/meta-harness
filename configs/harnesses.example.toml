@@ -11,9 +11,8 @@ open_browser_on_start = true
 max_agent_hops_per_user_turn = 6
 peer_consult_timeout_secs = 180
 idle_process_ttl_secs = 900
-# "worktree_smart" auto-allows file reads/writes inside the agent's isolated Git worktree
-# and prompts in Group Chat for shell commands & outside-worktree access (with session pattern rules).
-default_permission_policy = "worktree_smart" # "worktree_smart" | "strict" | "autonomous_sandbox"
+# Require approval permits workspace edits and asks before external access and unapproved shell commands.
+default_permission_policy = "require_approval" # "require_approval" | "approve_for_me" | "full_access"
 
 [git]
 # Isolated per-session integration worktree + per-executor worktrees by default

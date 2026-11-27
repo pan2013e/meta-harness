@@ -865,6 +865,7 @@ export function SettingsDialog({ onClose }: { onClose: () => void }) {
                       <h2 className="text-[11px] uppercase tracking-wider font-semibold text-ink-muted">
                         Permissions &amp; Loop Guard
                       </h2>
+                      <p className="text-[11px] text-ink-muted">Changes apply to each persona’s next turn.</p>
                       <div className="space-y-1.5">
                         {APPROVAL_MODES.map(({ value, label, description, Icon, color }) => {
                           const active = activeSession.permission_policy === value;

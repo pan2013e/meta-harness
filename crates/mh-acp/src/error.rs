@@ -22,6 +22,8 @@ pub enum AcpError {
     },
     #[error("permission denied: {0}")]
     PermissionDenied(String),
+    #[error("this harness does not accept image inputs")]
+    ImageInputUnsupported,
     #[error("ACP RPC error ({code}): {message}")]
     Rpc {
         code: i64,

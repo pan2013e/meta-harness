@@ -90,7 +90,7 @@ impl Default for SwitchConfig {
             max_agent_hops_per_user_turn: 6,
             peer_consult_timeout_secs: 180,
             idle_process_ttl_secs: 900,
-            default_permission_policy: "worktree_smart".to_string(),
+            default_permission_policy: "require_approval".to_string(),
         }
     }
 }

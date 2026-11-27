@@ -16,8 +16,8 @@ use mh_acp::{
     sync_member_worktree,
 };
 use mh_core::{
-    AppConfig, AppPaths, ChatMessage, DiffStat, DiscoveredConfigOption, DispatchTaskSpec,
-    IsolationMode, MemberContextBreakdown, MemberRole, MemberStatus, MessageKind,
+    AppConfig, AppPaths, ChatImage, ChatMessage, DiffStat, DiscoveredConfigOption,
+    DispatchTaskSpec, IsolationMode, MemberContextBreakdown, MemberRole, MemberStatus, MessageKind,
     PendingPermissionView, SenderKind, Session, SessionContextReport, SessionMember, SkillSummary,
     TrajectoryEventKind, TurnModelSelection, TurnStatus, WaitForGraph, WsEvent,
     context_window_for_model, estimate_tokens, parse_mentions, parse_slash_tokens,
@@ -92,7 +92,6 @@ pub struct SessionRuntime {
     pub pending_dispatches: Mutex<HashMap<String, PendingDispatch>>,
     pub orchestrator_dispatched_turn: Mutex<HashSet<String>>,
     pub curation_recorded_turns: Mutex<HashSet<String>>,
-    pub recorded_skill_uses: Mutex<HashSet<(String, String)>>,
     pub cancel_epoch: RwLock<u64>,
 }
 
@@ -111,7 +110,6 @@ impl Default for SessionRuntime {
             pending_dispatches: Mutex::new(HashMap::new()),
             orchestrator_dispatched_turn: Mutex::new(HashSet::new()),
             curation_recorded_turns: Mutex::new(HashSet::new()),
-            recorded_skill_uses: Mutex::new(HashSet::new()),
             cancel_epoch: RwLock::new(0),
         }
     }
@@ -275,6 +273,7 @@ impl SwitchEngine {
             content,
             TurnModelSelection::default(),
             HashMap::new(),
+            Vec::new(),
         )
         .await
     }
@@ -285,7 +284,13 @@ impl SwitchEngine {
         content: String,
         defaults: TurnModelSelection,
         recipient_overrides: HashMap<String, TurnModelSelection>,
+        images: Vec<ChatImage>,
     ) -> Result<ChatMessage, SwitchError> {
+        if content.trim().is_empty() && images.is_empty() {
+            return Err(SwitchError::Validation(
+                "Send a message or attach an image.".into(),
+            ));
+        }
         let session = self.store.get_session(session_id)?;
         if session.archived_at.is_some() {
             return Err(SwitchError::Validation(
@@ -385,12 +390,14 @@ impl SwitchEngine {
         let (slash_cmds, cleaned_body) = extract_workflow_slash_commands(&content);
         if slash_cmds.iter().any(|c| c == "compact") {
             let notice = self.compact_session(session_id).await?;
-            if cleaned_body.trim().is_empty() {
+            if cleaned_body.trim().is_empty() && images.is_empty() {
                 return Ok(notice);
             }
         }
         let directive_prefix = build_slash_directive_prefix(&slash_cmds);
-        let dispatch_content = if directive_prefix.is_empty() {
+        let dispatch_content = if content.trim().is_empty() {
+            "The user attached an image.".to_string()
+        } else if directive_prefix.is_empty() {
             content.clone()
         } else {
             format!("{directive_prefix}\n{content}")
@@ -403,19 +410,22 @@ impl SwitchEngine {
             .unwrap_or(false);
         let should_auto_title = is_first_user_msg && session.title == "New session";
 
-        let user_msg = self.store.append_message(NewMessageParams {
-            id: None,
-            session_id: session_id.to_string(),
-            chain_id: chain_id.clone(),
-            parent_msg_id: None,
-            sender_kind: SenderKind::User,
-            sender_id: "user".into(),
-            recipients: recipients.clone(),
-            kind: MessageKind::Text,
-            content: content.clone(),
-            turn_id: None,
-            metadata: json!({}),
-        })?;
+        let user_msg = self.store.append_message_with_images(
+            NewMessageParams {
+                id: None,
+                session_id: session_id.to_string(),
+                chain_id: chain_id.clone(),
+                parent_msg_id: None,
+                sender_kind: SenderKind::User,
+                sender_id: "user".into(),
+                recipients: recipients.clone(),
+                kind: MessageKind::Text,
+                content: content.clone(),
+                turn_id: None,
+                metadata: json!({}),
+            },
+            &images,
+        )?;
         let _ = self.events_tx.send(WsEvent::ChatMessageCreated {
             message: user_msg.clone(),
         });
@@ -507,7 +517,11 @@ impl SwitchEngine {
         if should_auto_title && let Some((first_task, _)) = tasks.first() {
             let engine = Arc::clone(self);
             let sid = session_id.to_string();
-            let raw_prompt = content;
+            let raw_prompt = if content.trim().is_empty() {
+                "Image attachment".into()
+            } else {
+                content
+            };
             let title_member = first_task.target.clone();
             tokio::spawn(async move {
                 engine
@@ -542,7 +556,7 @@ impl SwitchEngine {
 
         let mut target_handles = Vec::new();
         for t in &to {
-            if valid_handles.contains(t) && t != caller {
+            if valid_handles.contains(t) && t != caller && !target_handles.contains(t) {
                 target_handles.push(t.clone());
             }
         }
@@ -1061,15 +1075,14 @@ impl SwitchEngine {
         drop(pending);
         let decision = if allowed { "allowed" } else { "rejected" };
 
-        let _ = entry.tx.send(PermissionResolution::Selected {
-            option_id,
-            allow_pattern,
-        });
-
         let _ = self.events_tx.send(WsEvent::PermissionResolved {
             session_id: session_id.to_string(),
             request_id: request_id.to_string(),
             decision: decision.into(),
+        });
+        let _ = entry.tx.send(PermissionResolution::Selected {
+            option_id,
+            allow_pattern,
         });
         Ok(())
     }
@@ -1226,6 +1239,14 @@ impl SwitchEngine {
                 .list_session_skills(&session, Some(&work_cwd))
                 .unwrap_or_default();
             let skill_read_roots = crate::skills::session_skill_read_roots(&session_skills);
+            let images = if matches!(
+                purpose,
+                TurnPurpose::Normal | TurnPurpose::OrchestratorTriage
+            ) {
+                self.store.list_chain_images(session_id, chain_id)?
+            } else {
+                Vec::new()
+            };
 
             let traj = self.store.start_trajectory(StartTrajectoryParams {
                 turn_id: None,
@@ -1250,9 +1271,8 @@ impl SwitchEngine {
                 engine: Arc::downgrade(self),
                 session_id: session_id.to_string(),
                 member_handle: member.handle.clone(),
-                can_use_switch_tools_without_approval: is_orchestrator_context
-                    && mcp_spec.is_some(),
                 has_mcp_bridge,
+                cancel_epoch: epoch_at_start,
                 worktree: work_cwd.clone(),
                 touched_files: Mutex::new(HashSet::new()),
                 counters: Mutex::new(TurnCounters::default()),
@@ -1417,18 +1437,10 @@ impl SwitchEngine {
                 )
                 .await;
             for activated in &activated_skills {
-                self.emit_skill_activity_pill(
-                    session_id,
-                    &member.handle,
-                    Some(&turn_id),
-                    Some(chain_id),
-                    activated,
-                )
-                .await;
+                self.record_skill_use(session_id, &turn_id, activated);
             }
 
-            // Create visible reply bubble for normal/orchestrator/conflict turns (not silent curation or consults which create consult threads)
-            let visible_msg = if !matches!(
+            let chat = if !matches!(
                 purpose,
                 TurnPurpose::MemoryCuration | TurnPurpose::PeerConsult { .. }
             ) {
@@ -1437,7 +1449,7 @@ impl SwitchEngine {
                 } else {
                     SenderKind::Member
                 };
-                let placeholder = self.store.append_message(NewMessageParams {
+                Some(NewMessageParams {
                     id: None,
                     session_id: session_id.to_string(),
                     chain_id: chain_id.to_string(),
@@ -1453,11 +1465,7 @@ impl SwitchEngine {
                         "effort": applied_effort.as_deref().or(wanted_effort),
                         "streaming": true,
                     }),
-                })?;
-                let _ = self.events_tx.send(WsEvent::ChatMessageCreated {
-                    message: placeholder.clone(),
-                });
-                Some(placeholder)
+                })
             } else {
                 None
             };
@@ -1466,15 +1474,15 @@ impl SwitchEngine {
                 engine: Arc::downgrade(self),
                 session_id: session_id.to_string(),
                 member_handle: member.handle.clone(),
-                message_id: visible_msg.as_ref().map(|m| m.id.clone()),
+                chat,
+                segment: Mutex::new(None),
                 callbacks: Arc::clone(&callbacks),
             });
 
             let pre_head_sha = get_head_sha(&work_cwd).await;
             let prompt_res = if *rt.cancel_epoch.read().await == epoch_at_start {
-                let prompt = managed
-                    .client
-                    .prompt(&turn_id, &full_prompt, stream_listener);
+                let prompt =
+                    managed.prompt(&turn_id, &full_prompt, &images, stream_listener.clone());
                 if let Some(deadline) = deadline {
                     let result = if tokio::time::Instant::now() >= deadline {
                         None
@@ -1507,7 +1515,6 @@ impl SwitchEngine {
                         max_seen_seq,
                     );
                     let reply_text = prompt_output.final_text;
-                    let intermediate_notes = prompt_output.intermediate_notes;
                     let approx_tokens = ((full_prompt.len() + reply_text.len()) / 4).max(20) as u64;
                     self.quota
                         .record_turn_tokens(&member.adapter_id, approx_tokens)
@@ -1544,21 +1551,7 @@ impl SwitchEngine {
                         head_sha.as_deref(),
                     );
 
-                    if let Some(msg) = visible_msg {
-                        let updated = self.store.update_message(
-                            &msg.id,
-                            &reply_text,
-                            Some(json!({
-                                "model": applied_model.as_deref().or(wanted_model),
-                                "effort": applied_effort.as_deref().or(wanted_effort),
-                                "streaming": false,
-                                "intermediate_notes": intermediate_notes,
-                            })),
-                        )?;
-                        let _ = self
-                            .events_tx
-                            .send(WsEvent::ChatMessageCompleted { message: updated });
-                    }
+                    stream_listener.finish_chat(None).await?;
 
                     self.set_member_status(session_id, &member.handle, MemberStatus::Idle, None)
                         .await;
@@ -1610,16 +1603,12 @@ impl SwitchEngine {
                         self.attempt_429_failover(&session, chain_id, &member, &task, &msg)
                             .await;
                     }
-                    if let Some(vmsg) = visible_msg {
-                        let updated = self.store.update_message(
-                            &vmsg.id,
+                    stream_listener
+                        .finish_chat(Some((
                             &format!("Rate limit hit on @{}: {msg}", member.handle),
-                            Some(json!({ "error": true })),
-                        )?;
-                        let _ = self
-                            .events_tx
-                            .send(WsEvent::ChatMessageCompleted { message: updated });
-                    }
+                            "error",
+                        )))
+                        .await?;
                     Err(SwitchError::Acp(AcpError::RateLimited(msg)))
                 }
                 Err(AcpError::Cancelled) => {
@@ -1631,16 +1620,9 @@ impl SwitchEngine {
                         &DiffStat::default(),
                         None,
                     );
-                    if let Some(vmsg) = visible_msg {
-                        let updated = self.store.update_message(
-                            &vmsg.id,
-                            "[Cancelled]",
-                            Some(json!({ "cancelled": true })),
-                        )?;
-                        let _ = self
-                            .events_tx
-                            .send(WsEvent::ChatMessageCompleted { message: updated });
-                    }
+                    stream_listener
+                        .finish_chat(Some(("[Cancelled]", "cancelled")))
+                        .await?;
                     self.set_member_status(session_id, &member.handle, MemberStatus::Idle, None)
                         .await;
                     Err(SwitchError::Cancelled)
@@ -1654,16 +1636,12 @@ impl SwitchEngine {
                         &DiffStat::default(),
                         None,
                     );
-                    if let Some(vmsg) = visible_msg {
-                        let updated = self.store.update_message(
-                            &vmsg.id,
+                    stream_listener
+                        .finish_chat(Some((
                             &format!("Error in @{}: {err}", member.handle),
-                            Some(json!({ "error": true })),
-                        )?;
-                        let _ = self
-                            .events_tx
-                            .send(WsEvent::ChatMessageCompleted { message: updated });
-                    }
+                            "error",
+                        )))
+                        .await?;
                     self.set_member_status(session_id, &member.handle, MemberStatus::Error, None)
                         .await;
                     Err(err.into())
@@ -2813,8 +2791,8 @@ struct SwitchCallbacks {
     engine: std::sync::Weak<SwitchEngine>,
     session_id: String,
     member_handle: String,
-    can_use_switch_tools_without_approval: bool,
     has_mcp_bridge: bool,
+    cancel_epoch: u64,
     worktree: PathBuf,
     touched_files: Mutex<HashSet<String>>,
     counters: Mutex<TurnCounters>,
@@ -2850,9 +2828,10 @@ impl TurnCounters {
 #[async_trait]
 impl BrokerCallbacks for SwitchCallbacks {
     fn may_auto_approve_switch_tool(&self, tool: &str) -> bool {
-        let is_registered = crate::list_switch_tools()
-            .iter()
-            .any(|entry| entry["name"].as_str() == Some(tool));
+        let is_registered = self.has_mcp_bridge
+            && crate::list_switch_tools()
+                .iter()
+                .any(|entry| entry["name"].as_str() == Some(tool));
         if !is_registered {
             return false;
         }
@@ -2865,11 +2844,10 @@ impl BrokerCallbacks for SwitchCallbacks {
         if session.archived_at.is_some() {
             return false;
         }
-        if matches!(tool, "skill_list" | "skill_read") {
-            return self.has_mcp_bridge;
-        }
-        self.can_use_switch_tools_without_approval
-            && session.orchestrator_member.as_deref() == Some(self.member_handle.as_str())
+        engine
+            .store
+            .get_member(&self.session_id, &self.member_handle)
+            .is_ok()
     }
 
     async fn request_user_permission(
@@ -2882,8 +2860,17 @@ impl BrokerCallbacks for SwitchCallbacks {
         let (tx, rx) = oneshot::channel();
         let req_id = prompt.request_id.clone();
         let rt = engine.runtime(&self.session_id).await;
+        let turn_id = prompt.turn_id.clone();
+        let chain_id = engine
+            .active_chain_for_member(&self.session_id, &self.member_handle)
+            .await;
 
-        rt.pending_permissions.lock().await.insert(
+        let epoch = rt.cancel_epoch.read().await;
+        if *epoch != self.cancel_epoch {
+            return Ok(PermissionResolution::Cancelled);
+        }
+        let mut pending = rt.pending_permissions.lock().await;
+        pending.insert(
             req_id.clone(),
             PendingPermissionEntry {
                 view: prompt.clone(),
@@ -2894,9 +2881,7 @@ impl BrokerCallbacks for SwitchCallbacks {
         let card = engine.store.append_message(NewMessageParams {
             id: None,
             session_id: self.session_id.clone(),
-            chain_id: engine
-                .active_chain_for_member(&self.session_id, &self.member_handle)
-                .await,
+            chain_id,
             parent_msg_id: None,
             sender_kind: SenderKind::System,
             sender_id: self.member_handle.clone(),
@@ -2915,13 +2900,15 @@ impl BrokerCallbacks for SwitchCallbacks {
                 .events_tx
                 .send(WsEvent::ChatMessageCreated { message });
         }
+        drop(pending);
+        drop(epoch);
 
         engine
             .set_member_status(
                 &self.session_id,
                 &self.member_handle,
                 MemberStatus::WaitingPermission,
-                None,
+                turn_id.clone(),
             )
             .await;
 
@@ -2932,7 +2919,7 @@ impl BrokerCallbacks for SwitchCallbacks {
                 &self.session_id,
                 &self.member_handle,
                 MemberStatus::Thinking,
-                None,
+                turn_id,
             )
             .await;
 
@@ -2992,14 +2979,12 @@ impl BrokerCallbacks for SwitchCallbacks {
 
     async fn record_skill_read(&self, turn_id: &str, target: &Path) {
         if let Some(engine) = self.engine.upgrade() {
-            engine
-                .emit_skill_activity_for_path(
-                    &self.session_id,
-                    &self.member_handle,
-                    Some(turn_id),
-                    target,
-                )
-                .await;
+            engine.record_skill_use_for_path(
+                &self.session_id,
+                &self.member_handle,
+                turn_id,
+                target,
+            );
         }
     }
 }
@@ -3008,16 +2993,84 @@ struct SwitchStreamListener {
     engine: std::sync::Weak<SwitchEngine>,
     session_id: String,
     member_handle: String,
-    message_id: Option<String>,
+    chat: Option<NewMessageParams>,
+    segment: Mutex<Option<String>>,
     callbacks: Arc<SwitchCallbacks>,
+}
+
+impl SwitchStreamListener {
+    fn complete_segment(
+        engine: &SwitchEngine,
+        id: &str,
+        turn_complete: bool,
+    ) -> Result<(), SwitchError> {
+        let message = engine.store.get_message(id)?;
+        let mut metadata = message.metadata;
+        metadata["streaming"] = json!(false);
+        metadata["turn_complete"] = json!(turn_complete);
+        let message = engine
+            .store
+            .update_message(id, &message.content, Some(metadata))?;
+        let _ = engine
+            .events_tx
+            .send(WsEvent::ChatMessageCompleted { message });
+        Ok(())
+    }
+
+    async fn finish_chat(&self, notice: Option<(&str, &str)>) -> Result<(), SwitchError> {
+        let (Some(chat), Some(engine)) = (&self.chat, self.engine.upgrade()) else {
+            return Ok(());
+        };
+        let mut segment = self.segment.lock().await;
+        let previous = segment.take();
+        if let Some(id) = previous.as_deref() {
+            Self::complete_segment(&engine, id, notice.is_none())?;
+            if notice.is_none() {
+                return Ok(());
+            }
+        }
+        let mut params = chat.clone();
+        params.metadata["streaming"] = json!(false);
+        params.metadata["turn_complete"] = json!(true);
+        if let Some((content, status)) = notice {
+            params.content = content.into();
+            params.metadata[status] = json!(true);
+            params.metadata["continuation"] = json!(previous.is_some());
+        }
+        let message = engine.store.append_message(params)?;
+        let _ = engine
+            .events_tx
+            .send(WsEvent::ChatMessageCompleted { message });
+        Ok(())
+    }
 }
 
 #[async_trait]
 impl TurnStreamListener for SwitchStreamListener {
-    async fn on_text_delta(&self, turn_id: &str, delta: String, replace: bool) {
-        if let Some(msg_id) = &self.message_id
-            && let Some(engine) = self.engine.upgrade()
-            && let Ok(revision) = engine.store.append_message_delta(msg_id, &delta, replace)
+    async fn on_text_delta(&self, turn_id: &str, delta: String, new_segment: bool) {
+        let (Some(chat), Some(engine)) = (&self.chat, self.engine.upgrade()) else {
+            return;
+        };
+        let mut segment = self.segment.lock().await;
+        if new_segment || segment.is_none() {
+            let mut params = chat.clone();
+            params.content = delta;
+            params.metadata["continuation"] = json!(segment.is_some());
+            match engine.store.append_message(params) {
+                Ok(message) => {
+                    if let Some(previous) = segment.replace(message.id.clone())
+                        && let Err(error) = Self::complete_segment(&engine, &previous, false)
+                    {
+                        warn!(%error, %turn_id, "could not complete chat segment");
+                    }
+                    let _ = engine
+                        .events_tx
+                        .send(WsEvent::ChatMessageCreated { message });
+                }
+                Err(error) => warn!(%error, %turn_id, "could not start chat segment"),
+            }
+        } else if let Some(msg_id) = segment.as_ref()
+            && let Ok(revision) = engine.store.append_message_delta(msg_id, &delta, false)
         {
             let _ = engine.events_tx.send(WsEvent::ChatMessageDelta {
                 session_id: self.session_id.clone(),
@@ -3026,7 +3079,7 @@ impl TurnStreamListener for SwitchStreamListener {
                 member_handle: self.member_handle.clone(),
                 delta,
                 revision,
-                replace,
+                replace: false,
             });
         }
     }

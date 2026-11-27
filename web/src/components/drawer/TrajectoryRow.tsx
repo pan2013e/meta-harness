@@ -68,6 +68,9 @@ export const TrajectoryRow = memo(function TrajectoryRow({ entry, sessionId, act
   const { event } = entry;
   const { payload } = event;
   if (event.event_kind === "diff" && typeof payload.diff === "string") return <DiffViewer diffText={payload.diff} />;
+  if (event.event_kind === "skill") {
+    return <div className="px-3 py-2 text-ink-soft">Loaded skill {String(payload.skill_name ?? payload.skill_id ?? "")}</div>;
+  }
   const plan = event.event_kind === "plan" && Array.isArray(payload.entries) ? payload.entries.map(asRecord) : null;
   const label = payload.kind === "narration" ? "Progress note" : event.event_kind.replaceAll("_", " ");
   return (

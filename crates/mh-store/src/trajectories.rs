@@ -84,11 +84,17 @@ impl Store {
         {
             let mut stmt = tx.prepare(
                 "INSERT INTO trajectory_events (turn_id, event_kind, payload_json, created_at)
-                 VALUES (?1, ?2, ?3, ?4)",
+                 SELECT ?1, ?2, ?3, ?4
+                 WHERE ?2 <> 'skill' OR NOT EXISTS (
+                     SELECT 1 FROM trajectory_events WHERE turn_id = ?1 AND event_kind = 'skill'
+                     AND json_extract(payload_json, '$.skill_id') = json_extract(?3, '$.skill_id')
+                 )",
             )?;
             for (kind, payload) in events {
                 let payload_json = serde_json::to_string(payload)?;
-                stmt.execute(params![turn_id, kind.as_str(), payload_json, now])?;
+                if stmt.execute(params![turn_id, kind.as_str(), payload_json, now])? == 0 {
+                    continue;
+                }
                 let id = tx.last_insert_rowid();
                 inserted.push(TrajectoryEvent {
                     id,
@@ -231,6 +237,7 @@ impl Store {
                         | TrajectoryEventKind::Terminal
                         | TrajectoryEventKind::Error
                         | TrajectoryEventKind::Plan
+                        | TrajectoryEventKind::Skill
                 ),
                 TrajectoryDetailLevel::Diffs => {
                     matches!(ev.event_kind, TrajectoryEventKind::Diff)

@@ -406,16 +406,9 @@ pub async fn execute_mcp_tool(
                 rel_path,
             )?;
             let statuses = engine.get_member_statuses(session_id).await;
-            let turn_id = statuses.get(caller).and_then(|(_, tid)| tid.clone());
-            engine
-                .emit_skill_activity_pill(
-                    session_id,
-                    caller,
-                    turn_id.as_deref(),
-                    None,
-                    &detail.skill,
-                )
-                .await;
+            if let Some(turn_id) = statuses.get(caller).and_then(|(_, tid)| tid.as_deref()) {
+                engine.record_skill_use(session_id, turn_id, &detail.skill);
+            }
             Ok(json!({
                 "skill": detail.skill,
                 "file_path": detail.file_path,

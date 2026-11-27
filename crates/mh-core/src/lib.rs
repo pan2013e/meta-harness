@@ -1,3 +1,4 @@
+mod chat_image;
 pub mod config;
 pub mod dag;
 pub mod domain;
@@ -7,6 +8,7 @@ pub mod paths;
 pub mod skills;
 pub mod tokens;
 
+pub use chat_image::{ChatImage, ChatImageInput, MAX_CHAT_IMAGES, MAX_CHAT_REQUEST_BYTES};
 pub use config::*;
 pub use dag::WaitForGraph;
 pub use domain::*;

@@ -38,25 +38,27 @@ impl IsolationMode {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum PermissionPolicy {
-    WorktreeSmart,
-    Strict,
-    AutonomousSandbox,
+    #[serde(alias = "worktree_smart", alias = "strict")]
+    RequireApproval,
+    #[serde(alias = "autonomous_sandbox")]
+    ApproveForMe,
+    FullAccess,
 }
 
 impl PermissionPolicy {
     pub fn as_str(&self) -> &'static str {
         match self {
-            Self::WorktreeSmart => "worktree_smart",
-            Self::Strict => "strict",
-            Self::AutonomousSandbox => "autonomous_sandbox",
+            Self::RequireApproval => "require_approval",
+            Self::ApproveForMe => "approve_for_me",
+            Self::FullAccess => "full_access",
         }
     }
 
     pub fn parse(s: &str) -> Self {
         match s {
-            "strict" => Self::Strict,
-            "autonomous_sandbox" => Self::AutonomousSandbox,
-            _ => Self::WorktreeSmart,
+            "approve_for_me" | "autonomous_sandbox" => Self::ApproveForMe,
+            "full_access" => Self::FullAccess,
+            _ => Self::RequireApproval,
         }
     }
 }
@@ -306,6 +308,7 @@ pub struct TurnTrajectory {
 pub enum TrajectoryEventKind {
     Thought,
     Plan,
+    Skill,
     ToolCall,
     Diff,
     Terminal,
@@ -317,6 +320,7 @@ impl TrajectoryEventKind {
         match self {
             Self::Thought => "thought",
             Self::Plan => "plan",
+            Self::Skill => "skill",
             Self::ToolCall => "tool_call",
             Self::Diff => "diff",
             Self::Terminal => "terminal",
@@ -328,6 +332,7 @@ impl TrajectoryEventKind {
         match s {
             "thought" => Self::Thought,
             "plan" => Self::Plan,
+            "skill" => Self::Skill,
             "diff" => Self::Diff,
             "terminal" => Self::Terminal,
             "error" => Self::Error,

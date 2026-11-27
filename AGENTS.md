@@ -22,7 +22,7 @@ Every design decision must uphold these core specifications (finalized during de
 3. **ACP Native + Parallel Network Switch**:
    - Harness turns use the **Agent Client Protocol (ACP)** over JSON-RPC 2.0 stdio with the ordinary CLI profile or the configured separate profile.
    - Harnesses run **in parallel** across their isolated worktrees and communicate via Meta-Harness's embedded single-binary MCP bridge (`meta-harness mcp-bridge` injected into `session/new` `mcpServers`):
-     - **Async Group-Chat Messaging** (`@mention` / `chat_send_message`, queued if recipient is busy).
+     - **Async Group-Chat Messaging** (`@mention` / `chat_send_message`, queued if recipient is busy). Show direct peer recipients in chat and preserve chronological reply segments under one trajectory per turn.
      - **Synchronous Mid-Turn Consults** (`peer_consult`), allowing an active harness to pause mid-turn and await an answer from an idle peer, protected by a **Wait-For Graph cycle detector** so circular consults never deadlock.
      - **Peer Trajectory Inspection** (`trajectory_list` / `trajectory_read`).
    - **UI Visibility**: Peer messages and consults appear in main Group Chat (with `peer_consult` styled as compact collapsible threads), while `trajectory_read` calls appear as subtle inline activity pills (`@claude read @codex's trajectory`).
@@ -33,8 +33,9 @@ Every design decision must uphold these core specifications (finalized during de
 5. **Orchestrator-Curated High-Level Episodic Memory**:
    - Project-wide memory lives in **SQLite (`WAL`) + FTS5** (shared across sessions of the same project).
    - Curate high-level summaries for completed project work using the orchestrator when configured and available, with deterministic records as a fallback. Store job ownership, touched modules, outcomes, and harness/model notes.
-6. **Worktree-Smart Permissions, Low Footprint & Optional Remote Access**:
-   - Worktree is the default permission mode. Brokered reads from the project and writes inside the member worktree are allowed. Prompt for external file access and commands requiring approval, and support session-scoped allow patterns.
+6. **Approval Modes, Low Footprint & Optional Remote Access**:
+   - Require approval is the default. Brokered reads from the project and writes inside the member workspace are allowed. Prompt for external file access and commands requiring approval, and support session-scoped allow patterns. Apply the selected mode to each persona through its harness's supported permission settings.
+   - Approve registered embedded-switch MCP calls for all session personas. Enforce the switch's own role, routing, and dispatch confirmation checks.
    - The standalone CLI serves `127.0.0.1:4410` by default, opens the browser on loopback, and provides tray controls for Windows and macOS releases. Electron runs the same backend on token-protected loopback. Non-loopback standalone binds require HTTPS and authentication. The app refuses to run as root or with an elevated Windows token.
 
 ---

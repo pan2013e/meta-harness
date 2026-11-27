@@ -16,7 +16,6 @@ import {
   Settings2,
   Terminal,
 } from "lucide-react";
-import { api } from "../../api/client";
 import { useAppStore } from "../../store/useAppStore";
 import type { ChatMessage } from "../../types/api";
 import { Composer, type ComposerPreset } from "./Composer";
@@ -47,6 +46,7 @@ export function ChatPane() {
     messages,
     hopPaused,
     pendingPermissions,
+    resolvePermission,
     sidebarCollapsed,
     toggleSidebar,
     continueHopChain,
@@ -101,10 +101,23 @@ export function ChatPane() {
   const memoryCount = memoryJobs.length + memoryFacts.length;
   const readyCount = probes.filter((p) => p.installed).length;
 
-  const { visibleMessages, repliesByParent } = useMemo(() => {
+  const { visibleMessages, repliesByParent, legacySkillsByTurn, turnsWithText } = useMemo(() => {
     const replies = new Map<string, ChatMessage[]>();
+    const legacySkills = new Map<string, string[]>();
+    const pendingIds = new Set(pendingPermissions.map((prompt) => prompt.request_id));
+    const turns = new Set<string>();
     const visible: ChatMessage[] = [];
     for (const m of messages) {
+      if (m.kind === "permission_card" && !pendingIds.has(String(m.metadata.request_id))) continue;
+      if (m.kind === "text" && m.turn_id) turns.add(m.turn_id);
+      if (m.kind === "activity_pill" && typeof m.metadata.skill_id === "string") {
+        if (m.turn_id) {
+          const names = legacySkills.get(m.turn_id) ?? [];
+          names.push(typeof m.metadata.skill_name === "string" ? m.metadata.skill_name : m.metadata.skill_id);
+          legacySkills.set(m.turn_id, names);
+        }
+        continue;
+      }
       if (m.kind === "consult_thread" && m.parent_msg_id) {
         const list = replies.get(m.parent_msg_id) ?? [];
         list.push(m);
@@ -113,8 +126,13 @@ export function ChatPane() {
         visible.push(m);
       }
     }
-    return { visibleMessages: visible, repliesByParent: replies };
-  }, [messages]);
+    return { visibleMessages: visible, repliesByParent: replies, legacySkillsByTurn: legacySkills, turnsWithText: turns };
+  }, [messages, pendingPermissions]);
+
+  const workingMembers = Object.entries(memberStatuses).filter(([, member]) =>
+    (member.status === "thinking" || member.status === "running_tool") &&
+    member.turnId && !turnsWithText.has(member.turnId)
+  );
 
   const virtualizer = useVirtualizer({
     count: visibleMessages.length,
@@ -149,8 +167,7 @@ export function ChatPane() {
       const option = top.options.find((item) => item.kind === kind);
       if (!option) return;
       e.preventDefault();
-      void api
-        .resolvePermission(activeSession.id, top.request_id, option.option_id)
+      void resolvePermission(activeSession.id, top.request_id, option.option_id)
         .catch((error: unknown) =>
           useAppStore
             .getState()
@@ -159,7 +176,7 @@ export function ChatPane() {
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
-  }, [activeSession, pendingPermissions, shellOpen, setShellOpen]);
+  }, [activeSession, pendingPermissions, resolvePermission, shellOpen, setShellOpen]);
 
   return (
     <main className="flex-1 flex flex-col min-w-0 bg-app h-full">
@@ -473,6 +490,7 @@ export function ChatPane() {
                       <MessageRow
                         message={msg}
                         onQuote={quoteInComposer}
+                        legacySkills={msg.turn_id ? legacySkillsByTurn.get(msg.turn_id) : undefined}
                         consultReplies={
                           repliesByParent.get(msg.id) ?? NO_CONSULT_REPLIES
                         }
@@ -511,13 +529,16 @@ export function ChatPane() {
             </div>
           )}
 
-          {startingMembers.length > 0 && (
+          {(startingMembers.length > 0 || workingMembers.length > 0) && (
             <div
               role="status"
               className="mx-auto flex w-full max-w-[52rem] items-center gap-2 px-5 py-1.5 text-xs text-ink-muted"
             >
               <Loader2 className="h-3.5 w-3.5 animate-spin text-brand-ink" />
-              Starting {startingMembers.map(([handle]) => `@${handle}`).join(", ")}…
+              {[
+                startingMembers.length > 0 && `Starting ${startingMembers.map(([handle]) => `@${handle}`).join(", ")}`,
+                workingMembers.length > 0 && `Working ${workingMembers.map(([handle]) => `@${handle}`).join(", ")}`,
+              ].filter(Boolean).join(" · ")}…
             </div>
           )}
 

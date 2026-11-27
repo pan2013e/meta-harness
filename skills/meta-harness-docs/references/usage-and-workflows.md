@@ -53,12 +53,12 @@ Injected into every `session/new` / `session/load` via `meta-harness mcp-bridge`
   - `@handle` pills delete atomically on Backspace.
   - **Built-in workflow pills (green):** `/plan`, `/review`, `/test`, `/fix` (injected as structured `<slash_commands>` directives).
   - **Built-in action pills (amber):** `/compact`, `/diff`, `/shell`, `/memory`, `/new`, `/archive`.
-  - **Skill pills:** Typing `/` also lists enabled skills (e.g. `/meta-harness-docs`) in a distinct sky-blue pill that preloads `SKILL.md` for that turn and logs an inline activity pill.
+  - **Skill pills:** Typing `/` lists enabled skills (e.g. `/meta-harness-docs`). Selecting one preloads `SKILL.md` and records the skill in the turn's expandable steps.
 - **Model, Effort, & Context Ring:** Bottom-left selector supports per-recipient model & reasoning effort overrides when multiple agents are addressed. Bottom-right rings track subscription headroom and per-member context window composition (live ACP `usage_update` when available, or calibrated estimate including `gpt-6*` 1M windows).
 - **Approval Modes & Shortcuts:**
-  - **Worktree** (`worktree_smart`, default): auto-allows project reads, skill reads, and in-worktree edits; prompts for shell commands (supports **"Allow Pattern for Session"** saved in `session_permission_rules`).
-  - **Strict** (`strict`): prompts on edits and shell executions.
-  - **Auto** (`autonomous_sandbox`): allows in-worktree edits and safe commands; prompts on risky patterns (`git push`, `rm -rf`, etc.) and external paths.
+  - **Require approval** (`require_approval`, default) permits workspace edits and asks for external access and unapproved shell commands. A command pattern can be approved for the session.
+  - **Approve for me** (`approve_for_me`) uses native automatic review where available and can prompt when needed.
+  - **Full access** (`full_access`) runs without routine prompts, subject to provider restrictions. Each persona takes the selected mode on its next turn.
   - Pending approval card hotkeys: `Alt+A` (Allow once), `Alt+R` (Reject).
 - **Diff Review & Promote:** Header badge shows integration diff stats (`+N -M Review & Promote`). Supports **Fast-Forward / Merge**, **Squash Merge**, or **Apply Uncommitted Patch** to base branch.
 - **In-App File Previews:** Clicking workspace file links opens read-only Monaco code view, native image viewer, PDF.js viewer, or sandboxed HTML iframe via `/preview/{session_id}/{grant}/{*path}` (30-min scoped read-only grants, 24 MiB cap).

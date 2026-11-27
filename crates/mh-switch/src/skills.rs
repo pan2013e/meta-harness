@@ -5,11 +5,11 @@ use serde_json::json;
 use tracing::warn;
 
 use mh_core::{
-    AppPaths, MAX_SKILL_FILE_BYTES, MessageKind, SenderKind, Session, SkillDetail, SkillSource,
-    SkillSummary, compute_skill_tree_hash, is_path_within, normalize_path, resolve_skill_file,
-    sanitize_skill_slug, scan_skill_dir,
+    AppPaths, MAX_SKILL_FILE_BYTES, Session, SkillDetail, SkillSource, SkillSummary,
+    TrajectoryEventKind, WsEvent, compute_skill_tree_hash, is_path_within, normalize_path,
+    resolve_skill_file, sanitize_skill_slug, scan_skill_dir,
 };
-use mh_store::{NewMessageParams, SkillStateRow, Store};
+use mh_store::{SkillStateRow, Store};
 
 use crate::{SwitchEngine, SwitchError};
 
@@ -457,64 +457,27 @@ impl SwitchEngine {
         read_skill_file_from_summary(&skill, rel_path)
     }
 
-    pub async fn emit_skill_activity_pill(
-        &self,
-        session_id: &str,
-        member_handle: &str,
-        turn_id: Option<&str>,
-        chain_id: Option<&str>,
-        skill: &SkillSummary,
-    ) {
-        let rt = self.runtime(session_id).await;
-        let dedupe_scope = turn_id
-            .map(str::to_string)
-            .or_else(|| chain_id.map(|c| format!("{c}:{member_handle}")))
-            .unwrap_or_else(|| member_handle.to_string());
-        if !rt
-            .recorded_skill_uses
-            .lock()
-            .await
-            .insert((dedupe_scope, skill.id.clone()))
+    pub fn record_skill_use(&self, session_id: &str, turn_id: &str, skill: &SkillSummary) {
+        let payload = json!({ "skill_id": skill.id, "skill_name": skill.name });
+        if let Ok(events) = self
+            .store
+            .append_trajectory_events(turn_id, &[(TrajectoryEventKind::Skill, payload)])
         {
-            return;
-        }
-
-        let resolved_chain = match chain_id {
-            Some(c) => c.to_string(),
-            None => {
-                self.active_chain_for_member(session_id, member_handle)
-                    .await
+            for event in events {
+                let _ = self.events_tx.send(WsEvent::TrajectoryEvent {
+                    session_id: session_id.to_string(),
+                    turn_id: turn_id.to_string(),
+                    event,
+                });
             }
-        };
-        if let Ok(pill) = self.store.append_message(NewMessageParams {
-            id: None,
-            session_id: session_id.to_string(),
-            chain_id: resolved_chain,
-            parent_msg_id: None,
-            sender_kind: SenderKind::System,
-            sender_id: member_handle.to_string(),
-            recipients: Vec::new(),
-            kind: MessageKind::ActivityPill,
-            content: format!("@{member_handle} used skill {}", skill.name),
-            turn_id: turn_id.map(str::to_string),
-            metadata: json!({
-                "member": member_handle,
-                "skill_id": skill.id,
-                "skill_name": skill.name,
-            }),
-        }) {
-            let _ = self.events_tx.send(mh_core::WsEvent::SwitchActivityPill {
-                session_id: session_id.to_string(),
-                message: pill,
-            });
         }
     }
 
-    pub async fn emit_skill_activity_for_path(
+    pub fn record_skill_use_for_path(
         &self,
         session_id: &str,
         member_handle: &str,
-        turn_id: Option<&str>,
+        turn_id: &str,
         target: &Path,
     ) {
         let Ok(session) = self.store.get_session(session_id) else {
@@ -533,8 +496,7 @@ impl SwitchEngine {
             .into_iter()
             .find(|s| s.enabled && is_path_within(target, Path::new(&s.skill_dir)))
         {
-            self.emit_skill_activity_pill(session_id, member_handle, turn_id, None, &matched)
-                .await;
+            self.record_skill_use(session_id, turn_id, &matched);
         }
     }
 }

@@ -38,6 +38,8 @@ interface MentionEditorProps {
   onChange: (nextValue: string) => void;
   onMentionQuery: (query: string | null) => void;
   onSlashQuery?: (query: string | null) => void;
+  onPasteImages?: (files: File[]) => void;
+  onPasteError?: (message: string) => void;
   onKeyDown?: (event: React.KeyboardEvent<HTMLDivElement>) => void;
 }
 
@@ -224,6 +226,8 @@ export const MentionEditor = forwardRef<MentionEditorHandle, MentionEditorProps>
       onChange,
       onMentionQuery,
       onSlashQuery,
+      onPasteImages,
+      onPasteError,
       onKeyDown,
     },
     ref
@@ -497,7 +501,21 @@ export const MentionEditor = forwardRef<MentionEditorHandle, MentionEditorProps>
 
     const handlePaste = (event: React.ClipboardEvent<HTMLDivElement>) => {
       event.preventDefault();
-      insertPlainText(event.clipboardData.getData("text/plain"), selectionRangeWithin(event.currentTarget));
+      const images = Array.from(event.clipboardData.files ?? []).filter((file) => file.type.startsWith("image/"));
+      if (!images.length) {
+        for (const item of Array.from(event.clipboardData.items ?? [])) {
+          if (item.kind === "file" && item.type.startsWith("image/")) {
+            const file = item.getAsFile();
+            if (file) images.push(file);
+          }
+        }
+      }
+      if (images.length && onPasteImages) {
+        onPasteImages(images);
+        return;
+      }
+      const text = event.clipboardData.getData("text/plain");
+      if (text) insertPlainText(text, selectionRangeWithin(event.currentTarget));
     };
 
     const handleTextMenu = (event: React.MouseEvent<HTMLDivElement>) => {
@@ -508,9 +526,17 @@ export const MentionEditor = forwardRef<MentionEditorHandle, MentionEditorProps>
       const range = selectionRangeWithin(editor)?.cloneRange() ?? null;
       const selected = range && !range.collapsed ? serializeMentionDom(range.cloneContents()) : "";
       void desktop.textMenu("composer", selected, !disabled).then((action) => {
-        if (action?.type === "paste" && editorRef.current === editor && editor.getAttribute("contenteditable") === "true") {
-          editor.focus();
-          insertPlainText(action.text, range);
+        if (editorRef.current !== editor || editor.getAttribute("contenteditable") !== "true") return;
+        if (action?.type === "paste") {
+          if (action.text) {
+            editor.focus();
+            insertPlainText(action.text, range);
+          }
+        } else if (action?.type === "paste_image") {
+          const bytes = Uint8Array.from(atob(action.data), (character) => character.charCodeAt(0));
+          onPasteImages?.([new File([bytes], "Clipboard image.png", { type: "image/png" })]);
+        } else if (action?.type === "paste_error") {
+          onPasteError?.(action.message);
         }
       }).catch(() => useAppStore.getState().setError("Could not open the composer menu."));
     };

@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+## 0.8.0
+
+- Render Antigravity replies with nested lists, deeper headings, and bold text containing inline code. Preserve workspace file previews and expandable code and detail blocks.
+- Add Approve for me, Require approval, and Full access, and apply the session's mode to each persona's harness. Clear resolved approval cards from chat and automatically approve registered switch tools for every persona.
+- Show agent replies in chronological segments, label messages sent to peers, and record skill use in the shared turn timeline.
+- Paste or attach images in the composer and send them to harnesses that accept image prompts.
+
 ## 0.7.1
 
 - Fix project folders hanging when opened in the Windows desktop app. Time out stalled folder-picker requests and allow navigation to continue.

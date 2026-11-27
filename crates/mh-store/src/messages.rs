@@ -1,7 +1,7 @@
 use rusqlite::{OptionalExtension, params};
 use serde_json::Value;
 
-use mh_core::{ChatMessage, MessageKind, SenderKind};
+use mh_core::{ChatImage, ChatMessage, MessageKind, SenderKind};
 
 use crate::{Store, StoreError, now_millis};
 
@@ -22,15 +22,32 @@ pub struct NewMessageParams {
 
 impl Store {
     pub fn append_message(&self, msg: NewMessageParams) -> Result<ChatMessage, StoreError> {
+        self.append_message_with_images(msg, &[])
+    }
+
+    pub fn append_message_with_images(
+        &self,
+        mut msg: NewMessageParams,
+        images: &[ChatImage],
+    ) -> Result<ChatMessage, StoreError> {
         let id = msg
             .id
             .unwrap_or_else(|| format!("msg_{}", uuid::Uuid::new_v4().simple()));
-        let created_at = now_millis();
         let recipients_json = serde_json::to_string(&msg.recipients)?;
+        if !images.is_empty() {
+            msg.metadata["images"] = serde_json::json!(
+                images
+                    .iter()
+                    .map(|image| &image.mime_type)
+                    .collect::<Vec<_>>()
+            );
+        }
         let metadata_json = serde_json::to_string(&msg.metadata)?;
 
-        let conn = self.conn()?;
-        conn.execute(
+        let mut conn = self.conn()?;
+        let tx = conn.transaction()?;
+        let created_at = now_millis();
+        tx.execute(
             "INSERT INTO messages (
                 id, session_id, chain_id, parent_msg_id, sender_kind,
                 sender_id, recipients_json, kind, content, turn_id,
@@ -51,11 +68,16 @@ impl Store {
                 created_at,
             ],
         )?;
-        let seq = conn.last_insert_rowid();
-        conn.execute(
+        let seq = tx.last_insert_rowid();
+        for (index, image) in images.iter().enumerate() {
+            tx.execute("INSERT INTO message_images (message_id, image_index, mime_type, bytes) VALUES (?1, ?2, ?3, ?4)",
+                params![id, index, image.mime_type, image.bytes])?;
+        }
+        tx.execute(
             "UPDATE sessions SET updated_at = ?1 WHERE id = ?2",
             params![created_at, msg.session_id],
         )?;
+        tx.commit()?;
 
         Ok(ChatMessage {
             seq,
@@ -72,6 +94,34 @@ impl Store {
             metadata: msg.metadata,
             created_at,
         })
+    }
+
+    pub fn get_message_image(
+        &self,
+        session_id: &str,
+        message_id: &str,
+        index: u32,
+    ) -> Result<Option<ChatImage>, StoreError> {
+        Ok(self.conn()?.query_row(
+            "SELECT i.mime_type, i.bytes FROM message_images i JOIN messages m ON m.id = i.message_id
+             WHERE m.session_id = ?1 AND m.id = ?2 AND i.image_index = ?3",
+            params![session_id, message_id, index], map_image_row).optional()?)
+    }
+
+    pub fn list_chain_images(
+        &self,
+        session_id: &str,
+        chain_id: &str,
+    ) -> Result<Vec<ChatImage>, StoreError> {
+        let conn = self.conn()?;
+        let mut stmt = conn.prepare(
+            "SELECT i.mime_type, i.bytes FROM message_images i JOIN messages m ON m.id = i.message_id
+             WHERE m.session_id = ?1 AND m.chain_id = ?2 AND m.sender_kind = 'user'
+             ORDER BY i.image_index",
+        )?;
+        stmt.query_map(params![session_id, chain_id], map_image_row)?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(Into::into)
     }
 
     pub fn update_message(
@@ -192,6 +242,13 @@ impl Store {
         let rows = stmt.query_map(params![session_id, since_seq, limit_i], map_message_row)?;
         rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
     }
+}
+
+fn map_image_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ChatImage> {
+    Ok(ChatImage {
+        mime_type: row.get(0)?,
+        bytes: row.get(1)?,
+    })
 }
 
 fn map_message_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ChatMessage> {

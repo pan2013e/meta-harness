@@ -1,4 +1,4 @@
-type TextMenuAction = { type: "quote" } | { type: "paste"; text: string } | null;
+type TextMenuAction = { type: "quote" } | { type: "paste"; text: string } | { type: "paste_image"; data: string } | { type: "paste_error"; message: string } | null;
 
 declare global {
   interface Window {

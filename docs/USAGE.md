@@ -44,10 +44,10 @@ Harnesses start from their assigned worktree or the shared workspace. Commit pro
 
 While working concurrently, harnesses connect through Meta-Harness's embedded MCP switch (`meta-harness mcp-bridge`):
 
-- **Async Handoffs:** Harnesses can `@mention` peers in group chat to trigger follow-up turns (bounded by the session hop guard, default 6 hops per user turn).
+- **Async Handoffs:** Harnesses can `@mention` peers in group chat to trigger follow-up turns (bounded by the session hop guard, default 6 hops per user turn). Direct messages sent through the switch show a **To @handle** label.
 - **Synchronous Consults (`Sync Consult`):** An active harness can ask an idle peer a question mid-turn and receive the answer before continuing, protected against deadlocks by a live wait-for cycle detector.
 - **Trajectory Inspection:** When one harness reads a peer's reasoning steps, tool calls, or diffs (`trajectory_read`), an inline activity pill appears in chat (e.g., `@claude read @codex's trajectory`).
-- **Clean Multi-Step Messages:** Tool calls, shell output, and intermediate notes collapse into expandable **`Worked · N steps`** timelines above the final response.
+- **Chronological replies:** An agent can post a progress update, another agent can reply, and the first agent can post its final result below that reply. Each part links to the same expandable turn steps. Tool calls, shell output, and skills are shown in those steps.
 
 ### Composer Controls & Slash Commands
 
@@ -58,11 +58,13 @@ In the desktop app, right-click selected chat text to copy it or quote it in the
   - **Action pills** *(execute workspace actions immediately)*: `/compact` *(condense older chat context into working summary)*, `/diff`, `/shell`, `/memory`, `/new`, `/archive`
   - **Skill pills** *(preload `SKILL.md` for that turn)*: Any enabled skill such as `/meta-harness-docs` appears in the `/` menu in a distinct skill color; harnesses can also discover and read skills autonomously via `skill_list` / `skill_read` MCP tools or brokered read-only access.
 - **Model & Reasoning Effort Selector:** Click the model chip at the bottom-left of the composer to override the model or reasoning effort for the active route—when addressing multiple agents (e.g., `@codex @claude`), each recipient gets its own tab.
+- **Image inputs:** Paste an image into the composer or use **Attach images**. A message can contain up to four PNG, JPEG, GIF, or WebP images, each up to 5 MiB. Image-only messages work too. A recipient needs to support ACP image prompts to receive them.
 - **Approval Modes:**
-  - **Worktree** (`worktree_smart`) — Default. Allows file reads/writes inside the member worktree and prompts before running shell commands (with optional session-wide allow patterns).
-  - **Strict** (`strict`) — Prompts on both file writes and shell executions.
-  - **Auto** (`autonomous_sandbox`) — Auto-allows worktree edits and safe local commands while prompting on risky/external actions.
-  - Keyboard shortcuts when an approval card is pending: `Alt+A` to allow once, `Alt+R` to reject.
+  - **Require approval** is the default. Edit files in the workspace and ask before external edits, Internet access, and shell commands that require review.
+  - **Approve for me** uses the harness's automatic review where available. Otherwise, the harness and broker approve routine local operations and can still ask for a decision.
+  - **Full access** lets the harness edit files and use the network without routine prompts, subject to any provider or administrator restrictions.
+  - The mode applies to each persona's next turn. Registered Meta-Harness switch tools get one-time approval in every mode, subject to the switch's own role and dispatch checks.
+  - Use `Alt+A` to allow once or `Alt+R` to reject. The card disappears after the decision.
 - **Live Quota & Context Rings:** Bottom-right rings display current subscription utilization and per-member context composition (reported directly by ACP when supported, or estimated against the model's context window).
 
 ---

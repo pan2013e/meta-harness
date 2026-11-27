@@ -6,12 +6,15 @@ import {
   CornerDownLeft,
   Cpu,
   Gauge,
+  Paperclip,
   Send,
   Square,
+  X,
 } from "lucide-react";
 import { api } from "../../api/client";
 import { useAppStore } from "../../store/useAppStore";
 import type {
+  ChatImageInput,
   MemberContextBreakdown,
   ModelChoiceDetail,
   ModelSelection,
@@ -27,6 +30,25 @@ import {
   type MentionEditorHandle,
   type SlashCommandKind,
 } from "./MentionEditor";
+
+const IMAGE_TYPES = ["image/png", "image/jpeg", "image/gif", "image/webp"];
+const MAX_IMAGES = 4;
+const MAX_IMAGE_BYTES = 5 * 1024 * 1024;
+
+function encodeImage(file: File): Promise<ChatImageInput> {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onerror = () => reject(new Error(`Could not read ${file.name}.`));
+    reader.onabort = () => reject(new Error(`Reading ${file.name} was cancelled.`));
+    reader.onload = () => {
+      const dataUrl = typeof reader.result === "string" ? reader.result : "";
+      const data = dataUrl.split(",", 2)[1];
+      if (!data) reject(new Error(`Could not read ${file.name}.`));
+      else resolve({ mime_type: file.type, data });
+    };
+    reader.readAsDataURL(file);
+  });
+}
 
 const SLASH_ITEMS: Array<{
   command: string;
@@ -190,6 +212,9 @@ export function Composer({
 
   const [text, setText] = useState("");
   const [sending, setSending] = useState(false);
+  const [images, setImages] = useState<Array<{ file: File; url: string }>>([]);
+  const imagePreviews = useRef(new Set<string>());
+  const imageInput = useRef<HTMLInputElement>(null);
   const [mentionQuery, setMentionQuery] = useState<string | null>(null);
   const [slashQuery, setSlashQuery] = useState<string | null>(null);
   const [selectedIdx, setSelectedIdx] = useState(0);
@@ -208,6 +233,36 @@ export function Composer({
   const editorRef = useRef<MentionEditorHandle | null>(null);
   const modelButtonRef = useRef<HTMLButtonElement | null>(null);
   const modelMenuId = useId();
+
+  useEffect(() => {
+    const urls = imagePreviews.current;
+    return () => {
+      for (const url of urls) URL.revokeObjectURL(url);
+      urls.clear();
+    };
+  }, []);
+
+  const addImages = (files: File[]) => {
+    if (sending || !files.length) return;
+    if (imagePreviews.current.size + files.length > MAX_IMAGES) {
+      setError("Attach up to four images per message.");
+      return;
+    }
+    if (files.some((file) => !IMAGE_TYPES.includes(file.type))) {
+      setError("Attach a PNG, JPEG, GIF, or WebP image.");
+      return;
+    }
+    if (files.some((file) => !file.size || file.size > MAX_IMAGE_BYTES)) {
+      setError("Each image must be between 1 byte and 5 MiB.");
+      return;
+    }
+    const added = files.map((file) => {
+      const url = URL.createObjectURL(file);
+      imagePreviews.current.add(url);
+      return { file, url };
+    });
+    setImages((current) => [...current, ...added]);
+  };
 
   useEffect(() => {
     if (draftPreset?.text) {
@@ -602,7 +657,7 @@ export function Composer({
   const usage = reportedQuotaUse.length ? Math.max(...reportedQuotaUse) : null;
 
   const handleSend = async () => {
-    if (!raw || sending) return;
+    if ((!raw && !images.length) || sending) return;
 
     const overrides = Object.fromEntries(recipients.flatMap((member) => {
       const selection = modelOverrides[recipientKey(member)];
@@ -680,7 +735,13 @@ export function Composer({
     setText("");
     setSending(true);
     try {
-      await sendMessage(raw, opts);
+      const attachments = images.length ? await Promise.all(images.map(({ file }) => encodeImage(file))) : [];
+      await sendMessage(raw, attachments.length ? { ...opts, images: attachments } : opts);
+      for (const { url } of images) {
+        URL.revokeObjectURL(url);
+        imagePreviews.current.delete(url);
+      }
+      setImages([]);
     } catch (error) {
       setText((current) => (current ? `${raw}\n${current}` : raw));
       setError(error instanceof Error ? error.message : String(error));
@@ -794,6 +855,8 @@ export function Composer({
             onChange={setText}
             onMentionQuery={setMentionQuery}
             onSlashQuery={setSlashQuery}
+            onPasteImages={addImages}
+            onPasteError={setError}
             onKeyDown={(e) => {
               if (e.key === "Enter" && !e.shiftKey && raw.toLowerCase() === "/memory") {
                 e.preventDefault();
@@ -842,6 +905,25 @@ export function Composer({
               }
             }}
           />
+
+          {images.length > 0 && (
+            <div className="flex flex-wrap gap-2" aria-label="Image attachments">
+              {images.map(({ file, url }, index) => (
+                <div key={url} className="relative rounded-lg border border-line bg-inset">
+                  <img src={url} alt={file.name || `Image ${index + 1}`} className="h-16 w-20 rounded-lg object-contain" />
+                  <button type="button" aria-label={`Remove image ${index + 1}`} disabled={sending}
+                    className="absolute right-0.5 top-0.5 rounded bg-app/90 p-1 text-ink hover:bg-hover"
+                    onClick={() => {
+                      URL.revokeObjectURL(url);
+                      imagePreviews.current.delete(url);
+                      setImages((current) => current.filter((image) => image.url !== url));
+                    }}>
+                    <X className="h-3 w-3" />
+                  </button>
+                </div>
+              ))}
+            </div>
+          )}
 
           <div className="relative flex flex-wrap items-center gap-x-2 gap-y-1.5 border-t border-line pt-2">
             <div className="flex min-w-0 max-w-full flex-wrap items-center gap-1.5 whitespace-nowrap text-[11px]">
@@ -1202,9 +1284,24 @@ export function Composer({
               )}
               <button
                 type="button"
+                title="Attach images"
+                aria-label="Attach images"
+                disabled={sending || images.length >= MAX_IMAGES}
+                onClick={() => imageInput.current?.click()}
+                className="rounded-lg p-2 text-ink-muted hover:bg-hover hover:text-ink disabled:opacity-40"
+              >
+                <Paperclip className="h-4 w-4" />
+              </button>
+              <input type="file" hidden multiple accept={IMAGE_TYPES.join(",")} ref={imageInput}
+                onChange={(event) => {
+                  addImages(Array.from(event.currentTarget.files ?? []));
+                  event.currentTarget.value = "";
+                }} />
+              <button
+                type="button"
                 title="Send (Enter or Ctrl+Enter)"
                 disabled={
-                  !text.trim() ||
+                  (!text.trim() && !images.length) ||
                   sending ||
                   (!availableMembers.length && !/^\/(diff|shell|memory|new|archive|compact)\b/i.test(text.trim()))
                 }

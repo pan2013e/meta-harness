@@ -127,7 +127,19 @@ function showTextMenu(event, kind, selection, canPaste) {
     } : {
       label: "Paste",
       enabled: canPaste === true,
-      click: () => resolve({ type: "paste", text: clipboard.readText() }),
+      click: () => {
+        if (kind === "composer") {
+          const image = clipboard.readImage();
+          if (!image.isEmpty()) {
+            const png = image.toPNG();
+            resolve(png.length > 5 * 1024 * 1024
+              ? { type: "paste_error", message: "Each image must be at most 5 MiB." }
+              : { type: "paste_image", data: png.toString("base64") });
+            return;
+          }
+        }
+        resolve({ type: "paste", text: clipboard.readText() });
+      },
     };
     Menu.buildFromTemplate([copy, action]).popup({
       window,

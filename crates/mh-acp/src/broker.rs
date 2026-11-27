@@ -133,7 +133,10 @@ impl WorkspaceBroker {
             .iter()
             .any(|root| is_path_within(&target, root));
 
-        if !inside_project && !in_skill_root {
+        if self.ctx.permission_policy != PermissionPolicy::FullAccess
+            && !inside_project
+            && !in_skill_root
+        {
             self.prompt_or_allow(
                 "fs_external",
                 &format!("Read external file: {}", target.display()),
@@ -173,22 +176,10 @@ impl WorkspaceBroker {
         let target = resolve_member_path(&self.ctx.member_worktree, &params.path);
         let inside_member_wt = is_path_within(&target, &self.ctx.member_worktree);
 
-        let needs_prompt = match self.ctx.permission_policy {
-            PermissionPolicy::Strict => true,
-            PermissionPolicy::WorktreeSmart | PermissionPolicy::AutonomousSandbox => {
-                !inside_member_wt
-            }
-        };
-
-        if needs_prompt {
-            let reason = if inside_member_wt {
-                format!("Write file inside worktree: {}", target.display())
-            } else {
-                format!("Write file OUTSIDE worktree: {}", target.display())
-            };
+        if self.ctx.permission_policy != PermissionPolicy::FullAccess && !inside_member_wt {
             self.prompt_or_allow(
                 "fs_external",
-                &reason,
+                &format!("Write file outside workspace: {}", target.display()),
                 target.to_string_lossy().as_ref(),
                 None,
                 vec![
@@ -256,12 +247,12 @@ impl WorkspaceBroker {
             .unwrap_or_else(|| self.ctx.member_worktree.clone());
 
         let cwd_inside = is_path_within(&cwd, &self.ctx.member_worktree);
-        let needs_prompt = match self.ctx.permission_policy {
-            PermissionPolicy::AutonomousSandbox => !cwd_inside || is_risky_command(&full_cmd),
-            PermissionPolicy::WorktreeSmart | PermissionPolicy::Strict => {
-                !cwd_inside || !self.matches_allow_rule("terminal", &full_cmd).await
-            }
-        };
+        let auto_approved = self.ctx.permission_policy == PermissionPolicy::ApproveForMe
+            && params.env.is_empty()
+            && matches!(full_cmd.as_str(), "pwd" | "Get-Location" | "git --version");
+        let needs_prompt = self.ctx.permission_policy != PermissionPolicy::FullAccess
+            && (!cwd_inside
+                || !(auto_approved || self.matches_allow_rule("terminal", &full_cmd).await));
 
         if needs_prompt {
             let suggested = suggest_command_pattern(&full_cmd);
@@ -462,14 +453,12 @@ impl WorkspaceBroker {
             .unwrap_or("Approve tool execution")
             .to_string();
 
-        if kind == "other"
+        if matches!(kind, "other" | "mcp")
             && let Some(tool) = params
                 .tool_call
                 .get("name")
                 .and_then(Value::as_str)
-                .and_then(|name| name.strip_prefix("mcp_"))
-                .and_then(|name| name.strip_prefix(SWITCH_MCP_SERVER_NAME))
-                .and_then(|name| name.strip_prefix('_'))
+                .and_then(switch_tool_name)
             && let Some(allow_once) = params
                 .options
                 .iter()
@@ -489,12 +478,8 @@ impl WorkspaceBroker {
             }));
         }
 
-        // Worktree-smart fast-path for edit/read tool calls inside allowed roots
+        // Check every reported path before approving a brokered read or edit.
         if matches!(kind, "edit" | "read" | "write" | "fs") {
-            let allow_worktree_access = matches!(
-                self.ctx.permission_policy,
-                PermissionPolicy::WorktreeSmart | PermissionPolicy::AutonomousSandbox
-            );
             let paths = tool_call_paths(&params.tool_call);
             let mut skill_reads = Vec::new();
             let allow_paths = {
@@ -508,8 +493,7 @@ impl WorkspaceBroker {
                             skill_reads.push(target);
                             true
                         } else {
-                            allow_worktree_access
-                                && is_path_within(&target, &self.ctx.member_worktree)
+                            is_path_within(&target, &self.ctx.member_worktree)
                         }
                     })
             };
@@ -535,6 +519,14 @@ impl WorkspaceBroker {
                     }
                 }));
             }
+        }
+
+        if self.ctx.permission_policy == PermissionPolicy::FullAccess
+            && let Some(allow) = options.iter().find(|option| option.kind == "allow_once")
+        {
+            return Ok(json!({
+                "outcome": { "outcome": "selected", "optionId": allow.option_id }
+            }));
         }
 
         if (kind == "execute" || kind == "terminal")
@@ -743,6 +735,17 @@ async fn pump_stream<R: tokio::io::AsyncRead + Unpin>(
     }
 }
 
+fn switch_tool_name(name: &str) -> Option<&str> {
+    name.strip_prefix("mcp__")
+        .and_then(|name| name.strip_prefix(SWITCH_MCP_SERVER_NAME))
+        .and_then(|name| name.strip_prefix("__"))
+        .or_else(|| {
+            name.strip_prefix("mcp_")
+                .and_then(|name| name.strip_prefix(SWITCH_MCP_SERVER_NAME))
+                .and_then(|name| name.strip_prefix('_'))
+        })
+}
+
 fn tool_call_paths(tool_call: &Value) -> Vec<&str> {
     let mut paths = Vec::new();
     if let Some(locations) = tool_call.get("locations").and_then(Value::as_array) {
@@ -787,14 +790,6 @@ pub fn wildcard_match(pattern: &str, candidate: &str) -> bool {
     } else {
         pattern == candidate
     }
-}
-
-fn is_risky_command(cmd: &str) -> bool {
-    let lower = cmd.to_ascii_lowercase();
-    lower.contains("git push")
-        || lower.contains("npm publish")
-        || lower.contains("rm -rf")
-        || lower.contains("del /s")
 }
 
 #[cfg(test)]
@@ -872,7 +867,7 @@ mod tests {
                 project_root: proj,
                 member_worktree: wt.clone(),
                 skill_read_roots: Arc::new(RwLock::new(vec![skills_root.clone()])),
-                permission_policy: PermissionPolicy::WorktreeSmart,
+                permission_policy: PermissionPolicy::RequireApproval,
                 active_turn_id: Arc::new(RwLock::new(Some("t1".into()))),
                 rules: Arc::new(RwLock::new(Vec::new())),
             },
@@ -1008,7 +1003,7 @@ mod tests {
                 project_root: tmp.path().into(),
                 member_worktree: tmp.path().into(),
                 skill_read_roots: Arc::new(RwLock::new(Vec::new())),
-                permission_policy: PermissionPolicy::Strict,
+                permission_policy: PermissionPolicy::RequireApproval,
                 active_turn_id: Arc::clone(&active_turn),
                 rules: Arc::new(RwLock::new(Vec::new())),
             },

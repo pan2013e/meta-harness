@@ -71,7 +71,7 @@ pub async fn run_mock_acp_agent_stdio() {
                             "result": {
                                 "protocolVersion": 1,
                                 "agentInfo": { "name": "mock-acp-agent", "version": "0.1.0" },
-                                "agentCapabilities": { "loadSession": true }
+                                "agentCapabilities": { "loadSession": true, "promptCapabilities": { "image": true } }
                             }
                         }),
                     )
@@ -307,6 +307,23 @@ async fn handle_prompt(
         return;
     }
 
+    if let Some(progress) = extract_tag_attr(&directive_text, "[MOCK:PROGRESS", "text") {
+        emit_update(
+            &stdout,
+            &sid,
+            "agent_message_chunk",
+            json!({ "type": "text", "text": progress }),
+        )
+        .await;
+        emit_update(
+            &stdout,
+            &sid,
+            "agent_thought_chunk",
+            json!({ "type": "text", "text": "Continuing work" }),
+        )
+        .await;
+    }
+
     if let Some(ms_str) = extract_tag_attr(&directive_text, "[MOCK:SLEEP", "ms") {
         let ms: u64 = ms_str.parse().unwrap_or(2000);
         let gate =
@@ -524,6 +541,16 @@ async fn handle_prompt(
 
     if let Some(custom_reply) = extract_tag_attr(&directive_text, "[MOCK:REPLY", "text") {
         reply = custom_reply;
+    }
+    if let Some(image) = params["prompt"]
+        .as_array()
+        .and_then(|blocks| blocks.iter().find(|block| block["type"] == "image"))
+        && image["data"].as_str().is_some_and(|data| !data.is_empty())
+    {
+        reply = format!(
+            "Received image ({})",
+            image["mimeType"].as_str().unwrap_or_default()
+        );
     }
 
     emit_update(

@@ -73,6 +73,10 @@ export function sessionFileUrl(sessionId: string, relPath: string): string {
   return `/api/sessions/${encodeURIComponent(sessionId)}/files/${encodeFilePath(relPath)}`;
 }
 
+export function messageImageUrl(sessionId: string, messageId: string, index: number): string {
+  return `/api/sessions/${encodeURIComponent(sessionId)}/messages/${encodeURIComponent(messageId)}/images/${index}`;
+}
+
 export function sessionPreviewUrl(sessionId: string, grant: string, relPath: string): string {
   return `/preview/${encodeURIComponent(sessionId)}/${encodeURIComponent(grant)}/${encodeFilePath(relPath)}`;
 }
@@ -396,6 +400,7 @@ export const api = {
           ...(opts?.model ? { model: opts.model } : {}),
           ...(opts?.effort ? { effort: opts.effort } : {}),
           ...(opts?.recipient_overrides ? { recipient_overrides: opts.recipient_overrides } : {}),
+          ...(opts?.images?.length ? { images: opts.images } : {}),
         }),
       }
     ),

@@ -23,6 +23,8 @@ export function TurnActivityTimeline({
   waitingForApproval,
   intermediateNotes,
   actor,
+  legacySkills,
+  compact = false,
 }: {
   turnId: string;
   sessionId: string;
@@ -30,10 +32,13 @@ export function TurnActivityTimeline({
   waitingForApproval: boolean;
   intermediateNotes: string[];
   actor: string;
+  legacySkills?: string[];
+  compact?: boolean;
 }) {
   const [expanded, setExpanded] = useState(false);
-  const events = useAppStore((s) => s.turnEvents[turnId]);
-  const counters = useAppStore((s) => s.turnCounters[turnId]);
+  const showDetails = !compact || expanded;
+  const events = useAppStore((s) => showDetails ? s.turnEvents[turnId] : undefined);
+  const counters = useAppStore((s) => showDetails ? s.turnCounters[turnId] : undefined);
   const snapshotReady = useAppStore((s) => s.turnEventSnapshots[turnId]);
   const loadTurnEvents = useAppStore((s) => s.loadTurnEvents);
 
@@ -79,10 +84,13 @@ export function TurnActivityTimeline({
     if (last.event.event_kind === "thought") {
       return "Thinking";
     }
+    if (last.event.event_kind === "skill") {
+      return `Loaded ${String(last.event.payload.skill_name ?? "skill")}`;
+    }
     return last.event.event_kind;
   }, [entries, fallbackNotes, actor]);
 
-  const summaryLabel = streaming
+  const summaryLabel = compact ? "Turn steps" : streaming
     ? waitingForApproval
       ? "Waiting for approval"
       : `Working${latestTitle ? ` · ${latestTitle}` : ""}`
@@ -94,12 +102,12 @@ export function TurnActivityTimeline({
         .filter(Boolean)
         .join(" · ");
 
-  if (streaming && !expanded && totalSteps === 0 && editsCount === 0) {
+  if (!compact && streaming && !expanded && totalSteps === 0 && editsCount === 0 && !legacySkills?.length) {
     return <WaitingForTurn waitingForApproval={waitingForApproval} />;
   }
 
   return (
-    <div className="my-1 rounded-xl border border-line bg-elevated/45 overflow-hidden text-xs">
+    <div className={`my-1 rounded-xl border border-line bg-elevated/45 overflow-hidden text-xs ${compact && !expanded ? "w-fit" : ""}`}>
       <button
         type="button"
         onClick={() => setExpanded((v) => !v)}
@@ -131,12 +139,18 @@ export function TurnActivityTimeline({
               {counters?.tool_calls}
             </span>
           )}
-          <span>{expanded ? "Hide" : "Steps"}</span>
+          {(!compact || expanded) && <span>{expanded ? "Hide" : "Steps"}</span>}
         </span>
       </button>
 
       {expanded && (
         <div className="border-t border-line bg-app/50 p-2.5 space-y-2 max-h-96 overflow-y-auto">
+          {legacySkills?.map((skill) => (
+            <div key={skill} className="flex items-center gap-2 px-3 py-1 text-ink-soft">
+              <Sparkles aria-hidden="true" className="h-3.5 w-3.5 text-brand-ink" />
+              Loaded skill {skill}
+            </div>
+          ))}
           {fallbackNotes.map((note, idx) => (
             <div
               key={`note-${idx}`}
@@ -154,7 +168,7 @@ export function TurnActivityTimeline({
             <TrajectoryRow key={entry.key} entry={entry} sessionId={sessionId} actor={actor} />
           ))}
 
-          {entries.length === 0 && fallbackNotes.length === 0 && (
+          {entries.length === 0 && fallbackNotes.length === 0 && !legacySkills?.length && (
             <div className="py-3 text-center text-[11px] text-ink-muted">
               {snapshotReady ? "No steps recorded yet." : "Loading steps…"}
             </div>

@@ -23,7 +23,7 @@ export interface SkillDetail {
 }
 
 export type IsolationMode = "worktree_per_member" | "shared_cwd";
-export type PermissionPolicy = "worktree_smart" | "strict" | "autonomous_sandbox";
+export type PermissionPolicy = "require_approval" | "approve_for_me" | "full_access";
 export type MemberRole = "orchestrator" | "executor" | "both";
 export type MemberStatus =
   | "hibernated"
@@ -49,6 +49,7 @@ export type TurnStatus = "running" | "completed" | "cancelled" | "failed";
 export type TrajectoryEventKind =
   | "thought"
   | "plan"
+  | "skill"
   | "tool_call"
   | "diff"
   | "terminal"
@@ -292,6 +293,12 @@ export interface MessageOptions {
   model?: string | null;
   effort?: string | null;
   recipient_overrides?: Record<string, ModelSelection>;
+  images?: ChatImageInput[];
+}
+
+export interface ChatImageInput {
+  mime_type: string;
+  data: string;
 }
 
 export interface SettingsFile {

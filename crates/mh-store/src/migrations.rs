@@ -281,5 +281,20 @@ pub fn apply_migrations(conn: &Connection) -> Result<(), StoreError> {
              COMMIT;",
         )?;
     }
+    if current_ver < 7 {
+        conn.execute_batch(
+            "BEGIN;
+             CREATE TABLE message_images (
+                 message_id TEXT NOT NULL REFERENCES messages(id) ON DELETE CASCADE,
+                 image_index INTEGER NOT NULL,
+                 mime_type TEXT NOT NULL,
+                 bytes BLOB NOT NULL,
+                 PRIMARY KEY (message_id, image_index)
+             );
+             CREATE INDEX idx_messages_session_chain ON messages(session_id, chain_id);
+             INSERT INTO schema_migrations (version) VALUES (7);
+             COMMIT;",
+        )?;
+    }
     Ok(())
 }

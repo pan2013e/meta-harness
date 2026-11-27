@@ -12,7 +12,9 @@ pub mod ws;
 use std::sync::Arc;
 
 use axum::{
-    Router, middleware,
+    Router,
+    extract::DefaultBodyLimit,
+    middleware,
     routing::{delete, get, patch, post},
 };
 use rust_embed::RustEmbed;
@@ -172,7 +174,14 @@ pub fn build_router(state: AppState) -> Router {
         )
         .route(
             "/api/sessions/{id}/messages",
-            get(routes::list_messages).post(routes::post_message),
+            get(routes::list_messages).merge(
+                post(routes::post_message)
+                    .layer(DefaultBodyLimit::max(mh_core::MAX_CHAT_REQUEST_BYTES)),
+            ),
+        )
+        .route(
+            "/api/sessions/{id}/messages/{message_id}/images/{image_index}",
+            get(routes::get_message_image),
         )
         .route("/api/sessions/{id}/cancel", post(routes::cancel_session))
         .route(

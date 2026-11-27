@@ -157,6 +157,7 @@ interface AppState {
   setShellOpen: (open: boolean) => void;
   setPromoteBanner: (msg: string | null) => void;
   setPendingPermissionPolicy: (policy: PermissionPolicy) => void;
+  resolvePermission: (sessionId: string, requestId: string, optionId: string, pattern?: string) => Promise<void>;
   openProjectWithNativeOrModal: () => Promise<void>;
 
   init: () => Promise<void>;
@@ -292,7 +293,7 @@ export const useAppStore = create<AppState>((set, get) => {
     pickingFolder: false,
     quotasRefreshing: false,
     promoteBanner: null,
-    pendingPermissionPolicy: "worktree_smart",
+    pendingPermissionPolicy: "require_approval",
 
     adapters: {},
     adapterCatalogs: {},
@@ -352,6 +353,10 @@ export const useAppStore = create<AppState>((set, get) => {
     setShellOpen: (open) => set({ shellOpen: open }),
     setPromoteBanner: (msg) => set({ promoteBanner: msg }),
     setPendingPermissionPolicy: (policy) => set({ pendingPermissionPolicy: policy }),
+    resolvePermission: async (sessionId, requestId, optionId, pattern) => {
+      await api.resolvePermission(sessionId, requestId, optionId, pattern);
+      get().handleWsEvent({ type: "permission.resolved", session_id: sessionId, request_id: requestId, decision: "resolved" });
+    },
 
     openProjectWithNativeOrModal: async () => {
       set({ folderModalOpen: true });
@@ -789,7 +794,7 @@ export const useAppStore = create<AppState>((set, get) => {
     },
 
     sendMessage: async (content, opts) => {
-      if (!content.trim()) return;
+      if (!content.trim() && !opts?.images?.length) return;
       let sid = get().activeSession?.id ?? null;
       if (!sid) {
         const created = await get().createAndSelectSession("New session");
@@ -1009,9 +1014,9 @@ export const useAppStore = create<AppState>((set, get) => {
           set((s) => ({
             messages: s.messages.some((m) => m.id === ev.message.id)
               ? s.messages.map((m) => (m.id === ev.message.id ? ev.message : m))
-              : [...s.messages, ev.message],
+              : [...s.messages, ev.message].sort((a, b) => a.seq - b.seq),
           }));
-          if (ev.message.session_id) {
+          if (ev.message.metadata.turn_complete !== false) {
             const selected = sessionRequest;
             const request = ++trajectoryRequest;
             void api

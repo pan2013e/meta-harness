@@ -137,6 +137,8 @@ pub struct NewSessionResult {
     pub config_options: Vec<Value>,
     #[serde(default)]
     pub models: Option<Value>,
+    #[serde(default)]
+    pub modes: Option<Value>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -157,7 +159,14 @@ pub struct PromptParams {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ContentBlock {
-    Text { text: String },
+    Text {
+        text: String,
+    },
+    Image {
+        #[serde(rename = "mimeType")]
+        mime_type: String,
+        data: String,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -295,6 +304,7 @@ pub fn parse_config_options(raw_options: &[Value]) -> Vec<DiscoveredConfigOption
 /// Combines `session/new.configOptions` with fallback `session/new.models` state if present.
 pub fn parse_new_session_options(res: &NewSessionResult) -> Vec<DiscoveredConfigOption> {
     let mut opts = parse_config_options(&res.config_options);
+    add_legacy_modes(&mut opts, res.modes.as_ref());
     let has_model = opts.iter().any(|o| {
         o.category
             .as_deref()
@@ -342,6 +352,43 @@ pub fn parse_new_session_options(res: &NewSessionResult) -> Vec<DiscoveredConfig
         }
     }
     opts
+}
+
+pub(crate) fn add_legacy_modes(options: &mut Vec<DiscoveredConfigOption>, modes: Option<&Value>) {
+    if options
+        .iter()
+        .any(|option| option.id == "mode" || option.category.as_deref() == Some("mode"))
+    {
+        return;
+    }
+    let Some(modes) = modes else { return };
+    let Some(available) = modes.get("availableModes").and_then(Value::as_array) else {
+        return;
+    };
+    let choices = available
+        .iter()
+        .filter_map(|mode| {
+            let id = mode.get("id")?.as_str()?;
+            Some(ConfigOptionChoice {
+                value: id.into(),
+                label: mode
+                    .get("name")
+                    .and_then(Value::as_str)
+                    .unwrap_or(id)
+                    .into(),
+            })
+        })
+        .collect();
+    options.push(DiscoveredConfigOption {
+        id: "mode".into(),
+        category: Some("mode".into()),
+        label: Some("Mode".into()),
+        current_value: modes
+            .get("currentModeId")
+            .and_then(Value::as_str)
+            .map(str::to_string),
+        choices,
+    });
 }
 
 /// Extracts text from heterogeneous ACP `session/update` content shapes

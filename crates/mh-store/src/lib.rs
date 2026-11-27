@@ -87,7 +87,7 @@ mod tests {
                 orchestrator_member: Some("claude".into()),
                 confirm_before_dispatch: false,
                 max_hops: 6,
-                permission_policy: PermissionPolicy::WorktreeSmart,
+                permission_policy: PermissionPolicy::RequireApproval,
             })
             .unwrap();
 
@@ -255,7 +255,7 @@ mod tests {
                 orchestrator_member: None,
                 confirm_before_dispatch: false,
                 max_hops: 6,
-                permission_policy: PermissionPolicy::WorktreeSmart,
+                permission_policy: PermissionPolicy::RequireApproval,
             })
             .unwrap();
         assert!(standalone.project_id.is_none());

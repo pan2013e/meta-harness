@@ -11,7 +11,9 @@ use tokio::process::{Child, ChildStdin, Command};
 use tokio::sync::{Mutex, RwLock, oneshot};
 use tracing::{debug, warn};
 
-use mh_core::{DiscoveredConfigOption, PermissionRule, TrajectoryEventKind};
+use mh_core::{
+    ChatImage, DiscoveredConfigOption, PermissionPolicy, PermissionRule, TrajectoryEventKind,
+};
 
 use crate::AcpError;
 use crate::broker::{BrokerCallbacks, MemberBrokerContext, WorkspaceBroker};
@@ -20,19 +22,19 @@ use crate::protocol::{
     ClientCapabilities, ClientInfo, ContentBlock, FsCapabilities, InitializeParams,
     InitializeResult, JsonRpcNotification, JsonRpcRequest, JsonRpcResponse, LoadSessionParams,
     McpServerSpec, NewSessionParams, NewSessionResult, PromptParams, PromptResult,
-    SetConfigOptionParams, extract_update_text, parse_config_options, parse_new_session_options,
+    SetConfigOptionParams, add_legacy_modes, extract_update_text, parse_config_options,
+    parse_new_session_options,
 };
 use crate::trajectory::{TrajectoryUpdate, parse_tool_update, push_update};
 
 #[derive(Debug, Clone, Default)]
 pub struct PromptTextOutput {
     pub final_text: String,
-    pub intermediate_notes: Vec<String>,
 }
 
 #[async_trait]
 pub trait TurnStreamListener: Send + Sync {
-    async fn on_text_delta(&self, turn_id: &str, delta: String, replace: bool);
+    async fn on_text_delta(&self, turn_id: &str, delta: String, new_segment: bool);
     async fn on_thought_delta(&self, turn_id: &str, delta: String);
     async fn on_trajectory_event(&self, turn_id: &str, kind: TrajectoryEventKind, payload: Value);
     async fn on_config_options_updated(&self, options: Vec<DiscoveredConfigOption>);
@@ -42,12 +44,10 @@ struct TurnStreamAccumulator {
     turn_id: String,
     listener: Arc<dyn TurnStreamListener>,
     text_buf: String,
-    pending_replace: bool,
     after_step_boundary: bool,
     thought_buf: String,
     trajectory_buf: Vec<TrajectoryUpdate>,
     current_segment: String,
-    prior_segments: Vec<String>,
 }
 
 #[derive(Default)]
@@ -161,13 +161,12 @@ impl AcpClient {
             loop {
                 interval.tick().await;
                 let _flush = flush_guard.lock().await;
-                let (turn_id, listener, text_delta, replace, thought_delta, trajectory) = {
+                let (turn_id, listener, text_delta, thought_delta, trajectory) = {
                     let mut guard = stream_for_flush.lock().await;
                     let Some(acc) = guard.as_mut() else {
                         continue;
                     };
                     if acc.text_buf.is_empty()
-                        && !acc.pending_replace
                         && acc.thought_buf.is_empty()
                         && acc.trajectory_buf.is_empty()
                     {
@@ -177,7 +176,6 @@ impl AcpClient {
                         acc.turn_id.clone(),
                         Arc::clone(&acc.listener),
                         std::mem::take(&mut acc.text_buf),
-                        std::mem::replace(&mut acc.pending_replace, false),
                         std::mem::take(&mut acc.thought_buf),
                         std::mem::take(&mut acc.trajectory_buf),
                     )
@@ -185,8 +183,8 @@ impl AcpClient {
                 if !thought_delta.is_empty() {
                     listener.on_thought_delta(&turn_id, thought_delta).await;
                 }
-                if !text_delta.is_empty() || replace {
-                    listener.on_text_delta(&turn_id, text_delta, replace).await;
+                if !text_delta.is_empty() {
+                    listener.on_text_delta(&turn_id, text_delta, false).await;
                 }
                 for (kind, payload) in trajectory {
                     listener.on_trajectory_event(&turn_id, kind, payload).await;
@@ -313,10 +311,14 @@ impl AcpClient {
         let response = self
             .request("session/load", serde_json::to_value(params)?)
             .await?;
-        if let Some(options) = response.get("configOptions").and_then(Value::as_array) {
-            *self.config_options.write().await = parse_config_options(options);
-        }
-        *self.session_defaults.write().await = self.config_options.read().await.clone();
+        let mut options = response
+            .get("configOptions")
+            .and_then(Value::as_array)
+            .map(|options| parse_config_options(options))
+            .unwrap_or_default();
+        add_legacy_modes(&mut options, response.get("modes"));
+        *self.session_defaults.write().await = options.clone();
+        *self.config_options.write().await = options;
         *self.acp_session_id.write().await = Some(acp_session_id.to_string());
         Ok(())
     }
@@ -342,6 +344,66 @@ impl AcpClient {
             .await?;
         if let Some(raw_opts) = res.get("configOptions").and_then(|v| v.as_array()) {
             *self.config_options.write().await = parse_config_options(raw_opts);
+        }
+        Ok(())
+    }
+
+    pub(crate) async fn apply_approval_mode(
+        &self,
+        provider: &str,
+        policy: PermissionPolicy,
+    ) -> Result<(), AcpError> {
+        let candidates = crate::approval::acp_mode_candidates(provider, policy);
+        let Some(first) = candidates.first() else {
+            return Ok(());
+        };
+        let options = self.config_options.read().await.clone();
+        let mode = find_option_by_category_or_id(&options, &["mode"], &["mode", "permissionMode"]);
+        let value = if let Some(option) = mode.filter(|option| !option.choices.is_empty()) {
+            candidates
+                .iter()
+                .copied()
+                .find(|candidate| {
+                    option
+                        .choices
+                        .iter()
+                        .any(|choice| choice.value == *candidate)
+                })
+                .ok_or_else(|| {
+                    AcpError::PermissionDenied(format!(
+                        "This harness does not offer the requested approval mode ({})",
+                        policy.as_str()
+                    ))
+                })?
+        } else {
+            first
+        };
+        if mode.and_then(|option| option.current_value.as_deref()) == Some(value) {
+            return Ok(());
+        }
+        let option_id = mode.map_or("mode", |option| option.id.as_str());
+        match self.set_config_option(option_id, value).await {
+            Err(AcpError::Rpc {
+                code: -32601 | -32602,
+                ..
+            }) => {
+                let sid = self.acp_session_id.read().await.clone();
+                self.request(
+                    "session/set_mode",
+                    json!({ "sessionId": sid, "modeId": value }),
+                )
+                .await?;
+                if let Some(updated) = self
+                    .config_options
+                    .write()
+                    .await
+                    .iter_mut()
+                    .find(|option| option.id == option_id)
+                {
+                    updated.current_value = Some(value.into());
+                }
+            }
+            result => result?,
         }
         Ok(())
     }
@@ -408,6 +470,28 @@ impl AcpClient {
         prompt_text: &str,
         listener: Arc<dyn TurnStreamListener>,
     ) -> Result<(PromptResult, PromptTextOutput), AcpError> {
+        self.prompt_with_images(turn_id, prompt_text, &[], listener)
+            .await
+    }
+
+    pub async fn prompt_with_images(
+        &self,
+        turn_id: &str,
+        prompt_text: &str,
+        images: &[ChatImage],
+        listener: Arc<dyn TurnStreamListener>,
+    ) -> Result<(PromptResult, PromptTextOutput), AcpError> {
+        if !images.is_empty()
+            && self
+                .agent_capabilities
+                .read()
+                .await
+                .agent_capabilities
+                .prompt_capabilities["image"]
+                != true
+        {
+            return Err(AcpError::ImageInputUnsupported);
+        }
         let sid = self
             .acp_session_id
             .read()
@@ -425,20 +509,23 @@ impl AcpClient {
                 turn_id: turn_id.to_string(),
                 listener: Arc::clone(&listener),
                 text_buf: String::new(),
-                pending_replace: false,
                 after_step_boundary: false,
                 thought_buf: String::new(),
                 trajectory_buf: Vec::new(),
                 current_segment: String::new(),
-                prior_segments: Vec::new(),
             });
         }
 
+        let mut prompt = vec![ContentBlock::Text {
+            text: prompt_text.to_string(),
+        }];
+        prompt.extend(images.iter().map(|image| ContentBlock::Image {
+            mime_type: image.mime_type.clone(),
+            data: image.encode(),
+        }));
         let params = PromptParams {
             session_id: sid,
-            prompt: vec![ContentBlock::Text {
-                text: prompt_text.to_string(),
-            }],
+            prompt,
         };
 
         let rpc_res = self
@@ -447,23 +534,20 @@ impl AcpClient {
 
         // Flush any remaining buffered deltas before returning
         let _flush = self.stream_flush.lock().await;
-        let (final_text_tail, replace_tail, final_thought_tail, output, trajectory) = {
+        let (final_text_tail, final_thought_tail, output, trajectory) = {
             let mut guard = self.active_stream.lock().await;
             if let Some(mut acc) = guard.take() {
                 (
                     std::mem::take(&mut acc.text_buf),
-                    std::mem::replace(&mut acc.pending_replace, false),
                     std::mem::take(&mut acc.thought_buf),
                     PromptTextOutput {
                         final_text: acc.current_segment.trim().to_string(),
-                        intermediate_notes: acc.prior_segments,
                     },
                     acc.trajectory_buf,
                 )
             } else {
                 (
                     String::new(),
-                    false,
                     String::new(),
                     PromptTextOutput::default(),
                     Vec::new(),
@@ -473,9 +557,9 @@ impl AcpClient {
         if !final_thought_tail.is_empty() {
             listener.on_thought_delta(turn_id, final_thought_tail).await;
         }
-        if !final_text_tail.is_empty() || replace_tail {
+        if !final_text_tail.is_empty() {
             listener
-                .on_text_delta(turn_id, final_text_tail, replace_tail)
+                .on_text_delta(turn_id, final_text_tail, false)
                 .await;
         }
         for (kind, payload) in trajectory {
@@ -694,26 +778,42 @@ impl AcpClient {
         match kind {
             "agent_message_chunk" | "message" => {
                 let txt = extract_update_text(update.get("content"));
-                if !txt.is_empty() {
+                if txt.is_empty() {
+                    return;
+                }
+                {
                     let mut guard = self.active_stream.lock().await;
-                    if let Some(acc) = guard.as_mut() {
-                        if acc.after_step_boundary {
-                            let prev = std::mem::take(&mut acc.current_segment).trim().to_string();
-                            if !prev.is_empty() {
-                                acc.prior_segments.push(prev.clone());
-                                acc.trajectory_buf.push((
-                                    TrajectoryEventKind::Thought,
-                                    json!({ "kind": "narration", "text": prev }),
-                                ));
-                            }
-                            acc.text_buf.clear();
-                            acc.pending_replace = true;
-                            acc.after_step_boundary = false;
-                        }
+                    let Some(acc) = guard.as_mut() else { return };
+                    if !acc.after_step_boundary && !acc.current_segment.is_empty() {
                         acc.text_buf.push_str(&txt);
                         acc.current_segment.push_str(&txt);
+                        return;
                     }
                 }
+                if txt.trim().is_empty() {
+                    return;
+                }
+                // Allocate each segment on its first visible text, before a later tool
+                // or peer message can be inserted. Batch subsequent deltas as usual.
+                let _flush = self.stream_flush.lock().await;
+                let (turn_id, listener, previous, first_text) = {
+                    let mut guard = self.active_stream.lock().await;
+                    let Some(acc) = guard.as_mut() else {
+                        return;
+                    };
+                    acc.after_step_boundary = false;
+                    acc.current_segment.clone_from(&txt);
+                    (
+                        acc.turn_id.clone(),
+                        Arc::clone(&acc.listener),
+                        std::mem::take(&mut acc.text_buf),
+                        txt,
+                    )
+                };
+                if !previous.is_empty() {
+                    listener.on_text_delta(&turn_id, previous, false).await;
+                }
+                listener.on_text_delta(&turn_id, first_text, true).await;
             }
             "agent_thought_chunk" | "thought" => {
                 let txt = extract_update_text(update.get("content"));
@@ -763,6 +863,16 @@ impl AcpClient {
                     if let Some(l) = listener {
                         l.on_config_options_updated(parsed).await;
                     }
+                }
+            }
+            "current_mode_update" => {
+                if let Some(current) = update.get("currentModeId").and_then(Value::as_str)
+                    && let Some(option) =
+                        self.config_options.write().await.iter_mut().find(|option| {
+                            option.id == "mode" || option.category.as_deref() == Some("mode")
+                        })
+                {
+                    option.current_value = Some(current.into());
                 }
             }
             "usage_update" => {

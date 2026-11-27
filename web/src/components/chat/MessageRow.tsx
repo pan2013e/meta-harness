@@ -5,10 +5,11 @@ import {
   ChevronRight,
   Crown,
   GitCommitHorizontal,
+  Send,
   ShieldAlert,
   Sparkles,
 } from "lucide-react";
-import { api } from "../../api/client";
+import { api, messageImageUrl } from "../../api/client";
 import { selectionRangeWithin } from "../../desktop";
 import { useAppStore } from "../../store/useAppStore";
 import type { ChatMessage, DispatchTaskSpec, PendingPermissionView } from "../../types/api";
@@ -20,9 +21,10 @@ interface Props {
   message: ChatMessage;
   consultReplies: ChatMessage[];
   onQuote?: (sessionId: string, text: string) => void;
+  legacySkills?: string[];
 }
 
-export const MessageRow = memo(function MessageRow({ message, consultReplies, onQuote }: Props) {
+export const MessageRow = memo(function MessageRow({ message, consultReplies, onQuote, legacySkills }: Props) {
   const accent = useAppStore((state) => {
     const member = state.members.find((m) => m.handle === message.sender_id);
     return (member && state.adapters[member.adapter_id]?.accent_color) || "#6366f1";
@@ -41,8 +43,12 @@ export const MessageRow = memo(function MessageRow({ message, consultReplies, on
     }).catch(() => useAppStore.getState().setError("Could not open the message menu."));
   };
   const streaming = message.metadata.streaming === true;
+  const turnRunning = useAppStore((state) => {
+    const member = state.memberStatuses[message.sender_id];
+    return streaming || (message.turn_id !== null && member?.turnId === message.turn_id);
+  });
   const waitingForApproval = useAppStore((state) =>
-    streaming && state.pendingPermissions.some((prompt) =>
+    turnRunning && state.pendingPermissions.some((prompt) =>
       prompt.session_id === message.session_id &&
       prompt.member_handle === message.sender_id &&
       (prompt.turn_id === null || prompt.turn_id === message.turn_id)
@@ -50,15 +56,11 @@ export const MessageRow = memo(function MessageRow({ message, consultReplies, on
   );
 
   if (message.kind === "activity_pill") {
-    const isSkill = typeof message.metadata.skill_id === "string";
+    if (typeof message.metadata.skill_id === "string") return null;
     return (
       <div className="px-6 py-1 flex items-center justify-center">
         <div className="inline-flex items-center gap-1.5 px-3 py-1 rounded-full bg-elevated border border-line text-[11px] text-ink-muted">
-          {isSkill ? (
-            <Sparkles className="w-3 h-3 text-sky-400 shrink-0" />
-          ) : (
-            <Activity className="w-3 h-3 text-brand-ink shrink-0" />
-          )}
+          <Activity className="w-3 h-3 text-brand-ink shrink-0" />
           <span>{message.content}</span>
         </div>
       </div>
@@ -200,6 +202,7 @@ export const MessageRow = memo(function MessageRow({ message, consultReplies, on
   });
 
   if (isUser) {
+    const images = Array.isArray(message.metadata.images) ? message.metadata.images : [];
     return (
       <article
         aria-label="Your message"
@@ -211,7 +214,15 @@ export const MessageRow = memo(function MessageRow({ message, consultReplies, on
             <span className="font-medium text-ink-soft">You</span>
           </div>
           <div onContextMenu={handleTextMenu} className="rounded-2xl rounded-tr-md border border-brand/25 bg-brand-soft px-4 py-2.5">
-            <MarkdownBlock content={message.content} sessionId={message.session_id} />
+            {message.content.trim() && <MarkdownBlock content={message.content} sessionId={message.session_id} />}
+            {images.length > 0 && (
+              <div className="flex flex-wrap gap-2 py-1">
+                {images.map((_, index) => (
+                  <img key={index} loading="lazy" src={messageImageUrl(message.session_id, message.id, index)}
+                    alt={`Attached image ${index + 1}`} className="max-h-72 max-w-full rounded-lg border border-brand/20 object-contain" />
+                ))}
+              </div>
+            )}
           </div>
         </div>
       </article>
@@ -241,6 +252,12 @@ export const MessageRow = memo(function MessageRow({ message, consultReplies, on
                   {effort ? ` · ${effort}` : ""}
                 </span>
               )}
+              {message.recipients.length > 0 && message.metadata.via === "mcp_chat_send_message" && (
+                <span className="inline-flex items-center gap-1.5 text-xs text-brand-ink">
+                  <Send aria-hidden="true" className="h-3 w-3" />
+                  To {message.recipients.map((handle) => `@${handle}`).join(", ")}
+                </span>
+              )}
             </div>
             <span className="shrink-0 text-[11px] text-ink-muted ml-auto">{time}</span>
           </div>
@@ -249,9 +266,11 @@ export const MessageRow = memo(function MessageRow({ message, consultReplies, on
             <TurnActivityTimeline
               turnId={message.turn_id}
               sessionId={message.session_id}
-              streaming={streaming}
+              streaming={turnRunning}
               waitingForApproval={waitingForApproval}
               intermediateNotes={intermediateNotes}
+              legacySkills={legacySkills}
+              compact={message.metadata.continuation === true}
               actor={message.sender_kind === "orchestrator" ? "Orchestrator" : `@${message.sender_id}`}
             />
           )}
@@ -282,19 +301,22 @@ function PermissionInlineCard({
     state.pendingPermissions.some((p) => p.request_id === prompt.request_id)
   );
   const setError = useAppStore((state) => state.setError);
+  const resolvePermission = useAppStore((state) => state.resolvePermission);
+  const [resolving, setResolving] = useState(false);
   const allow = prompt.options.find((option) => option.kind === "allow_once");
   const deny = prompt.options.find((option) => option.kind === "reject_once");
   const patternOption =
     allow ?? prompt.options.find((option) => option.kind === "allow_always");
   const resolve = (optionId: string, pattern?: string) => {
-    void api
-      .resolvePermission(sessionId, prompt.request_id, optionId, pattern)
-      .catch((error: unknown) =>
-        setError(error instanceof Error ? error.message : String(error))
-      );
+    setResolving(true);
+    void resolvePermission(sessionId, prompt.request_id, optionId, pattern)
+      .catch((error: unknown) => {
+        setResolving(false);
+        setError(error instanceof Error ? error.message : String(error));
+      });
   };
 
-  if (!prompt?.request_id) return null;
+  if (!prompt?.request_id || !isPending) return null;
 
   return (
     <div className="px-5 py-1.5">
@@ -314,8 +336,7 @@ function PermissionInlineCard({
             {prompt.detail}
           </pre>
         )}
-        {isPending ? (
-          <div className="flex flex-wrap gap-2 pt-1">
+          <fieldset disabled={resolving} className="flex flex-wrap gap-2 pt-1">
             {allow && (
               <button
                 type="button"
@@ -345,10 +366,7 @@ function PermissionInlineCard({
                 Deny (Alt+R)
               </button>
             )}
-          </div>
-        ) : (
-          <div className="text-[11px] text-ink-muted">Permission resolved.</div>
-        )}
+          </fieldset>
       </div>
     </div>
   );

@@ -35,7 +35,7 @@ Any code change to Meta-Harness **must preserve every invariant** defined in `AG
 - **Canonical Path Containment:** Always resolve filesystem targets via `expand_user_path`, `dunce::canonicalize` / `normalize_for_create`, and `is_path_within` (preventing `..` traversal, symlink escape, and Windows verbatim `\\?\` prefixes that break Git and Node).
 - **Read-Only Skills Sandbox:**
   - `skill_read_roots` (`<MH_DATA_DIR>/skills`, `<worktree>/.agents/skills`, `<project_root>/.agents/skills`) permit **reads only** (`fs/read_text_file`, `kind == "read"` permission fast-path, `skill_list` / `skill_read` MCP tools) without user prompts.
-  - **Never** grant unprompted **writes** outside `member_worktree`! `handle_write_text_file` and edit permissions outside `member_worktree` remain gated.
+  - Require approval and Approve for me gate brokered writes outside `member_worktree`. Full access is an explicit session setting. Registered switch tools receive one-time approval regardless of mode while their role and routing checks still apply.
 - **Preview Security Boundary:** `/preview/{session_id}/{grant}/{*path}` validates a 30-minute signed grant scoped to the session and opened HTML site. Canonical paths must remain inside the workspace. Shared previews allow the site and static assets, and enforce a 24 MiB limit and sandbox CSP.
 
 ---

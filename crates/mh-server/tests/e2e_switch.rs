@@ -12,6 +12,96 @@ use mh_server::{AppState, build_bridge_router, build_router};
 use mh_store::Store;
 use mh_switch::{SwitchEngine, SwitchError, TurnPurpose, execute_mcp_tool};
 
+#[tokio::test]
+async fn image_only_message_is_stored_and_delivered_as_an_acp_image() {
+    let (base, switch, server, _tmp, _paths) = start_test_server_with_paths().await;
+    let http = reqwest::Client::new();
+    let created: Value = http
+        .post(format!("{base}/api/sessions"))
+        .json(&json!({ "title": "Image fixture", "orchestrator_member": "codex" }))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let session = created["session"]["id"].as_str().unwrap();
+    let messages = format!("{base}/api/sessions/{session}/messages");
+    let pixels = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+aYioAAAAASUVORK5CYII=";
+    let invalid = http
+        .post(&messages)
+        .json(&json!({"content":"", "images":[{"mime_type":"image/jpeg", "data":pixels}]}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(invalid.status(), reqwest::StatusCode::BAD_REQUEST);
+    let response: Value = http
+        .post(&messages)
+        .json(&json!({"content":"", "images":[{"mime_type":"image/png", "data":pixels}]}))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let id = response["message"]["id"].as_str().unwrap();
+    assert_eq!(
+        response["message"]["metadata"]["images"],
+        json!(["image/png"])
+    );
+    assert!(!response.to_string().contains(pixels));
+    let image = http
+        .get(format!("{messages}/{id}/images/0"))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap();
+    assert_eq!(image.headers()[reqwest::header::CONTENT_TYPE], "image/png");
+    assert!(
+        image
+            .bytes()
+            .await
+            .unwrap()
+            .starts_with(b"\x89PNG\r\n\x1a\n")
+    );
+    assert_eq!(
+        http.get(format!(
+            "{base}/api/sessions/unrelated/messages/{id}/images/0"
+        ))
+        .send()
+        .await
+        .unwrap()
+        .status(),
+        reqwest::StatusCode::NOT_FOUND
+    );
+    tokio::time::timeout(Duration::from_secs(15), async {
+        loop {
+            if switch
+                .store
+                .list_messages(session, None, 20)
+                .unwrap()
+                .iter()
+                .any(|message| {
+                    message.content == "Received image (image/png)"
+                        && message.metadata["turn_complete"] == true
+                })
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(30)).await;
+        }
+    })
+    .await
+    .unwrap();
+    switch.supervisor.shutdown_all().await;
+    server.abort();
+}
+
 fn mock_app_config() -> AppConfig {
     let exe = env!("CARGO_BIN_EXE_mh-test-fixture").to_string();
     let mut cfg = AppConfig::default();
@@ -1455,15 +1545,20 @@ async fn orchestrator_reports_during_work_and_queues_feedback_with_separate_pers
     };
 
     let kickoff = post(&format!(
-        "@codex [MOCK:SLEEP ms=\"60000\" until=\"{}\"] [MOCK:REPLY text=\"Original complete: blue cache\"]",
+        "@codex [MOCK:PROGRESS text=\"Starting work on the cache\"] [MOCK:SLEEP ms=\"60000\" until=\"{}\"] [MOCK:REPLY text=\"Original complete: blue cache\"]",
         release.to_string_lossy().replace('\\', "/")
     )).await;
     let running_turn = tokio::time::timeout(Duration::from_secs(15), async {
         loop {
-            if let Some((mh_core::MemberStatus::Thinking, Some(turn_id))) =
-                switch.get_member_statuses(sid).await.get("codex")
+            if let Some(turn_id) = switch
+                .store
+                .list_messages(sid, None, 50)
+                .unwrap()
+                .into_iter()
+                .find(|message| message.content == "Starting work on the cache")
+                .and_then(|message| message.turn_id)
             {
-                break turn_id.clone();
+                break turn_id;
             }
             tokio::time::sleep(Duration::from_millis(30)).await;
         }
@@ -1559,11 +1654,15 @@ async fn orchestrator_reports_during_work_and_queues_feedback_with_separate_pers
             "user",
             "antigravity",
             "antigravity",
+            "codex",
             "codex"
         ]
     );
-    assert_eq!(messages[1].content, "Original complete: blue cache");
+    assert_eq!(messages[1].content, "Starting work on the cache");
     assert_eq!(messages[1].chain_id, kickoff.chain_id);
+    assert_eq!(messages[7].content, "Original complete: blue cache");
+    assert_eq!(messages[7].turn_id, messages[1].turn_id);
+    assert!(messages[7].created_at >= messages[6].created_at);
     let after_release = switch
         .store
         .list_trajectories(sid, Some("codex"), 10)
@@ -1584,48 +1683,19 @@ async fn orchestrator_reports_during_work_and_queues_feedback_with_separate_pers
         post("@agy-monitor [MOCK:MCP tool=\"chat_list_peers\" permission=\"required\" args={}]")
             .await;
     assert_eq!(second_persona.recipients, ["agy-monitor"]);
-    let permission = tokio::time::timeout(Duration::from_secs(15), async {
-        loop {
-            if let Some(card) = switch
-                .store
-                .list_messages(sid, None, 50)
-                .unwrap()
-                .into_iter()
-                .find(|message| {
-                    message.chain_id == second_persona.chain_id
-                        && message.kind == MessageKind::PermissionCard
-                })
-            {
-                break card;
-            }
-            tokio::time::sleep(Duration::from_millis(30)).await;
-        }
-    })
-    .await
-    .expect("the executor persona should still request approval");
-    assert_eq!(permission.sender_id, "agy-monitor");
-    let request = permission.metadata["request_id"].as_str().unwrap();
-    http.post(format!(
-        "{base_url}/api/sessions/{sid}/permissions/{request}"
-    ))
-    .json(&json!({ "option_id": "once" }))
-    .send()
-    .await
-    .unwrap()
-    .error_for_status()
-    .unwrap();
     tokio::time::timeout(Duration::from_secs(15), async {
         loop {
-            if switch
-                .store
-                .list_messages(sid, None, 50)
-                .unwrap()
-                .iter()
-                .any(|message| {
-                    message.sender_id == "agy-monitor"
-                        && message.content.starts_with("MCP chat_list_peers ok")
-                })
-            {
+            let messages = switch.store.list_messages(sid, None, 50).unwrap();
+            assert!(
+                !messages
+                    .iter()
+                    .any(|message| message.chain_id == second_persona.chain_id
+                        && message.kind == MessageKind::PermissionCard)
+            );
+            if messages.iter().any(|message| {
+                message.sender_id == "agy-monitor"
+                    && message.content.starts_with("MCP chat_list_peers ok")
+            }) {
                 break;
             }
             tokio::time::sleep(Duration::from_millis(30)).await;
@@ -1825,7 +1895,7 @@ async fn e2e_skills_builtin_install_mcp_access_and_slash_preload() {
             .any(|s| s["id"] == "repo-conventions" && s["source"] == "project")
     );
 
-    // 3. Create session; verify executor (`@codex`) auto-approves `skill_read` and emits ActivityPill
+    // A non-orchestrator can use registered switch MCP tools and records skill use on its turn.
     let sess_resp: Value = http
         .post(format!("{base_url}/api/projects/{project_id}/sessions"))
         .json(&json!({
@@ -1871,10 +1941,27 @@ async fn e2e_skills_builtin_install_mcp_access_and_slash_preload() {
     })
     .await
     .unwrap();
+    let turn_id = msgs
+        .iter()
+        .find(|m| m.sender_id == "codex" && m.content.contains("MCP skill_read ok"))
+        .and_then(|message| message.turn_id.as_deref())
+        .unwrap();
     assert!(
-        msgs.iter().any(|m| m.kind == MessageKind::ActivityPill
-            && m.metadata["skill_id"] == "meta-harness-docs"),
-        "expected ActivityPill when @codex read meta-harness-docs via MCP"
+        switch
+            .store
+            .list_trajectory_events(turn_id)
+            .unwrap()
+            .iter()
+            .any(|event| {
+                event.event_kind == mh_core::TrajectoryEventKind::Skill
+                    && event.payload["skill_id"] == "meta-harness-docs"
+            })
+    );
+    assert!(
+        !msgs
+            .iter()
+            .any(|message| message.kind == MessageKind::ActivityPill
+                && message.metadata["skill_id"].is_string())
     );
     assert!(
         msgs.iter()
@@ -1882,7 +1969,7 @@ async fn e2e_skills_builtin_install_mcp_access_and_slash_preload() {
         "expected skill_read result to include architecture-and-crates content"
     );
 
-    // 4. Verify `/meta-harness-docs @claude ...` routes to @claude and preloads skill pill
+    // The slash command routes to @claude and records the skill on that turn as well.
     http.post(format!("{base_url}/api/sessions/{sid}/messages"))
         .json(&json!({
             "content": "/meta-harness-docs @claude [MOCK:REPLY text=\"Skill preloaded ok\"]"
@@ -1895,15 +1982,44 @@ async fn e2e_skills_builtin_install_mcp_access_and_slash_preload() {
     tokio::time::timeout(Duration::from_secs(15), async {
         loop {
             let list = switch.store.list_messages(&sid, None, 50).unwrap();
-            if list
+            if let Some(turn_id) = list
                 .iter()
-                .any(|m| m.sender_id == "claude" && m.content == "Skill preloaded ok")
-                && list.iter().any(|m| {
-                    m.kind == MessageKind::ActivityPill
-                        && m.sender_id == "claude"
-                        && m.metadata["skill_id"] == "meta-harness-docs"
-                })
+                .find(|m| m.sender_id == "claude" && m.content == "Skill preloaded ok")
+                .and_then(|message| message.turn_id.as_deref())
             {
+                assert!(
+                    switch
+                        .store
+                        .list_trajectory_events(turn_id)
+                        .unwrap()
+                        .iter()
+                        .any(|event| {
+                            event.event_kind == mh_core::TrajectoryEventKind::Skill
+                                && event.payload["skill_id"] == "meta-harness-docs"
+                        })
+                );
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(30)).await;
+        }
+    })
+    .await
+    .unwrap();
+
+    http.post(format!("{base_url}/api/sessions/{sid}/messages"))
+        .json(&json!({"content": "@codex [MOCK:MCP tool=\"chat_list_peers\" permission=\"required\" args={}]"}))
+        .send().await.unwrap().error_for_status().unwrap();
+    tokio::time::timeout(Duration::from_secs(15), async {
+        loop {
+            let messages = switch.store.list_messages(&sid, None, 50).unwrap();
+            assert!(
+                !messages
+                    .iter()
+                    .any(|message| message.kind == MessageKind::PermissionCard)
+            );
+            if messages.iter().any(|message| {
+                message.sender_id == "codex" && message.content.contains("MCP chat_list_peers ok")
+            }) {
                 break;
             }
             tokio::time::sleep(Duration::from_millis(30)).await;

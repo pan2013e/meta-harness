@@ -125,13 +125,13 @@ The ACP broker resolves file paths against the member worktree and checks canoni
 
 | UI label | Wire value | Broker behavior |
 | :--- | :--- | :--- |
-| Worktree | `worktree_smart` | Allows writes inside the member worktree and prompts for shell commands unless an in-worktree session rule allows them. |
-| Strict | `strict` | Prompts for file writes and applies the shell approval and session rule checks. |
-| Auto | `autonomous_sandbox` | Allows in-worktree writes and in-worktree commands that pass the broker's command checks. Risky commands and external working directories prompt. |
+| Require approval | `require_approval` | Default. Allows workspace writes and prompts for external access and unapproved shell commands. |
+| Approve for me | `approve_for_me` | Uses native automatic review when offered by the harness. The broker also allows simple local commands and prompts when an operation needs manual approval. |
+| Full access | `full_access` | Uses the harness's full-access mode and permits brokered filesystem and shell operations without prompts. |
 
-Permission cards use the adapter's ACP options. A saved command pattern is scoped to the session. Harness CLIs may also enforce their own approval and sandbox settings.
+Native approval settings are applied per persona before the next turn starts. Codex uses `workspace-write`, `agent`, and `agent-full-access`. Claude Code uses `acceptEdits`, `auto` when available, and `bypassPermissions`. Antigravity CLI uses its sandbox for the first two choices and skips permission prompts in Full access. The Gemini CLI fallback uses `default`, `auto_edit`, and `yolo`. Provider or administrator policy can impose additional controls. The older values `worktree_smart` and `strict` map to Require approval, and `autonomous_sandbox` maps to Approve for me.
 
-During an orchestrator turn, the broker selects the one-time ACP approval option for registered tools from the embedded Meta-Harness switch. Dispatch confirmation and the switch's routing and authorization checks still apply.
+Permission cards use the adapter's ACP options and disappear when resolved. A saved command pattern is scoped to the session. The broker selects one-time ACP approval for registered embedded-switch tools for every active session persona in every mode. Dispatch confirmation and the switch's routing and authorization checks still apply.
 
 ---
 
@@ -157,7 +157,7 @@ The canonical tool schemas are declared in [mh-switch's MCP implementation](../c
 | :--- | :--- | :--- |
 | `chat_list_peers` | All | Lists session members, adapter brands, roles, live states (`idle`/`working`/`consulting`), active models, and worktree branches. |
 | `chat_read_messages` | All | Paginated read of group chat messages (`limit`, `before_seq`). |
-| `chat_send_message` | All | Posts a visible message/handoff to Group Chat and triggers `@to` recipients asynchronously (consumes 1 hop). |
+| `chat_send_message` | All | Posts a visible message labeled with its peer recipients and triggers their turns asynchronously (consumes 1 hop). |
 | `peer_consult` | All | Synchronous mid-turn question to a peer with DAG deadlock prevention; renders as a compact collapsible thread in Group Chat (consumes 1 hop). |
 | `trajectory_list` | All | Lists recent turns (`turn_id`, `member`, `summary`, `touched_files`, `git_diff_stat`, `status`). |
 | `trajectory_read` | All | Reads a peer's trajectory (`summary` \| `tool_calls` \| `diffs` \| `full`, max 16 KB/page); emits a subtle inline pill in Group Chat (`@claude read @codex's trajectory`). |
@@ -165,7 +165,7 @@ The canonical tool schemas are declared in [mh-switch's MCP implementation](../c
 | `memory_record_fact` | All | Records or updates a high-level architectural/ownership/performance note (`project_facts`). |
 | `quota_get_status` | All / Orch | Returns adapter-level subscription quota headroom snapshots. |
 | `skill_list` | All | Lists enabled global (`<MH_DATA_DIR>/skills/`) and repo-local (`.agents/skills/`) skills available to the session. |
-| `skill_read` | All | Reads a skill's `SKILL.md` or supporting file with zero approval prompts and emits an inline activity pill. |
+| `skill_read` | All | Reads a skill's `SKILL.md` or supporting file and records it in the current turn's activity. |
 | `models_list_catalog` | Orchestrator | Returns live ACP `configOptions` (`models`, `efforts`) + adapter capability metadata. |
 | `orchestrator_dispatch` | Orchestrator | Configures target executor member(s) (`model`, `reasoning_effort`) and dispatches 1 or more parallel/sequential worktree tasks with a visible Dispatch Card. |
 | `memory_curate_job` | Orchestrator | Saves the curated post-job `EpisodicJob` summary + optional `project_facts` updates after a turn/wave completes. |
@@ -238,6 +238,7 @@ The [Axum router](../crates/mh-server/src/lib.rs) lists the full routes. [Shared
 | Harnesses and quotas | Adapter listing and probing use `GET /api/adapters` and `GET /api/adapters/probe`. Version, profile, operation, defaults, and quota endpoints are grouped under `/api/adapters/{id}`. `GET /api/quotas` reads snapshots and `POST /api/quotas/refresh` refreshes them. |
 | Settings and storage | `GET/POST /api/settings` exports or merges versioned preferences. The web client includes the theme in its export. Storage usage and cleanup use `GET /api/storage` and `POST /api/storage/cleanup`. |
 | Chat and approvals | `GET/POST /api/sessions/{id}/messages` reads or sends chat. The composer can send `recipient_overrides` keyed by handle. `POST /api/sessions/{id}/cancel` stops activity. `POST /api/sessions/{id}/permissions/{req_id}` resolves a request with `option_id` and optional `allow_pattern`. |
+| Chat images | `POST /api/sessions/{id}/messages` accepts up to four `images` containing `mime_type` and base64 `data`. Each image is limited to 5 MiB. `GET /api/sessions/{id}/messages/{message_id}/images/{image_index}` reads the binary image. The message stores image metadata, and the server passes the bytes to harnesses that advertise ACP image support in that message's routing chain. |
 | Git and shells | `GET /api/sessions/{id}/diff` returns the integration diff. `POST /api/sessions/{id}/promote` accepts `merge`, `squash`, or `patch`. The embedded terminal uses the `/api/sessions/{id}/pty` WebSocket. The `run-command` and `open-terminal` POST routes provide command execution and the OS terminal. |
 | Files and previews | `GET/HEAD /api/sessions/{id}/files/{*path}` reads workspace files. For HTML, an authenticated `?preview=true` request issues an `x-meta-harness-preview` grant. The sandboxed iframe loads from `/preview/{session_id}/{grant}/{*path}` to preserve relative assets. Grants cover read-only files for one session, expire after 30 minutes, and still enforce canonical path containment. Preview requests have a 24 MiB size limit. |
 | Trajectories and memory | `GET /api/trajectories?session_id=...` and `GET /api/trajectories/{turn_id}` list turns and read details. Project memory is under `/api/projects/{id}/memory`. |
@@ -251,8 +252,8 @@ HTML preview documents can load local styles, scripts, and other relative assets
 
 - The left sidebar lists projects, Quick Sessions, active sessions, and archived sessions. `Ctrl+B` collapses it. Session deletion uses an in-app confirmation dialog. Archive, restore, and deletion (including archived-session cleanup) act on linked conversations in their original profiles through Codex App Server and compatible Claude Code ACP versions. Claude adapters that advertise the AIR archive extension use its archived-title convention. Harnesses without supported lifecycle operations keep their own histories and the UI reports this.
 - The session header shows the orchestrator and opens diff review, shell, promotion, and project memory when applicable. Hiding the shell preserves its PTY. File links open in-page previews for HTML, images, PDFs, and source code. Source previews use read-only Monaco.
-- Chat renders Markdown, right-aligned user messages, dispatch and approval cards, consult threads, and inline turn activity. Trajectory tool updates and terminal chunks group under the corresponding tool call. The timeline summarizes Meta-Harness switch calls in plain language. Native harness subagents can appear in the parent turn's tool activity. Separate ACP child-session updates do not contribute to the parent transcript or context totals.
-- The composer offers mention and slash-command autocomplete, a per-recipient model and reasoning-effort menu, context and subscription meters, and Worktree, Strict, and Auto approval modes. Context shows the harness-reported total and window when available or an estimated Meta-Harness breakdown. `/memory` opens Project Memory, with an empty state for Quick Sessions.
+- Chat renders CommonMark and GitHub Flavored Markdown with workspace preview links, right-aligned user messages, dispatch cards, pending approvals, and consult threads. Agent text segments take their place in chat when their first text arrives. Each segment links to the same turn trajectory. The timeline groups tool calls, terminal output, and skill use, and summarizes switch calls in plain language. Native harness subagents can appear in the parent turn's tool activity. Separate ACP child-session updates do not contribute to the parent transcript or context totals.
+- The composer offers mention and slash-command autocomplete, a per-recipient model and reasoning-effort menu, context and subscription meters, and the session's approval modes. Context shows the harness-reported total and window when available or an estimated Meta-Harness breakdown. `/memory` opens Project Memory, with an empty state for Quick Sessions.
 - Startup shows connection and harness checks first. Model, quota, and workspace lookups can finish with progress indicators while the main UI is available.
 - Settings contains Appearance, Harnesses & Models, Skills, Global Personas, Session, Storage & Data, and About. The browser persists theme selection in local storage. **Skills** manages the preinstalled `meta-harness-docs` skill as well as local folder, Git URL, custom inline, and repo-local (`.agents/skills/`) skills.
 

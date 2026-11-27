@@ -21,7 +21,7 @@ import { TrajectoryRow } from "./components/drawer/TrajectoryRow";
 import { terminalDirectory } from "./components/chat/terminalPaths";
 import { api, WsHubClient } from "./api/client";
 import { useAppStore } from "./store/useAppStore";
-import type { ChatMessage, TrajectoryEvent, TurnTrajectory } from "./types/api";
+import type { ChatMessage, PendingPermissionView, TrajectoryEvent, TurnTrajectory } from "./types/api";
 
 afterEach(() => {
   cleanup();
@@ -61,6 +61,55 @@ describe("Opening project folders", () => {
     expect(refresh).not.toHaveBeenCalled();
     expect(selectProject).toHaveBeenCalledWith(project.id);
     expect(useAppStore.getState()).toMatchObject({ projects: [project], folderModalOpen: false });
+  });
+});
+
+describe("Chat approvals and image inputs", () => {
+  it("removes a permission card as soon as the server accepts the decision", async () => {
+    const prompt: PendingPermissionView = {
+      request_id: "permission", session_id: "session", member_handle: "codex", turn_id: "turn",
+      title: "Approve command", detail: "Command details", tool_kind: "terminal", suggested_pattern: null,
+      options: [{ option_id: "once", label: "Allow once", kind: "allow_once" }], created_at: 0,
+    };
+    useAppStore.setState({
+      activeSession: {
+        id: "session", project_id: null, title: "Test", base_branch: null, base_commit_sha: null,
+        integration_branch: null, integration_wt_path: null, isolation_mode: "shared_cwd", orchestrator_member: null,
+        confirm_before_dispatch: false, max_hops: 6, permission_policy: "require_approval", working_summary: "",
+        created_at: 0, updated_at: 0,
+      },
+      pendingPermissions: [prompt],
+    });
+    vi.spyOn(api, "resolvePermission").mockResolvedValue({ resolved: true });
+    const card: ChatMessage = {
+      id: "card", seq: 1, session_id: "session", chain_id: "chain", parent_msg_id: null, sender_kind: "system",
+      sender_id: "codex", recipients: [], kind: "permission_card", content: prompt.title, turn_id: "turn",
+      metadata: { ...prompt }, created_at: 0,
+    };
+    render(<MessageRow message={card} consultReplies={[]} />);
+    fireEvent.click(screen.getByRole("button", { name: /Allow Once/ }));
+    await waitFor(() => expect(screen.queryByText(/Permission Required/)).toBeNull());
+  });
+
+  it("pastes and sends an image from the composer without accompanying text", async () => {
+    vi.stubGlobal("URL", class extends URL {
+      static createObjectURL() { return "blob:clipboard-png"; }
+      static revokeObjectURL() {}
+    });
+    const sendMessage = vi.fn().mockResolvedValue(undefined);
+    useAppStore.setState({ sendMessage, probes: [{
+      adapter_id: "codex", display_name: "Codex", accent_color: "#10a37f", installed: true,
+      resolved_command: "/usr/bin/codex", auth_detected: true, auth_hint: "Ready", strengths: [],
+    }] });
+    render(<Composer />);
+    const file = new File([new Uint8Array([137, 80, 78, 71])], "clipboard.png", { type: "image/png" });
+    fireEvent.paste(screen.getByRole("textbox", { name: "Message group chat" }), { clipboardData: { files: [file] } });
+    expect(screen.getByRole("img", { name: "clipboard.png" })).toBeTruthy();
+    fireEvent.click(screen.getByRole("button", { name: "Send" }));
+    await waitFor(() => expect(sendMessage).toHaveBeenCalledWith("", {
+      images: [{ mime_type: "image/png", data: "iVBORw==" }],
+    }));
+    await waitFor(() => expect(screen.queryByRole("img", { name: "clipboard.png" })).toBeNull());
   });
 });
 
@@ -187,7 +236,7 @@ describe("Session navigation", () => {
           orchestrator_member: null,
           confirm_before_dispatch: false,
           max_hops: 6,
-          permission_policy: "worktree_smart",
+          permission_policy: "require_approval",
           working_summary: "",
           created_at: 0,
           updated_at: 0,
@@ -266,7 +315,7 @@ describe("Session navigation", () => {
         id, project_id: null, title: id, isolation_mode: "shared_cwd", base_branch: null,
         base_commit_sha: null, integration_branch: null, integration_wt_path: null,
         orchestrator_member: null, confirm_before_dispatch: false, max_hops: 6,
-        permission_policy: "worktree_smart", working_summary: "", created_at: 0, updated_at: 0,
+        permission_policy: "require_approval", working_summary: "", created_at: 0, updated_at: 0,
       },
       members: [], statuses: {}, permission_rules: [], pending_permissions: [],
     }));
@@ -300,7 +349,7 @@ describe("Session navigation", () => {
         orchestrator_member: null,
         confirm_before_dispatch: false,
         max_hops: 6,
-        permission_policy: "worktree_smart",
+        permission_policy: "require_approval",
         working_summary: "",
         created_at: 0,
         updated_at: 0,
@@ -469,6 +518,49 @@ describe("UI primitives", () => {
     expect(screen.getByText("Prompt")).toBeTruthy();
     const link = screen.getByText("Open the page").closest("a");
     expect(link?.getAttribute("href")).toBe("/api/sessions/s_1/files/index.html");
+  });
+
+  it("preserves the nested lists, headings, and mixed inline markup in Antigravity replies", () => {
+    const markdown = [
+      "#### Merged Changes (`abc..def`)",
+      "",
+      "1. **Ownership split confirmed:**",
+      "   - Keep `crates/*`.",
+      "2. **#2 `decision` contract confirmed**:",
+      "   - Update [router.rs](file:///C:/project/.meta-harness/worktrees/s_1/_integration/crates/router.rs#L42).",
+      "3. **#3 trust boundary**",
+      "",
+      "#### Agents & Verification",
+      "- **Backend (`@codex`, `abc`):**",
+      "  - Preserve the active turn.",
+    ].join("\n");
+    const { container } = render(<MarkdownBlock content={markdown} sessionId="s_1" />);
+    expect(screen.getByRole("heading", { level: 4, name: "Merged Changes (abc..def)" })).toBeTruthy();
+    expect(screen.getByRole("heading", { level: 4, name: "Agents & Verification" })).toBeTruthy();
+    expect(container.querySelectorAll("ol")).toHaveLength(1);
+    expect(container.querySelectorAll("ol > li")).toHaveLength(3);
+    expect(container.querySelectorAll("ol > li > ul > li")).toHaveLength(2);
+    expect(container.querySelector("ol > li > strong > code")?.textContent).toBe("decision");
+    expect(container.querySelector("ul > li > ul > li")?.textContent).toBe("Preserve the active turn.");
+    expect(screen.getByRole("link", { name: "router.rs" }).getAttribute("href")).toBe("/api/sessions/s_1/files/crates/router.rs");
+  });
+
+  it("renders code inside a list and displays Markdown images as links", () => {
+    const markdown = [
+      "3. Keep the code literal.",
+      "",
+      "   ```html",
+      "   <details><summary>Literal summary</summary>Example</details>",
+      "   ```",
+      "",
+      "4. ![Example preview](https://example.com/file.png)",
+    ].join("\n");
+    const { container } = render(<MarkdownBlock content={markdown} sessionId="s_1" />);
+    expect(container.querySelector("ol")?.getAttribute("start")).toBe("3");
+    expect(container.querySelector("ol > li pre code")?.textContent).toContain("<details>");
+    expect(container.querySelector("details")).toBeNull();
+    expect(screen.getByRole("link", { name: "Example preview" }).getAttribute("href")).toBe("https://example.com/file.png");
+    expect(screen.queryByRole("img")).toBeNull();
   });
 
   it("renders quota meter percentage, exhausted, n/a, and 429 cooldown states", () => {
@@ -725,7 +817,7 @@ describe("UI primitives", () => {
         orchestrator_member: "codex",
         confirm_before_dispatch: false,
         max_hops: 6,
-        permission_policy: "worktree_smart",
+        permission_policy: "require_approval",
         working_summary: "",
         created_at: 0,
         updated_at: 0,
@@ -758,7 +850,7 @@ describe("UI primitives", () => {
           orchestrator_member: "codex",
           confirm_before_dispatch: false,
           max_hops: 6,
-          permission_policy: "worktree_smart",
+          permission_policy: "require_approval",
           working_summary: "",
           created_at: 0,
           updated_at: 0,
@@ -874,7 +966,7 @@ describe("UI primitives", () => {
         orchestrator_member: "codex",
         confirm_before_dispatch: false,
         max_hops: 6,
-        permission_policy: "worktree_smart",
+        permission_policy: "require_approval",
         working_summary: "",
         archived_at: null,
         created_at: 0,
@@ -966,9 +1058,9 @@ describe("UI primitives", () => {
     const trigger = screen.getByRole("button", { name: "Model and reasoning effort" });
     const permission = screen.getByRole("button", { name: "Permission policy" });
     fireEvent.click(permission);
-    expect(screen.getByRole("button", { name: /^Worktree Allow/ }).querySelector(".lucide-git-branch")).toBeTruthy();
-    expect(screen.getByRole("button", { name: /^Strict Prompt/ }).querySelector(".lucide-lock-keyhole")).toBeTruthy();
-    expect(screen.getByRole("button", { name: /^Auto Allow/ }).querySelector(".lucide-zap")).toBeTruthy();
+    expect(screen.getByRole("button", { name: /^Require approval Ask/ }).querySelector(".lucide-lock-keyhole")).toBeTruthy();
+    expect(screen.getByRole("button", { name: /^Approve for me Use/ }).querySelector(".lucide-shield-check")).toBeTruthy();
+    expect(screen.getByRole("button", { name: /^Full access Allow/ }).querySelector(".lucide-lock-open")).toBeTruthy();
     fireEvent.click(permission);
     const editor = screen.getByRole("textbox", { name: "Message group chat" });
     const draft = (text: string) => {
@@ -1048,7 +1140,7 @@ describe("UI primitives", () => {
         orchestrator_member: "codex",
         confirm_before_dispatch: false,
         max_hops: 6,
-        permission_policy: "worktree_smart",
+        permission_policy: "require_approval",
         working_summary: "",
         archived_at: 1700000,
         created_at: 0,
@@ -1069,7 +1161,7 @@ describe("UI primitives", () => {
           orchestrator_member: "codex",
           confirm_before_dispatch: false,
           max_hops: 6,
-          permission_policy: "worktree_smart",
+          permission_policy: "require_approval",
           working_summary: "",
           archived_at: 1700000,
           created_at: 0,
@@ -1095,7 +1187,7 @@ describe("UI primitives", () => {
           orchestrator_member: "codex",
           confirm_before_dispatch: false,
           max_hops: 6,
-          permission_policy: "worktree_smart",
+          permission_policy: "require_approval",
           working_summary: "",
           archived_at: null,
           created_at: 0,
@@ -1113,7 +1205,7 @@ describe("UI primitives", () => {
           orchestrator_member: null,
           confirm_before_dispatch: false,
           max_hops: 6,
-          permission_policy: "worktree_smart",
+          permission_policy: "require_approval",
           working_summary: "",
           archived_at: 123456,
           created_at: 0,
@@ -1171,7 +1263,7 @@ describe("UI primitives", () => {
         orchestrator_member: "codex",
         confirm_before_dispatch: false,
         max_hops: 6,
-        permission_policy: "worktree_smart",
+        permission_policy: "require_approval",
         working_summary: "",
         created_at: 0,
         updated_at: 0,

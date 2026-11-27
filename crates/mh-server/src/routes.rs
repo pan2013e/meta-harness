@@ -20,8 +20,9 @@ use mh_acp::{
     sync_member_worktree,
 };
 use mh_core::{
-    DiffStat, IsolationMode, MemberRole, MemberStatus, PermissionPolicy, PromoteMode, Session,
-    StorageSummary, TurnModelSelection, WsEvent, expand_user_path, is_path_within, normalize_path,
+    ChatImage, ChatImageInput, DiffStat, IsolationMode, MemberRole, MemberStatus, PermissionPolicy,
+    PromoteMode, Session, StorageSummary, TurnModelSelection, WsEvent, expand_user_path,
+    is_path_within, normalize_path,
 };
 use mh_store::{CreateSessionParams, PatchSessionParams, UpsertMemberParams};
 use mh_switch::{SwitchError, execute_mcp_tool, list_switch_tools};
@@ -1351,7 +1352,7 @@ pub async fn list_messages(
     Ok(Json(json!({ "messages": msgs })))
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Deserialize)]
 pub struct PostMessageRequest {
     pub content: String,
     #[serde(default)]
@@ -1360,6 +1361,8 @@ pub struct PostMessageRequest {
     pub effort: Option<String>,
     #[serde(default)]
     pub recipient_overrides: HashMap<String, TurnModelSelection>,
+    #[serde(default)]
+    pub images: Vec<ChatImageInput>,
 }
 
 pub async fn post_message(
@@ -1367,6 +1370,18 @@ pub async fn post_message(
     AxumPath(session_id): AxumPath<String>,
     Json(body): Json<PostMessageRequest>,
 ) -> ApiResult<Value> {
+    if body.images.len() > mh_core::MAX_CHAT_IMAGES || body.content.len() > 2 * 1024 * 1024 {
+        return Err(err_resp(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "A message can contain up to four images and 2 MiB of text.",
+        ));
+    }
+    let images = body
+        .images
+        .into_iter()
+        .map(ChatImage::decode)
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| err_resp(StatusCode::BAD_REQUEST, error))?;
     let msg = state
         .switch
         .handle_user_message_with_overrides(
@@ -1377,10 +1392,24 @@ pub async fn post_message(
                 effort: body.effort,
             },
             body.recipient_overrides,
+            images,
         )
         .await
         .map_err(map_switch_err)?;
     Ok(Json(json!({ "message": msg })))
+}
+
+pub async fn get_message_image(
+    State(state): State<AppState>,
+    AxumPath((session_id, message_id, index)): AxumPath<(String, String, u32)>,
+) -> Result<Response, (StatusCode, Json<Value>)> {
+    let image = state
+        .switch
+        .store
+        .get_message_image(&session_id, &message_id, index)
+        .map_err(|error| err_resp(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?
+        .ok_or_else(|| err_resp(StatusCode::NOT_FOUND, "Image not found"))?;
+    Ok(([(header::CONTENT_TYPE, image.mime_type)], image.bytes).into_response())
 }
 
 pub async fn cancel_session(

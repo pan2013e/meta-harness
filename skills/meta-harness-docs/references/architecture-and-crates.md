@@ -67,7 +67,7 @@ Never introduce upward or cyclic crate dependencies.
 - `store/useAppStore.ts` — Normalized Zustand state (theme, sidebar, projects, sessions, members, deltas, trajectories, quotas, memory, skills, storage, WS dispatch).
 - `components/sidebar/Sidebar.tsx` — Project switcher (plus Quick Sessions), active/archived sessions, right-click Rename/Archive/Delete, Initialize Git.
 - `components/chat/`:
-  - `Composer.tsx` & `MentionEditor.tsx` — ContentEditable atomic pills for `@handles`, workflow/action `/commands`, and `/skills`; model/effort popover; Worktree/Strict/Auto policy; quota & context rings.
+  - `Composer.tsx` & `MentionEditor.tsx` — ContentEditable pills for `@handles`, workflow/action `/commands`, and `/skills`, model and effort controls, approval-mode selection, quota and context rings.
   - `MessageRow.tsx` & `TurnActivityTimeline.tsx` — Virtualized messages, Dispatch/Permission cards, collapsible `Sync Consult` threads, `Worked · N steps` timelines, skill & trajectory `ActivityPill`s.
   - `WebShellDrawer.tsx` — Multi-tab xterm.js PTY drawer.
 - `components/modals/` — `SettingsDialog.tsx` (`Appearance`, `Harnesses & Models`, `Skills` -> `SkillsSettings.tsx`, `Global Personas` -> `GlobalPersonas.tsx`, `Session`, `Storage & Data` -> `SettingsBackup.tsx`, `About`), `DiffReviewModal.tsx`, `FilePreviewModal.tsx`, `FolderPickerModal.tsx`, `MemoryModal.tsx`.

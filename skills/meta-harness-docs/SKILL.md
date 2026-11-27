@@ -29,7 +29,7 @@ Read the targeted reference guide under this skill's directory (via `skill_read`
 1. **[references/usage-and-workflows.md](references/usage-and-workflows.md)** — Day-to-day workflows & UI guide:
    - Workspaces, Quick Sessions, Archive/Restore/Delete + Codex/Claude conversation sync
    - `@mention` & Orchestrator routing, `orchestrator_dispatch`, `peer_consult`, `trajectory_read`, Activity Timelines
-   - Composer pills (`@handle`, `/plan` `/review` `/test` `/fix`, `/compact` `/diff` `/shell` `/memory` `/new` `/archive`, `/skill-name`), model/effort overrides, approval modes (`Worktree`, `Strict`, `Auto`), and shortcuts (`Alt+A`, `Alt+R`, `Ctrl+B`, `Ctrl+\``)
+   - Composer pills (`@handle`, `/plan` `/review` `/test` `/fix`, `/compact` `/diff` `/shell` `/memory` `/new` `/archive`, `/skill-name`), model/effort overrides, approval modes (Require approval, Approve for me, Full access), and shortcuts (`Alt+A`, `Alt+R`, `Ctrl+B`, `Ctrl+\``)
    - Settings panels, desktop clipboard and quote menus, release updates, and HTTPS LAN pairing
 
 2. **[references/architecture-and-crates.md](references/architecture-and-crates.md)** — Repository layout, crate dependency DAG, and symbol map:
@@ -40,7 +40,7 @@ Read the targeted reference guide under this skill's directory (via `skill_read`
 3. **[references/protocols-and-invariants.md](references/protocols-and-invariants.md)** — Mandatory architectural contracts (never violate):
    - ACP stdio JSON-RPC lifecycle, 25 ms stream coalescing, child-session isolation
    - Wait-For Graph deadlock detection, hop guard (`max_hops`), `<250 ms` `Stop All` cancellation
-   - Mention code-block masking, cross-platform process tree cleanup (Win32 Job Objects / POSIX process groups / Linux `PR_SET_PDEATHSIG`), `dunce` path normalization, `worktree_smart` & read-only skills containment, and signed iframe preview grants
+   - Mention code-block masking, cross-platform process tree cleanup (Win32 Job Objects / POSIX process groups / Linux `PR_SET_PDEATHSIG`), `dunce` path normalization, workspace and skill-root containment under Require approval, and signed iframe preview grants
 
 4. **[references/dev-testing-and-release.md](references/dev-testing-and-release.md)** — Bootstrapping Meta-Harness development inside Meta-Harness:
    - Windows (MSVC/WinLibs), macOS, and Linux toolchain setup

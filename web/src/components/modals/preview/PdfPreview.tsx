@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState } from "react";
 import { getDocument, GlobalWorkerOptions, type PDFDocumentProxy } from "pdfjs-dist";
 import workerUrl from "pdfjs-dist/build/pdf.worker.min.mjs?url";
+import { notifyInApp } from "../../../inAppNotifications";
 
 GlobalWorkerOptions.workerSrc = workerUrl;
 
@@ -8,7 +9,7 @@ export default function PdfPreview({ file }: { file: Blob }) {
   const canvas = useRef<HTMLCanvasElement>(null);
   const [document, setDocument] = useState<PDFDocumentProxy | null>(null);
   const [page, setPage] = useState(1);
-  const [error, setError] = useState<string | null>(null);
+  const [failed, setFailed] = useState(false);
 
   useEffect(() => {
     let active = true;
@@ -17,7 +18,10 @@ export default function PdfPreview({ file }: { file: Blob }) {
     void task.promise.then((pdf) => {
       if (active) setDocument(pdf);
     }).catch(() => {
-      if (active) setError("The PDF could not be opened.");
+      if (active) {
+        notifyInApp("The PDF could not be opened.", "error");
+        setFailed(true);
+      }
     });
     return () => {
       active = false;
@@ -41,7 +45,10 @@ export default function PdfPreview({ file }: { file: Blob }) {
       cancel = () => render.cancel();
       await render.promise;
     }).catch(() => {
-      if (active) setError("The PDF page could not be displayed.");
+      if (active) {
+        notifyInApp("The PDF page could not be displayed.", "error");
+        setFailed(true);
+      }
     });
     return () => {
       active = false;
@@ -49,7 +56,7 @@ export default function PdfPreview({ file }: { file: Blob }) {
     };
   }, [document, page]);
 
-  if (error) return <p role="alert" className="p-5 text-sm text-ink-muted">{error}</p>;
+  if (failed) return <p className="p-5 text-sm text-ink-muted">PDF preview unavailable.</p>;
   return (
     <div className="flex h-full flex-col">
       {document ? (

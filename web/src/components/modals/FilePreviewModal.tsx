@@ -1,6 +1,7 @@
 import { Suspense, lazy, useEffect, useRef, useState } from "react";
 import { Download, X } from "lucide-react";
 import { sessionFileUrl, sessionPreviewUrl } from "../../api/client";
+import { notifyInApp } from "../../inAppNotifications";
 
 const CodePreview = lazy(() => import("./preview/CodePreview"));
 const PdfPreview = lazy(() => import("./preview/PdfPreview"));
@@ -21,7 +22,7 @@ type Preview =
   | { type: "image"; url: string }
   | { type: "pdf"; file: Blob }
   | { type: "code"; value: string; language: string }
-  | { type: "message"; text: string };
+  | { type: "unavailable" };
 
 export function FilePreviewModal({ sessionId, path, onClose }: {
   sessionId: string;
@@ -79,12 +80,10 @@ export function FilePreviewModal({ sessionId, path, onClose }: {
         if (!abort.signal.aborted) setPreview({ type: "code", value, language: CODE_LANGUAGES[extension] || "plaintext" });
       } catch (error) {
         if (!abort.signal.aborted) {
-          setPreview({
-            type: "message",
-            text: error instanceof TypeError
+          notifyInApp(error instanceof TypeError
               ? "Preview is unavailable for this file type."
-              : error instanceof Error ? error.message : "The file could not be opened.",
-          });
+              : error instanceof Error ? error.message : "The file could not be opened.", "error");
+          setPreview({ type: "unavailable" });
         }
       }
     };
@@ -113,7 +112,7 @@ export function FilePreviewModal({ sessionId, path, onClose }: {
         <div className="min-h-0 flex-1 overflow-auto bg-inset">
           <Suspense fallback={loading}>
             {preview.type === "loading" && loading}
-            {preview.type === "message" && <p className="p-5 text-sm text-ink-muted">{preview.text}</p>}
+            {preview.type === "unavailable" && <p className="p-5 text-sm text-ink-muted">Preview unavailable. You can still download the file.</p>}
             {preview.type === "html" && (
               <iframe src={preview.src} title={filename + " webpage"}
                 sandbox="allow-scripts" referrerPolicy="no-referrer"
@@ -122,7 +121,10 @@ export function FilePreviewModal({ sessionId, path, onClose }: {
             {preview.type === "image" && (
               <div className="flex h-full items-center justify-center p-4">
                 <img src={preview.url} alt={filename} className="max-h-full max-w-full object-contain"
-                  onError={() => setPreview({ type: "message", text: "The image could not be displayed." })} />
+                  onError={() => {
+                    notifyInApp("The image could not be displayed.", "error");
+                    setPreview({ type: "unavailable" });
+                  }} />
               </div>
             )}
             {preview.type === "code" && <CodePreview value={preview.value} language={preview.language} filename={filename} />}

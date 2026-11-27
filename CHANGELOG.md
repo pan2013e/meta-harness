@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+## 0.10.0
+
+- Check explicit outbound proxies at startup, every minute, and on demand from Settings. Switch to direct routing when the check fails and resume proxy routing after recovery.
+- Add a Windows Store AppX build with Store-managed updates. Attach the verified Store-signed AppX to its corresponding GitHub release and keep macOS disk images unsigned.
+- Unify Settings layouts, open third-party notices in a read-only viewer, and show operation feedback in dismissible in-app notifications.
+- Test explicit proxies with a real HTTPS request before using them. Antigravity background probes use a non-browser sign-in flow, and an authentication error offers a link to Harnesses settings.
 - Use the desktop system proxy or an explicit desktop Network setting for the app and its harnesses. Add `--proxy` for the standalone server, keep loopback traffic direct, and fall back to a direct connection when an explicit proxy is unreachable.
 - Improve Antigravity sign-in with complete provider links, support for callback URLs, and clearer separate-profile and exchange status.
 - Add opt-in desktop and browser notifications for approval requests and finished turns.

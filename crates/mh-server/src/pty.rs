@@ -163,6 +163,9 @@ Clear-Host"#
     );
 
     let mut cmd = CommandBuilder::new(&prog);
+    for (key, value) in mh_core::outbound_proxy::environment() {
+        cmd.env(key, value);
+    }
     cmd.args(args);
     #[cfg(unix)]
     match std::path::Path::new(&prog)

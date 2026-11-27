@@ -1332,7 +1332,10 @@ impl SwitchEngine {
                         kind: MessageKind::SystemNotice,
                         content: format!("Could not start @{}: {e}", member.handle),
                         turn_id: Some(turn_id.clone()),
-                        metadata: json!({"error": true}),
+                        metadata: json!({
+                            "error": true,
+                            "authentication_required": matches!(e, AcpError::AuthenticationRequired),
+                        }),
                     }) {
                         let _ = self.events_tx.send(WsEvent::ChatMessageCreated { message });
                         let _ = self.events_tx.send(WsEvent::ActivityNotification {
@@ -1647,7 +1650,11 @@ impl SwitchEngine {
                     stream_listener
                         .finish_chat(Some((
                             &format!("Error in @{}: {err}", member.handle),
-                            "error",
+                            if matches!(err, AcpError::AuthenticationRequired) {
+                                "authentication_required"
+                            } else {
+                                "error"
+                            },
                         )))
                         .await?;
                     self.set_member_status(session_id, &member.handle, MemberStatus::Error, None)
@@ -3062,6 +3069,9 @@ impl SwitchStreamListener {
         if let Some((content, status)) = notice {
             params.content = content.into();
             params.metadata[status] = json!(true);
+            if status == "authentication_required" {
+                params.metadata["error"] = json!(true);
+            }
             params.metadata["continuation"] = json!(previous.is_some());
         }
         let message = engine.store.append_message(params)?;

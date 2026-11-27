@@ -116,10 +116,10 @@ impl AcpClient {
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped());
+        prepare_isolated_command(&mut cmd);
         for (k, v) in extra_env {
             cmd.env(k, v);
         }
-        prepare_isolated_command(&mut cmd);
 
         let mut child = cmd.spawn()?;
         let guard = ProcessTreeGuard::attach(&child);
@@ -638,6 +638,9 @@ impl AcpClient {
             .await
             .map_err(|_| AcpError::ProcessExited("ACP request channel dropped".into()))??;
         if let Some(err) = resp.error {
+            if err.code == -32000 && err.message.eq_ignore_ascii_case("authentication required") {
+                return Err(AcpError::AuthenticationRequired);
+            }
             let lower = err.message.to_ascii_lowercase();
             if err.code == 429
                 || lower.contains("429")

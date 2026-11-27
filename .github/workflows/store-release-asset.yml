@@ -1,0 +1,68 @@
+name: Attach the Microsoft Store package
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '23 */6 * * *'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: store-release-asset
+
+jobs:
+  download:
+    if: vars.MH_STORE_PRODUCT_ID != ''
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      - uses: actions/checkout@v6
+        with:
+          repository: JasonWei512/Upload-Microsoft-Store-MSIX-Package-to-GitHub-Release
+          ref: 80b980b3065f16557b6c450e9efe2144344b589f # v1
+          path: store-downloader
+          persist-credentials: false
+      - uses: actions/setup-dotnet@v5
+        with:
+          dotnet-version: 10.0.x
+      - name: Download the published package from Microsoft Store
+        env:
+          STORE_PRODUCT_ID: ${{ vars.MH_STORE_PRODUCT_ID }}
+          STORE_LIB_PROJECT: ${{ github.workspace }}/store-downloader/Dependencies/StoreLib/StoreLib/StoreLib.csproj
+        run: |
+          dotnet run --project scripts/store-download -- "$STORE_PRODUCT_ID" "$RUNNER_TEMP/meta-harness-desktop-windows-x64.appx"
+      - uses: actions/upload-artifact@v7
+        with:
+          name: store-package
+          path: |
+            ${{ runner.temp }}/meta-harness-desktop-windows-x64.appx
+            ${{ runner.temp }}/meta-harness-desktop-windows-x64.version
+          if-no-files-found: error
+          retention-days: 1
+
+  attach:
+    needs: download
+    runs-on: windows-2025
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@v8
+        with:
+          name: store-package
+          path: ${{ runner.temp }}/meta-harness-store
+      - name: Verify and attach the package to its matching release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $directory = Join-Path $env:RUNNER_TEMP 'meta-harness-store'
+          $version = Get-Content -Raw -LiteralPath (Join-Path $directory 'meta-harness-desktop-windows-x64.version')
+          scripts/attach-store-release.ps1 -PackagePath (Join-Path $directory 'meta-harness-desktop-windows-x64.appx') -ExpectedVersion $version

@@ -1,17 +1,112 @@
-use std::net::{TcpStream, ToSocketAddrs};
-use std::time::{Duration, Instant};
+use std::sync::{Mutex, OnceLock};
+use std::time::{SystemTime, UNIX_EPOCH};
+
+use serde::Serialize;
 use url::Url;
 
-/// Resolve outbound proxy variables before the server creates networking clients or children.
-pub fn outbound_proxy_environment(
-    override_url: Option<&str>,
-) -> Result<Vec<(String, String)>, &'static str> {
-    if override_url.is_none()
-        && std::env::var_os("MH_OUTBOUND_PROXY_DIRECT").as_deref()
-            == Some(std::ffi::OsStr::new("1"))
-    {
-        return Ok(direct_variables());
+static PROXY: OnceLock<OutboundProxy> = OnceLock::new();
+
+struct OutboundProxy {
+    variables: Vec<(String, String)>,
+    endpoint: Option<String>,
+    host: Option<String>,
+    force_direct: bool,
+    health: Mutex<Health>,
+}
+
+#[derive(Default)]
+struct Health {
+    checked_at: Option<u64>,
+    reachable: bool,
+    generation: u64,
+}
+
+#[derive(Serialize)]
+pub struct OutboundProxyStatus {
+    pub host: Option<String>,
+    pub checked_at: Option<u64>,
+    pub proxy_not_used: bool,
+}
+
+pub fn initialize(override_url: Option<&str>) -> Result<(), &'static str> {
+    let proxy = resolve(override_url)?;
+    let _ = PROXY.set(proxy);
+    Ok(())
+}
+
+pub fn endpoint() -> Option<&'static str> {
+    PROXY.get()?.endpoint.as_deref()
+}
+
+pub fn status() -> OutboundProxyStatus {
+    if let Some(proxy) = PROXY.get() {
+        let health = proxy.health.lock().unwrap_or_else(|e| e.into_inner());
+        return OutboundProxyStatus {
+            host: proxy.host.clone(),
+            checked_at: health.checked_at,
+            proxy_not_used: proxy.force_direct || (proxy.endpoint.is_some() && !health.reachable),
+        };
     }
+    OutboundProxyStatus {
+        host: None,
+        checked_at: None,
+        proxy_not_used: false,
+    }
+}
+
+pub fn record_health(reachable: bool) -> bool {
+    let Some(proxy) = PROXY.get() else {
+        return false;
+    };
+    proxy.record_health(reachable)
+}
+
+pub fn environment() -> Vec<(String, String)> {
+    PROXY
+        .get()
+        .map_or_else(Vec::new, OutboundProxy::environment)
+}
+
+pub fn generation() -> u64 {
+    PROXY.get().map_or(0, |proxy| {
+        proxy
+            .health
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .generation
+    })
+}
+
+impl OutboundProxy {
+    fn record_health(&self, reachable: bool) -> bool {
+        let mut health = self.health.lock().unwrap_or_else(|e| e.into_inner());
+        let changed = health.checked_at.is_none() || health.reachable != reachable;
+        if changed {
+            health.generation += 1;
+        }
+        health.reachable = reachable;
+        health.checked_at = Some(
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs(),
+        );
+        changed
+    }
+
+    fn environment(&self) -> Vec<(String, String)> {
+        let health = self.health.lock().unwrap_or_else(|e| e.into_inner());
+        if self.force_direct || (self.endpoint.is_some() && !health.reachable) {
+            return direct_variables();
+        }
+        self.variables.clone()
+    }
+}
+
+fn resolve(override_url: Option<&str>) -> Result<OutboundProxy, &'static str> {
+    let force_direct = override_url.is_none()
+        && std::env::var_os("MH_OUTBOUND_PROXY_DIRECT").as_deref()
+            == Some(std::ffi::OsStr::new("1"));
     let read = |key| {
         std::env::var(key)
             .ok()
@@ -21,17 +116,12 @@ pub fn outbound_proxy_environment(
     let configured = read("MH_OUTBOUND_PROXY");
     let explicit = override_url
         .or(configured.as_deref())
+        .filter(|_| !force_direct)
         .map(|value| {
             proxy_url(value)
                 .ok_or("The outbound proxy must be an HTTP, HTTPS, or SOCKS5 proxy URL.")
         })
         .transpose()?;
-    if explicit
-        .as_deref()
-        .is_some_and(|proxy| !proxy_reachable(proxy))
-    {
-        return Ok(direct_variables());
-    }
     let all = env("ALL_PROXY", "all_proxy");
     #[cfg(windows)]
     let system = windows_proxy();
@@ -63,32 +153,20 @@ pub fn outbound_proxy_environment(
             })
             .unwrap_or_default()
     });
-    Ok(proxy_variables(http, https, &bypass))
-}
-
-fn proxy_reachable(proxy: &str) -> bool {
-    let Ok(url) = Url::parse(proxy) else {
-        return false;
-    };
-    let Some(host) = url.host_str() else {
-        return false;
-    };
-    let port = url.port_or_known_default().unwrap_or(1080);
-    let host = host.trim_matches(['[', ']']);
-    let Ok(addresses) = (host, port).to_socket_addrs() else {
-        return false;
-    };
-    let deadline = Instant::now() + Duration::from_secs(1);
-    for address in addresses {
-        let remaining = deadline.saturating_duration_since(Instant::now());
-        if remaining.is_zero() {
-            break;
-        }
-        if TcpStream::connect_timeout(&address, remaining).is_ok() {
-            return true;
-        }
-    }
-    false
+    let host = explicit.as_deref().and_then(|value| {
+        let url = Url::parse(value).ok()?;
+        Some(match url.port() {
+            Some(port) => format!("{}:{port}", url.host()?),
+            None => url.host()?.to_string(),
+        })
+    });
+    Ok(OutboundProxy {
+        variables: proxy_variables(http, https, &bypass),
+        endpoint: explicit,
+        host,
+        force_direct,
+        health: Mutex::new(Health::default()),
+    })
 }
 
 fn direct_variables() -> Vec<(String, String)> {
@@ -215,5 +293,25 @@ mod tests {
             "NO_PROXY".into(),
             ".example.test,localhost,127.0.0.1,::1".into()
         )));
+    }
+
+    #[test]
+    fn route_falls_back_on_failure_and_recovers_on_success() {
+        let proxy = resolve(Some("http://account:secret@proxy.local:8080")).unwrap();
+        assert_eq!(proxy.host.as_deref(), Some("proxy.local:8080"));
+        let has_https_proxy = || {
+            proxy
+                .environment()
+                .iter()
+                .any(|(key, value)| key == "HTTPS_PROXY" && value.contains("@proxy.local:8080"))
+        };
+        assert!(proxy.record_health(true));
+        assert!(has_https_proxy());
+        assert!(!proxy.record_health(true));
+        assert!(proxy.record_health(false));
+        assert!(!has_https_proxy());
+        assert!(proxy.record_health(true));
+        assert!(has_https_proxy());
+        assert_eq!(proxy.health.lock().unwrap().generation, 3);
     }
 }

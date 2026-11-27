@@ -3,7 +3,6 @@ const { execFile, spawn } = require("node:child_process");
 const { randomBytes } = require("node:crypto");
 const { readFile, rename, writeFile } = require("node:fs/promises");
 const { homedir } = require("node:os");
-const { createConnection } = require("node:net");
 const { delimiter, join } = require("node:path");
 const { createInterface } = require("node:readline");
 const { promisify } = require("node:util");
@@ -20,6 +19,7 @@ let updateDownloader;
 let updateInstaller;
 let configuredProxy;
 let proxyNotUsed = false;
+let browserProxyChange = Promise.resolve();
 
 const windows = process.platform === "win32";
 const titleBarHeight = 36;
@@ -133,21 +133,6 @@ function nativeEnvironment() {
   return configuredProxy ? { ...process.env, MH_OUTBOUND_PROXY: configuredProxy } : process.env;
 }
 
-function proxyReachable(proxy) {
-  const port = Number(proxy.port || ({ "http:": 80, "https:": 443 })[proxy.protocol] || 1080);
-  return new Promise((resolve) => {
-    const socket = createConnection({ host: proxy.hostname.replace(/^\[|\]$/g, ""), port });
-    const finish = (available) => {
-      clearTimeout(deadline);
-      socket.destroy();
-      resolve(available);
-    };
-    const deadline = setTimeout(() => finish(false), 1000);
-    socket.once("connect", () => finish(true));
-    socket.once("error", () => finish(false));
-  });
-}
-
 async function loadProxySettings() {
   try {
     const { proxy } = JSON.parse(await readFile(proxySettingsPath(), "utf8"));
@@ -155,12 +140,14 @@ async function loadProxySettings() {
   } catch (error) {
     if (error.code !== "ENOENT") console.warn("Could not read the desktop proxy setting.");
   }
-  const explicit = configuredProxy || process.env.MH_OUTBOUND_PROXY;
-  if (explicit?.trim() && !await proxyReachable(parseProxy(explicit))) {
-    proxyNotUsed = true;
+}
+
+async function applyBrowserProxy() {
+  if (proxyNotUsed) {
     await session.defaultSession.setProxy({ mode: "direct" });
     return;
   }
+  const explicit = configuredProxy || process.env.MH_OUTBOUND_PROXY;
   const all = process.env.ALL_PROXY || process.env.all_proxy;
   const sources = [
     ["http", explicit || process.env.HTTP_PROXY || process.env.http_proxy || all],
@@ -239,6 +226,7 @@ async function prepareDesktopUpdate(event, version) {
   if (!app.isPackaged || !fromMainWindow(event)) {
     throw new Error("Updates must be started from the installed Meta-Harness app.");
   }
+  if (process.windowsStore) throw new Error("Microsoft Store manages updates for this build.");
   if (typeof version !== "string" || !/^\d+\.\d+\.\d+$/.test(version)) {
     throw new Error("Invalid release version.");
   }
@@ -295,16 +283,26 @@ function startBackend() {
   startupTimer = setTimeout(() => showStartupError(new Error("The local backend did not become ready.")), 30000);
   const output = createInterface({ input: backend.stdout });
   output.on("line", (line) => {
+    const proxyLine = /^MH_PROXY (direct|enabled)$/.exec(line.trim());
+    if (proxyLine) {
+      proxyNotUsed = proxyLine[1] === "direct";
+      if (backendUrl && !quitting) {
+        browserProxyChange = browserProxyChange.then(async () => {
+          await applyBrowserProxy();
+          await session.defaultSession.closeAllConnections();
+        }).catch(() => console.warn("Could not update the desktop network route."));
+      }
+      return;
+    }
     const match = /^MH_READY (http:\/\/127\.0\.0\.1:\d+)\/#token=([a-f0-9]+)$/.exec(line.trim());
     if (!match || match[2] !== token || backendUrl || quitting) return;
     backendUrl = String(match[1]) + "/#token=" + token;
     clearTimeout(startupTimer);
-    try {
+    void applyBrowserProxy().then(() => {
+      if (quitting || !backend) return;
       startTray();
       createWindow(backendUrl);
-    } catch (error) {
-      showStartupError(error);
-    }
+    }).catch(showStartupError);
   });
 }
 
@@ -331,10 +329,6 @@ if (process.getuid?.() === 0 || process.geteuid?.() === 0) {
     notification.on("click", openWindow);
     notification.show();
     return true;
-  });
-  ipcMain.handle("meta-harness:proxy-settings", (event) => {
-    if (!fromMainWindow(event)) return { host: null, proxyNotUsed: false };
-    return { host: configuredProxy ? parseProxy(configuredProxy).host : null, proxyNotUsed };
   });
   ipcMain.handle("meta-harness:save-proxy", async (event, value) => {
     if (!fromMainWindow(event) || quitting) throw new Error("The desktop app is closing.");
@@ -371,7 +365,7 @@ if (process.getuid?.() === 0 || process.geteuid?.() === 0) {
     }).finally(() => app.quit());
   });
   void app.whenReady().then(async () => {
-    if (windows) app.setAppUserModelId("com.pan2013e.meta-harness");
+    if (windows && !process.windowsStore) app.setAppUserModelId("com.pan2013e.meta-harness");
     await loadProxySettings();
     if (!quitting) startBackend();
   }).catch(showStartupError);

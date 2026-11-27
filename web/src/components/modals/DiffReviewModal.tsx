@@ -9,6 +9,7 @@ import {
   X,
 } from "lucide-react";
 import { api } from "../../api/client";
+import { notifyInApp } from "../../inAppNotifications";
 import { SessionFileLink } from "../common/SessionFileLink";
 import { useAppStore } from "../../store/useAppStore";
 import type { PromoteMode } from "../../types/api";
@@ -19,7 +20,6 @@ export function DiffReviewModal({ onClose }: { onClose: () => void }) {
     activeSession,
     sessionDiff,
     refreshSessionDiff,
-    setPromoteBanner,
     setError,
   } = useAppStore();
 
@@ -44,13 +44,8 @@ export function DiffReviewModal({ onClose }: { onClose: () => void }) {
     setPromoting(true);
     try {
       const res = await api.promoteSession(activeSession.id, mode);
-      setPromoteBanner(res.result.summary);
+      notifyInApp(res.result.summary, "success");
       await refreshSessionDiff();
-      window.setTimeout(() => {
-        if (useAppStore.getState().promoteBanner === res.result.summary) {
-          useAppStore.getState().setPromoteBanner(null);
-        }
-      }, 5000);
       onClose();
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));

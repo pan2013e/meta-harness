@@ -101,7 +101,17 @@ export function ptyWsUrl(
   )}/pty?${params.toString()}`;
 }
 
+export interface OutboundProxyStatus {
+  host: string | null;
+  checked_at: number | null;
+  proxy_not_used: boolean;
+}
+
 export const api = {
+  proxyStatus: (signal?: AbortSignal) =>
+    apiFetch<OutboundProxyStatus>("/api/settings/proxy", { signal }),
+  checkProxy: () =>
+    apiFetch<OutboundProxyStatus>("/api/settings/proxy", { method: "POST" }),
   buildInfo: (signal?: AbortSignal) =>
     apiFetch<{ version: string; commit: string | null; release_build: boolean }>("/api/health", { signal }),
   checkForUpdate: (kind: "cli" | "desktop") =>

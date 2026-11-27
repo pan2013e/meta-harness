@@ -1,3 +1,4 @@
+import { notifyInApp, reportInAppError } from "../../inAppNotifications";
 import { useState } from "react";
 import { ArrowDownToLine, RefreshCw } from "lucide-react";
 import { api } from "../../api/client";
@@ -17,16 +18,16 @@ export function AboutUpdates() {
   const desktop = window.metaHarnessDesktop;
   const [result, setResult] = useState<AppUpdateCheck | null>(null);
   const [busy, setBusy] = useState<"checking" | "updating" | null>(null);
-  const [error, setError] = useState<string | null>(null);
 
   async function check() {
-    setError(null);
     setResult(null);
     setBusy("checking");
     try {
-      setResult(await api.checkForUpdate(desktop ? "desktop" : "cli"));
+      const update = await api.checkForUpdate(desktop ? "desktop" : "cli");
+      setResult(update);
+      notifyInApp(statusText(update), update.status === "missing_asset" ? "warning" : "info");
     } catch (cause) {
-      setError(cause instanceof Error ? cause.message : "Could not check for updates.");
+      reportInAppError(cause, "Could not check for updates.");
     } finally {
       setBusy(null);
     }
@@ -34,17 +35,25 @@ export function AboutUpdates() {
 
   async function install(version: string) {
     if (!desktop) return;
-    setError(null);
     setBusy("updating");
     try {
       await desktop.installUpdate(version);
     } catch (cause) {
-      setError(cause instanceof Error ? cause.message : "Could not prepare the update.");
+      reportInAppError(cause, "Could not prepare the update.");
       setBusy(null);
     }
   }
 
   const available = result?.status === "available" && result.latest_version;
+
+  if (desktop?.windowsStore) {
+    return (
+      <div className="space-y-2 border-t border-line pt-4">
+        <h3 className="font-medium">Updates</h3>
+        <p className="text-xs text-ink-muted">Microsoft Store manages updates for this build.</p>
+      </div>
+    );
+  }
 
   return (
     <div className="space-y-2 border-t border-line pt-4">
@@ -63,8 +72,6 @@ export function AboutUpdates() {
           </button>
         )}
       </div>
-      {error && <p role="alert" className="text-xs text-neg">{error}</p>}
-      {result && <p role="status" className="text-xs text-ink-muted">{statusText(result)}</p>}
       {available && !desktop && <p className="text-xs text-ink-muted">Run <code>meta-harness update</code> on the machine hosting this app.</p>}
       {available && desktop && <p className="text-xs text-ink-muted">Meta-Harness will close before opening the installer.</p>}
       {result && result.status !== "current" && (

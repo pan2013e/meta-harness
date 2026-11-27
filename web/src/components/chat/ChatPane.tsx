@@ -2,7 +2,6 @@ import { lazy, Suspense, useCallback, useEffect, useMemo, useRef, useState } fro
 import { useVirtualizer } from "@tanstack/react-virtual";
 import {
   Brain,
-  CheckCircle2,
   ChevronDown,
   Crown,
   FolderGit2,
@@ -62,7 +61,6 @@ export function ChatPane() {
     setShellOpen,
     sessionDiff,
     refreshSessionDiff,
-    promoteBanner,
     memoryJobs,
     memoryFacts,
     memberStatuses,
@@ -228,14 +226,6 @@ export function ChatPane() {
         </div>
 
         <div className="flex shrink-0 items-center gap-1.5">
-          {promoteBanner && (
-            <span className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-lg bg-pos-soft border border-pos/30 text-[11px] font-medium text-pos">
-              <CheckCircle2 className="w-3.5 h-3.5" />
-              <span className="hidden sm:inline">{promoteBanner}</span>
-              <span className="sm:hidden">Merged</span>
-            </span>
-          )}
-
           {hasUnpromotedChanges && (
             <button
               type="button"

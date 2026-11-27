@@ -1,3 +1,4 @@
+import { reportInAppError } from "../../inAppNotifications";
 import { useEffect, useState } from "react";
 import { Brain, Pencil, Pin, Plus, Search, Trash2, X } from "lucide-react";
 import { api } from "../../api/client";
@@ -17,20 +18,17 @@ export function MemoryModal({ onClose }: { onClose: () => void }) {
   const [newFact, setNewFact] = useState("");
   const [factCategory, setFactCategory] = useState("architecture");
   const [editingFact, setEditingFact] = useState<ProjectFact | null>(null);
-  const [factError, setFactError] = useState<string | null>(null);
   const [savingFact, setSavingFact] = useState(false);
 
   useEffect(() => {
     setEditingFact(null);
     setNewFact("");
-    setFactError(null);
   }, [activeProjectId]);
 
   const saveFact = async () => {
     const summary = newFact.trim();
     if (!activeProjectId || !summary || savingFact || (editingFact && editingFact.project_id !== activeProjectId)) return;
     setSavingFact(true);
-    setFactError(null);
     try {
       if (editingFact) await api.reviseFact(editingFact, factCategory, summary);
       else await api.createFact(activeProjectId, factCategory, summary);
@@ -40,7 +38,7 @@ export function MemoryModal({ onClose }: { onClose: () => void }) {
         await refreshMemory(memQuery);
       }
     } catch (error) {
-      setFactError(error instanceof Error ? error.message : String(error));
+      reportInAppError(error);
     } finally {
       setSavingFact(false);
     }
@@ -145,10 +143,8 @@ export function MemoryModal({ onClose }: { onClose: () => void }) {
                         <button
                           type="button"
                           title={j.pinned ? "Unpin job" : "Pin job"}
-                          onClick={async () => {
-                            await api.pinJob(j.id, !j.pinned);
-                            await refreshMemory(memQuery);
-                          }}
+                          onClick={() => void api.pinJob(j.id, !j.pinned)
+                            .then(() => refreshMemory(memQuery)).catch(reportInAppError)}
                           className={`p-1 rounded hover:bg-hover ${
                             j.pinned ? "text-warn" : "text-ink-muted hover:text-ink"
                           }`}
@@ -158,10 +154,8 @@ export function MemoryModal({ onClose }: { onClose: () => void }) {
                         <button
                           type="button"
                           title="Delete job entry"
-                          onClick={async () => {
-                            await api.deleteJob(j.id);
-                            await refreshMemory(memQuery);
-                          }}
+                          onClick={() => void api.deleteJob(j.id)
+                            .then(() => refreshMemory(memQuery)).catch(reportInAppError)}
                           className="p-1 rounded text-ink-muted hover:text-neg hover:bg-hover"
                         >
                           <Trash2 className="w-3.5 h-3.5" />
@@ -237,10 +231,9 @@ export function MemoryModal({ onClose }: { onClose: () => void }) {
                     <span>{editingFact ? "Save" : "Pin"}</span>
                   </button>
                   {editingFact && <button type="button" disabled={savingFact}
-                    onClick={() => { setEditingFact(null); setNewFact(""); setFactError(null); }}
+                    onClick={() => { setEditingFact(null); setNewFact(""); }}
                     className="rounded-lg border border-line px-2">Cancel</button>}
                 </form>
-                {factError && <p role="alert" className="text-xs text-neg">{factError}</p>}
               </div>
             )}
 
@@ -259,20 +252,19 @@ export function MemoryModal({ onClose }: { onClose: () => void }) {
                   {activeProjectId && (
                     <div className="flex shrink-0 gap-1">
                     <button type="button" aria-label="Edit fact" disabled={savingFact}
-                      onClick={() => { setEditingFact(f); setFactCategory(f.category); setNewFact(f.summary); setFactError(null); }}
+                      onClick={() => { setEditingFact(f); setFactCategory(f.category); setNewFact(f.summary); }}
                       className="p-1 text-ink-muted hover:text-ink"><Pencil className="h-3.5 w-3.5" /></button>
                     <button
                       type="button"
                       aria-label="Delete fact"
                       disabled={savingFact}
                       onClick={async () => {
-                        setFactError(null);
                         try {
                           await api.deleteFact(activeProjectId, f.id);
                           if (editingFact?.id === f.id) { setEditingFact(null); setNewFact(""); }
                           await refreshMemory(memQuery);
                         } catch (error) {
-                          setFactError(error instanceof Error ? error.message : String(error));
+                          reportInAppError(error);
                         }
                       }}
                       className="text-ink-muted hover:text-neg p-1"

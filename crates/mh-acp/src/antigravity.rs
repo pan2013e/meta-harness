@@ -18,6 +18,10 @@ pub(crate) async fn run_agy(
     process
         .args(args)
         .env("AGY_CLI_DISABLE_AUTO_UPDATE", "true")
+        .env("AGY_CLI_NONINTERACTIVE_HEADLESS", "true")
+        // agy's print-mode OAuth fallback can open the local browser even with
+        // stdin closed. Its remote flow prints a URL and waits for input.
+        .env("SSH_CONNECTION", "127.0.0.1 1 127.0.0.1 1")
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())

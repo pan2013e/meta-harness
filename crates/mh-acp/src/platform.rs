@@ -346,6 +346,7 @@ pub fn open_terminal_in_dir(dir: &Path) -> Result<(), AcpError> {
 
 /// Configures OS-specific process-group isolation on a `Command` prior to spawning.
 pub fn prepare_isolated_command(cmd: &mut Command) {
+    cmd.envs(mh_core::outbound_proxy::environment());
     #[cfg(unix)]
     {
         cmd.process_group(0);
@@ -369,10 +370,37 @@ pub fn prepare_isolated_command(cmd: &mut Command) {
 
 pub(crate) fn background_command(program: &str) -> Command {
     let mut command = Command::new(program);
+    command.envs(mh_core::outbound_proxy::environment());
     #[cfg(windows)]
     command.creation_flags(windows_sys::Win32::System::Threading::CREATE_NO_WINDOW);
     command.kill_on_drop(true);
     command
+}
+
+pub fn outbound_http_builder() -> reqwest::ClientBuilder {
+    let variables = mh_core::outbound_proxy::environment();
+    let mut builder = reqwest::Client::builder().no_proxy();
+    let value = |name| {
+        variables
+            .iter()
+            .find(|(key, _)| key == name)
+            .map(|(_, value)| value.as_str())
+    };
+    for proxy in [
+        value("HTTP_PROXY")
+            .filter(|url| !url.is_empty())
+            .and_then(|url| reqwest::Proxy::http(url).ok()),
+        value("HTTPS_PROXY")
+            .filter(|url| !url.is_empty())
+            .and_then(|url| reqwest::Proxy::https(url).ok()),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        builder = builder
+            .proxy(proxy.no_proxy(value("NO_PROXY").and_then(reqwest::NoProxy::from_string)));
+    }
+    builder
 }
 
 /// Cross-platform child process tree lifetime guard.

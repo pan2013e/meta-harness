@@ -1,3 +1,4 @@
+import { notifyInApp, reportInAppError } from "../../inAppNotifications";
 import { useEffect, useRef, useState } from "react";
 import {
   Archive,
@@ -19,7 +20,7 @@ import {
   X,
 } from "lucide-react";
 import { api } from "../../api/client";
-import { useAppStore } from "../../store/useAppStore";
+import { useAppStore, type SettingsSection } from "../../store/useAppStore";
 import { HarnessAvatar, QuotaSnapshotSummary, THEMES } from "../common/Badges";
 import { APPROVAL_MODES } from "../common/approvalModes";
 import { HarnessMaintenance } from "./HarnessMaintenance";
@@ -30,7 +31,20 @@ import { SkillsSettings } from "./SkillsSettings";
 import { AboutUpdates } from "./AboutUpdates";
 import { NotificationSettings } from "./NotificationSettings";
 import { NetworkSettings } from "./NetworkSettings";
+import { LicenseNotices } from "./LicenseNotices";
 import { version } from "../../../package.json";
+
+const sections = [
+  ["appearance", "Appearance", Palette],
+  ["notifications", "Notifications", Bell],
+  ["harnesses", "Harnesses & Models", Terminal],
+  ["skills", "Skills", Sparkles],
+  ["personas", "Global Personas", UserPlus],
+  ["session", "Session", Sliders],
+  ["network", "Network", Globe],
+  ["storage", "Storage & Data", HardDrive],
+  ["about", "About", Info],
+] as const satisfies ReadonlyArray<[SettingsSection, string, typeof X]>;
 
 function formatBytes(bytes: number): string {
   if (!Number.isFinite(bytes) || bytes <= 0) return "0 B";
@@ -46,12 +60,11 @@ function formatBytes(bytes: number): string {
 
 export function SettingsDialog({ onClose }: { onClose: () => void }) {
   const dialog = useRef<HTMLDialogElement>(null);
-  const [section, setSection] = useState<
-    "harnesses" | "skills" | "session" | "personas" | "storage" | "appearance" | "about" | "notifications" | "network"
-  >("harnesses");
+  const section = useAppStore((state) => state.settingsSection);
+  const setSection = useAppStore((state) => state.setSettingsSection);
+  const [showLicenses, setShowLicenses] = useState(false);
+  const page = useRef<HTMLDivElement>(null);
   const [saving, setSaving] = useState<string | null>(null);
-  const [error, setError] = useState<string | null>(null);
-  const [cleanupNotice, setCleanupNotice] = useState<string | null>(null);
   const [confirmArchivedDelete, setConfirmArchivedDelete] = useState(false);
   const [showUninstalled, setShowUninstalled] = useState(false);
   const [buildInfo, setBuildInfo] = useState<Awaited<ReturnType<typeof api.buildInfo>> | null>(null);
@@ -77,7 +90,6 @@ export function SettingsDialog({ onClose }: { onClose: () => void }) {
     refreshQuotasLive,
     updateAdapterDefaults,
     updateMemberConfig,
-    errorBanner,
     activeProjectId,
     activeSession,
     members,
@@ -100,6 +112,10 @@ export function SettingsDialog({ onClose }: { onClose: () => void }) {
     const element = dialog.current;
     if (element && !element.open) element.showModal();
   }, []);
+
+  useEffect(() => {
+    page.current?.scrollTo?.(0, 0);
+  }, [section, showLicenses]);
 
   useEffect(() => {
     if (section === "storage") {
@@ -127,40 +143,32 @@ export function SettingsDialog({ onClose }: { onClose: () => void }) {
     payload: { default_model?: string | null; default_effort?: string | null }
   ) => {
     setSaving(adapterId);
-    setError(null);
     try {
       await updateAdapterDefaults(adapterId, payload);
     } catch (cause) {
-      setError(cause instanceof Error ? cause.message : String(cause));
+      reportInAppError(cause);
     } finally {
       setSaving(null);
     }
   };
 
   const handleCleanup = async (action: "clear_caches" | "delete_archived") => {
-    setError(null);
-    setCleanupNotice(null);
     try {
       const res = await cleanupStorage(action);
       if (action === "clear_caches") {
-        setCleanupNotice(
-          `Cleared ${res.removed_dirs} orphan/cache directories (freed ${formatBytes(res.freed_bytes)}).`
-        );
+        notifyInApp(`Cleared ${res.removed_dirs} orphan/cache directories (freed ${formatBytes(res.freed_bytes)}).`, "success");
       } else {
-        setCleanupNotice(
-          `Deleted ${res.removed_sessions} archived sessions & ${res.removed_dirs} worktree dirs (freed ${formatBytes(res.freed_bytes)}).`
-        );
-        if (res.harness_warnings?.length) setError(res.harness_warnings.join(" "));
+        notifyInApp(`Deleted ${res.removed_sessions} archived sessions & ${res.removed_dirs} worktree dirs (freed ${formatBytes(res.freed_bytes)}).`, "success");
+        if (res.harness_warnings?.length) notifyInApp(res.harness_warnings.join(" "), "warning");
       }
     } catch (cause) {
-      setError(cause instanceof Error ? cause.message : String(cause));
+      reportInAppError(cause);
     }
   };
 
   const addPersona = async () => {
     if (!activeSession || !personaHandle.trim()) return;
     setSaving("persona");
-    setError(null);
     try {
       await api.upsertMember(activeSession.id, {
         handle: personaHandle.trim(),
@@ -173,7 +181,7 @@ export function SettingsDialog({ onClose }: { onClose: () => void }) {
       setPersonaHandle("");
       setPersonaOptions({ active_model: null, active_effort: null });
     } catch (cause) {
-      setError(cause instanceof Error ? cause.message : String(cause));
+      reportInAppError(cause);
     } finally {
       setSaving(null);
     }
@@ -181,11 +189,10 @@ export function SettingsDialog({ onClose }: { onClose: () => void }) {
 
   const changePersona = async (handle: string, values: Partial<PersonaModel>) => {
     setSaving(handle);
-    setError(null);
     try {
       await updateMemberConfig(handle, values);
     } catch (cause) {
-      setError(cause instanceof Error ? cause.message : String(cause));
+      reportInAppError(cause);
     } finally {
       setSaving(null);
     }
@@ -195,16 +202,26 @@ export function SettingsDialog({ onClose }: { onClose: () => void }) {
     if (!activeSession) return;
     const sid = activeSession.id;
     setSaving(handle);
-    setError(null);
     try {
       await api.deleteMember(sid, handle);
       if (useAppStore.getState().activeSession?.id === sid) {
         await selectSession(sid);
       }
     } catch (cause) {
-      setError(cause instanceof Error ? cause.message : String(cause));
+      reportInAppError(cause);
     } finally {
       setSaving(null);
+    }
+  };
+
+  const updateSession = async (change: (id: string) => Promise<unknown>) => {
+    if (!activeSession) return;
+    const id = activeSession.id;
+    try {
+      await change(id);
+      if (useAppStore.getState().activeSession?.id === id) await selectSession(id);
+    } catch (cause) {
+      reportInAppError(cause);
     }
   };
 
@@ -242,24 +259,12 @@ export function SettingsDialog({ onClose }: { onClose: () => void }) {
             aria-label="Settings sections"
             className="w-full sm:w-52 shrink-0 border-b sm:border-b-0 sm:border-r border-line bg-inset/45 p-3 flex sm:flex-col gap-1 overflow-x-auto"
           >
-            {(
-              [
-                ["appearance", "Appearance", Palette],
-                ["notifications", "Notifications", Bell],
-                ["harnesses", "Harnesses & Models", Terminal],
-                ["skills", "Skills", Sparkles],
-                ["personas", "Global Personas", UserPlus],
-                ["session", "Session", Sliders],
-                ["network", "Network", Globe],
-                ["storage", "Storage & Data", HardDrive],
-                ["about", "About", Info],
-              ] as const
-            ).filter(([id]) => id !== "network" || Boolean(window.metaHarnessDesktop?.saveProxy)).map(([id, label, Icon]) => (
+            {sections.map(([id, label, Icon]) => (
               <button
                 key={id}
                 type="button"
                 aria-pressed={section === id}
-                onClick={() => setSection(id)}
+                onClick={() => { setShowLicenses(false); setSection(id); }}
                 className={`inline-flex items-center gap-2.5 rounded-xl px-3 py-2 text-xs font-medium shrink-0 text-left transition-colors ${
                   section === id
                     ? "bg-brand-soft text-brand-ink border border-brand/30"
@@ -272,24 +277,22 @@ export function SettingsDialog({ onClose }: { onClose: () => void }) {
             ))}
           </nav>
 
-          <div className="flex-1 min-w-0 overflow-y-auto p-5 sm:p-6">
-            {(error || errorBanner) && (
-              <p
-                role="alert"
-                className="mb-3 rounded-lg bg-neg-soft px-3 py-2 text-xs text-neg"
-              >
-                {error ?? errorBanner}
-              </p>
-            )}
-
+          <div ref={page} className="flex-1 min-w-0 overflow-y-auto bg-app/55 px-5 py-5 sm:px-7 sm:py-6">
+            <header className="mb-5 border-b border-line pb-4">
+              <h2 className="text-lg font-semibold tracking-tight text-ink">
+                {sections.find(([id]) => id === section)?.[1]}
+              </h2>
+            </header>
             {section === "notifications" && <NotificationSettings />}
             {section === "network" && <NetworkSettings />}
-            {section === "about" && (
-              <section className="space-y-5 text-sm">
+            {section === "about" && (showLicenses ? (
+              <LicenseNotices onBack={() => setShowLicenses(false)} />
+            ) : (
+              <section className="settings-card space-y-5 text-sm">
                 <div className="flex items-center gap-3">
                   <img src="/meta-harness.svg" alt="" className="h-12 w-12" />
                   <div>
-                    <h2 className="text-base font-semibold">Meta-Harness</h2>
+                    <h3 className="text-base font-semibold">Meta-Harness</h3>
                     <p className="flex items-center gap-2 text-xs text-ink-muted">
                       Version {buildInfo?.version ?? version}
                       {buildInfo?.commit && <code aria-label={"Commit " + buildInfo.commit}>{buildInfo.commit}</code>}
@@ -304,7 +307,7 @@ export function SettingsDialog({ onClose }: { onClose: () => void }) {
                     <a className="underline" href="https://github.com/pan2013e/meta-harness/blob/main/LICENSE" target="_blank" rel="noreferrer">MIT License</a>
                   </div>
                 </div>
-                {buildInfo?.release_build && <AboutUpdates />}
+                {(buildInfo?.release_build || window.metaHarnessDesktop?.windowsStore) && <AboutUpdates />}
                 <div className="space-y-2 border-t border-line pt-4">
                   <h3 className="font-medium">Open-source software</h3>
                   <ul className="space-y-1 text-xs text-ink-soft">
@@ -313,23 +316,23 @@ export function SettingsDialog({ onClose }: { onClose: () => void }) {
                     <li>Monaco Editor and PDF.js</li>
                     <li>Electron and Chromium in the desktop app</li>
                   </ul>
-                  <a className="inline-block text-xs text-brand-ink underline" href="/third-party-licenses.txt" download>Third-party license notices</a>
+                  <button type="button" className="settings-button" onClick={() => setShowLicenses(true)}>Third-party license notices</button>
                 </div>
               </section>
-            )}
+            ))}
 
             {section === "storage" && (
               <div className="space-y-4 text-xs">
                 <SettingsBackup />
                 <div className="flex items-center justify-between gap-2">
-                  <h2 className="text-[11px] uppercase tracking-wider font-semibold text-ink-muted">
+                  <h2 className="settings-heading">
                     Disk Usage &amp; Cleanup
                   </h2>
                   <button
                     type="button"
                     disabled={storageLoading}
                     onClick={() => void loadStorage()}
-                    className="inline-flex items-center gap-1.5 rounded-lg border border-line bg-elevated px-3 py-1.5 text-xs hover:bg-hover disabled:opacity-60"
+                    className="settings-button"
                   >
                     <RefreshCw
                       size={13}
@@ -338,12 +341,6 @@ export function SettingsDialog({ onClose }: { onClose: () => void }) {
                     <span>{storageLoading ? "Scanning…" : "Recalculate"}</span>
                   </button>
                 </div>
-
-                {cleanupNotice && (
-                  <p className="rounded-lg bg-pos-soft border border-pos/30 px-3 py-2 text-xs text-pos">
-                    {cleanupNotice}
-                  </p>
-                )}
 
                 {storageSummary ? (
                   <>
@@ -463,8 +460,8 @@ export function SettingsDialog({ onClose }: { onClose: () => void }) {
             )}
 
             {section === "appearance" && (
-              <div className="space-y-3">
-                <h2 className="text-[11px] uppercase tracking-wider font-semibold text-ink-muted">
+              <div className="settings-card space-y-3">
+                <h2 className="settings-heading">
                   Workspace Theme
                 </h2>
                 <div className="grid gap-3 sm:grid-cols-2" aria-label="Color theme">
@@ -508,14 +505,14 @@ export function SettingsDialog({ onClose }: { onClose: () => void }) {
             {section === "harnesses" && (
               <div className="space-y-4">
                 <div className="flex items-center justify-between gap-2">
-                  <h2 className="text-[11px] uppercase tracking-wider font-semibold text-ink-muted">
-                    Available Harnesses &amp; Quotas
+                  <h2 className="settings-heading">
+                    Installed harnesses
                   </h2>
                   <button
                     type="button"
                     disabled={quotasRefreshing || saving !== null}
                     onClick={() => void refreshQuotasLive()}
-                    className="inline-flex items-center gap-1.5 rounded-lg border border-line bg-elevated px-3 py-1.5 text-xs hover:bg-hover disabled:opacity-60"
+                    className="settings-button"
                   >
                     <RefreshCw
                       size={13}
@@ -559,7 +556,7 @@ export function SettingsDialog({ onClose }: { onClose: () => void }) {
                     return (
                       <section
                         key={probe.adapter_id}
-                        className="space-y-3 rounded-xl border border-line bg-elevated/55 p-4"
+                        className="settings-card space-y-3"
                       >
                         <div className="flex items-start gap-3">
                           <HarnessAvatar
@@ -745,7 +742,7 @@ export function SettingsDialog({ onClose }: { onClose: () => void }) {
                   <>
                     {/* Orchestrator & Session Members (installed only) */}
                     <section className="space-y-2.5">
-                      <h2 className="text-[11px] uppercase tracking-wider font-semibold text-ink-muted">
+                      <h2 className="settings-heading">
                         Session Roster &amp; Orchestrator
                       </h2>
                       <div className="space-y-1.5">
@@ -754,7 +751,7 @@ export function SettingsDialog({ onClose }: { onClose: () => void }) {
                           return (
                             <div
                               key={m.handle}
-                              className="space-y-2.5 rounded-xl border border-line bg-inset px-3 py-2"
+                              className="settings-card space-y-2.5"
                             >
                               <div className="flex items-center justify-between gap-2">
                               <div className="min-w-0">
@@ -773,12 +770,9 @@ export function SettingsDialog({ onClose }: { onClose: () => void }) {
 
                               <button
                                 type="button"
-                                onClick={async () => {
-                                  await api.patchSession(activeSession.id, {
-                                    orchestrator_member: isOrch ? null : m.handle,
-                                  });
-                                  await selectSession(activeSession.id);
-                                }}
+                                onClick={() => void updateSession((id) => api.patchSession(id, {
+                                  orchestrator_member: isOrch ? null : m.handle,
+                                }))}
                                 className={`inline-flex items-center gap-1 px-2.5 py-1 rounded-lg border text-[11px] shrink-0 transition-colors ${
                                   isOrch
                                     ? "bg-warn-soft border-warn/40 text-warn font-medium"
@@ -806,7 +800,7 @@ export function SettingsDialog({ onClose }: { onClose: () => void }) {
 
                       {/* Add Persona */}
                       {installedAdapters.length > 0 && (
-                        <div className="rounded-xl border border-line bg-elevated/40 p-3 space-y-2.5">
+                        <div className="settings-card space-y-2.5">
                           <div className="flex items-center gap-1.5 font-medium text-ink">
                             <UserPlus className="w-3.5 h-3.5 text-brand-ink" />
                             <span>Add Custom Persona</span>
@@ -870,7 +864,7 @@ export function SettingsDialog({ onClose }: { onClose: () => void }) {
 
                     {/* Permission Policy & Hops */}
                     <section className="space-y-2.5 pt-3 border-t border-line">
-                      <h2 className="text-[11px] uppercase tracking-wider font-semibold text-ink-muted">
+                      <h2 className="settings-heading">
                         Permissions &amp; Loop Guard
                       </h2>
                       <p className="text-[11px] text-ink-muted">Changes apply to each persona’s next turn.</p>
@@ -881,12 +875,7 @@ export function SettingsDialog({ onClose }: { onClose: () => void }) {
                             <button
                               key={value}
                               type="button"
-                              onClick={async () => {
-                                await api.patchSession(activeSession.id, {
-                                  permission_policy: value,
-                                });
-                                await selectSession(activeSession.id);
-                              }}
+                              onClick={() => void updateSession((id) => api.patchSession(id, { permission_policy: value }))}
                               className={`w-full text-left px-3 py-2 rounded-xl border transition-colors ${
                                 active
                                   ? "bg-brand-soft border-brand text-ink"
@@ -912,11 +901,9 @@ export function SettingsDialog({ onClose }: { onClose: () => void }) {
                           min={2}
                           max={16}
                           value={activeSession.max_hops}
-                          onChange={async (e) => {
-                            await api.patchSession(activeSession.id, {
-                              max_hops: Number(e.target.value),
-                            });
-                            await selectSession(activeSession.id);
+                          onChange={(event) => {
+                            const maxHops = Number(event.target.value);
+                            void updateSession((id) => api.patchSession(id, { max_hops: maxHops }));
                           }}
                           className="w-full accent-indigo-500"
                         />
@@ -937,10 +924,7 @@ export function SettingsDialog({ onClose }: { onClose: () => void }) {
                               </span>
                               <button
                                 type="button"
-                                onClick={async () => {
-                                  await api.deletePermissionRule(activeSession.id, r.id);
-                                  await selectSession(activeSession.id);
-                                }}
+                                onClick={() => void updateSession((id) => api.deletePermissionRule(id, r.id))}
                                 className="text-ink-muted hover:text-neg"
                               >
                                 <Trash2 className="w-3 h-3" />

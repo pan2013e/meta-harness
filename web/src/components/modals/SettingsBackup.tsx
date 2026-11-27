@@ -1,25 +1,22 @@
+import { notifyInApp, reportInAppError } from "../../inAppNotifications";
 import { useState } from "react";
 import { api } from "../../api/client";
 import { useAppStore } from "../../store/useAppStore";
 
-const buttonClass = "rounded-lg border border-line bg-elevated px-3 py-1.5 text-ink-soft hover:bg-hover disabled:opacity-50";
+const buttonClass = "settings-button";
 
 export function SettingsBackup() {
   const theme = useAppStore((state) => state.theme);
   const importSettings = useAppStore((state) => state.importSettings);
   const [file, setFile] = useState<File | null>(null);
   const [working, setWorking] = useState(false);
-  const [error, setError] = useState<string | null>(null);
-  const [notice, setNotice] = useState<string | null>(null);
 
   const run = async (action: () => Promise<void>) => {
     setWorking(true);
-    setNotice(null);
-    setError(null);
     try {
       await action();
     } catch (error) {
-      setError(error instanceof Error ? error.message : String(error));
+      reportInAppError(error);
     } finally {
       setWorking(false);
     }
@@ -34,7 +31,7 @@ export function SettingsBackup() {
     link.download = "meta-harness-settings.json";
     link.click();
     setTimeout(() => URL.revokeObjectURL(url), 1000);
-    setNotice("Settings exported.");
+    notifyInApp("Settings exported.", "success");
   });
 
   const upload = () => run(async () => {
@@ -48,12 +45,12 @@ export function SettingsBackup() {
     }
     await importSettings(document);
     setFile(null);
-    setNotice("Settings imported.");
+    notifyInApp("Settings imported.", "success");
   });
 
   return (
-    <section className="space-y-2 rounded-xl border border-line bg-inset p-3">
-      <h2 className="font-semibold text-ink">Settings backup</h2>
+    <section className="settings-card space-y-3">
+      <h2 className="settings-heading">Settings backup</h2>
       <p className="text-ink-muted">Transfer your theme, harness model defaults, quota preferences, and global personas. Import merges records by harness or persona handle.</p>
       <div className="flex flex-wrap items-center gap-2">
         <button type="button" className={buttonClass} disabled={working} onClick={() => void download()}>
@@ -65,8 +62,6 @@ export function SettingsBackup() {
             className="sr-only" onChange={(event) => {
               setFile(event.target.files?.[0] ?? null);
               event.currentTarget.value = "";
-              setNotice(null);
-              setError(null);
             }} />
         </label>
         {file && (
@@ -78,8 +73,6 @@ export function SettingsBackup() {
           </>
         )}
       </div>
-      {notice && <p role="status" className="text-pos">{notice}</p>}
-      {error && <p role="alert" className="text-neg">{error}</p>}
     </section>
   );
 }

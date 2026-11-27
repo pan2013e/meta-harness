@@ -1,9 +1,10 @@
+import { notifyInApp, reportInAppError } from "../../inAppNotifications";
 import { useEffect, useState } from "react";
 import { api } from "../../api/client";
 import { useAppStore } from "../../store/useAppStore";
 import type { HarnessCliVersion, HarnessOperation } from "../../types/api";
 
-const actionClass = "rounded-lg border border-line bg-elevated px-2.5 py-1.5 text-xs text-ink-soft hover:bg-hover disabled:opacity-50";
+const actionClass = "settings-button";
 
 function signInLinks(output: string): string[] {
   const trustedDomains = ["openai.com", "chatgpt.com", "google.com", "antigravity.google", "claude.com", "claude.ai", "anthropic.com"];
@@ -31,7 +32,6 @@ export function HarnessMaintenance({ adapterId, profile, hasSavedProfile, offers
   const [operation, setOperation] = useState<HarnessOperation | null>(null);
   const [working, setWorking] = useState(false);
   const [code, setCode] = useState("");
-  const [error, setError] = useState<string | null>(null);
   const selectProfile = useAppStore((state) => state.selectHarnessProfile);
   const running = operation?.status === "running";
 
@@ -54,13 +54,19 @@ export function HarnessMaintenance({ adapterId, profile, hasSavedProfile, offers
         const { operation: next } = await api.harnessOperation(adapterId);
         if (!active) return;
         setOperation(next);
+        if (next?.status === "failed") {
+          notifyInApp(next.kind === "sign_in"
+            ? `@${adapterId} could not sign in. Check the profile status in Settings.`
+            : `@${adapterId} could not update its CLI.`, "error");
+        }
         if (next?.status === "completed") {
+          notifyInApp(next.kind === "sign_in" ? `@${adapterId} profile signed in.` : `@${adapterId} CLI updated.`, "success");
           setCode("");
           setVersion(null);
           void useAppStore.getState().refreshQuotasLive();
         }
       } catch (cause) {
-        if (active) setError(cause instanceof Error ? cause.message : String(cause));
+        if (active) reportInAppError(cause);
       } finally {
         pending = false;
       }
@@ -70,11 +76,10 @@ export function HarnessMaintenance({ adapterId, profile, hasSavedProfile, offers
 
   const run = async (action: () => Promise<void>) => {
     setWorking(true);
-    setError(null);
     try {
       await action();
     } catch (cause) {
-      setError(cause instanceof Error ? cause.message : String(cause));
+      reportInAppError(cause);
     } finally {
       setWorking(false);
     }
@@ -132,7 +137,6 @@ export function HarnessMaintenance({ adapterId, profile, hasSavedProfile, offers
           </button>
         )}
       </div>
-      {error && <p role="alert" className="text-neg">{error}</p>}
       {operation && (
         <div className="space-y-2 rounded-lg border border-line bg-inset px-2.5 py-2">
           <div className="flex items-center justify-between gap-2">

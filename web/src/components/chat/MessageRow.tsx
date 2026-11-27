@@ -9,6 +9,7 @@ import {
   ShieldAlert,
   Sparkles,
 } from "lucide-react";
+import { reportInAppError } from "../../inAppNotifications";
 import { api, messageImageUrl } from "../../api/client";
 import { selectionRangeWithin } from "../../desktop";
 import { useAppStore } from "../../store/useAppStore";
@@ -119,14 +120,14 @@ export const MessageRow = memo(function MessageRow({ message, consultReplies, on
             <div className="flex gap-2 pt-1">
               <button
                 type="button"
-                onClick={() => void api.confirmDispatch(message.session_id, dispatchId)}
+                onClick={() => void api.confirmDispatch(message.session_id, dispatchId).catch(reportInAppError)}
                 className="px-3 py-1 rounded-lg bg-amber-500 hover:bg-amber-400 text-zinc-950 font-semibold transition-colors"
               >
                 Confirm & Run
               </button>
               <button
                 type="button"
-                onClick={() => void api.cancelDispatch(message.session_id, dispatchId)}
+                onClick={() => void api.cancelDispatch(message.session_id, dispatchId).catch(reportInAppError)}
                 className="px-3 py-1 rounded-lg bg-elevated hover:bg-hover border border-line text-ink-soft transition-colors"
               >
                 Cancel

@@ -29,11 +29,11 @@ Run the desktop app and standalone binary from a standard user account. Meta-Har
 
 Download the installer or standalone binary for your platform and architecture from [GitHub Releases](https://github.com/pan2013e/meta-harness/releases).
 
-- **Desktop on Windows.** Run `meta-harness-desktop-windows-x64.exe` to install. To remove it, use **Settings → Apps → Installed apps**.
-- **Desktop on macOS.** Open the `meta-harness-desktop-macos-*.dmg` for your architecture and drag Meta-Harness into Applications. To remove it, quit and move Meta-Harness from Applications to the Trash.
+- **Desktop on Windows.** Install Meta-Harness from Microsoft Store once it is published, or open the Microsoft-signed `meta-harness-desktop-windows-x64.appx` (or `.appxbundle`) attached to its GitHub release after certification. To remove it, use **Settings → Apps → Installed apps**.
+- **Desktop on macOS.** Open the unsigned `meta-harness-desktop-macos-*.dmg` for your architecture and drag Meta-Harness into Applications. To remove it, quit and move Meta-Harness from Applications to the Trash.
 - **Standalone binary.** Run the downloaded `meta-harness-cli-*` file directly after making it executable on macOS (`chmod +x ./meta-harness-cli-macos-arm64` for Apple Silicon). Or run the download with `install` to copy it to a per-user bin directory. The command prints the installation path and tells you if the directory needs to be added to `PATH`.
 
-Desktop users can open **Settings → About → Check for updates**. **Update and quit** downloads and verifies the installer, then closes Meta-Harness and opens the installer. On macOS, drag the new app into Applications and choose **Replace**. On Windows, complete the installer to update the existing installation.
+On macOS, open **Settings → About → Check for updates**. **Update and quit** downloads and verifies the new image and opens it so you can replace the app in Applications. Windows Store builds use Store-managed updates. If you have an older Windows EXE installation, use the Store listing or GitHub release page for the first AppX installation.
 
 For the standalone binary, use `meta-harness update --check` to check the release feed and `meta-harness update` to download and replace the binary. Quit and restart any running instance to use the new version. `meta-harness uninstall` removes a copy installed with `install`. If you installed to a custom directory, pass the same `--bin-dir` to `uninstall`. Removing the desktop or standalone binary keeps your sessions, profiles, and settings.
 
@@ -57,6 +57,28 @@ node scripts/build.mjs --cli-only
 ```
 
 On Windows, the desktop build writes its GUI installer to `dist/desktop/meta-harness-desktop-windows-x64.exe` for an x64 build.
+
+### Microsoft Store package
+
+Start at [Microsoft Store developer registration](https://storedeveloper.microsoft.com/). After verification, reserve **Meta-Harness** in Partner Center and open its **Product identity** page. Copy the package name, publisher, and publisher display name exactly.
+
+On Windows, set those three values and build the Store package:
+
+```powershell
+$env:MH_STORE_IDENTITY_NAME = '<Package/Identity/Name>'
+$env:MH_STORE_PUBLISHER = '<Package/Identity/Publisher>'
+$env:MH_STORE_PUBLISHER_DISPLAY_NAME = '<Package/Properties/PublisherDisplayName>'
+node scripts/build.mjs --store
+```
+
+The build writes `dist/store/meta-harness-store-windows-x64.appx` on x64. Microsoft signs the package after certification and manages updates for the Store installation. Test the installed package before submission, including startup of the bundled backend, discovery and launch of locally installed harnesses, and file access in a selected project. Tell certification testers which external harnesses and sign-ins they need. [Microsoft Store readiness checklist](https://learn.microsoft.com/en-us/windows/apps/publish/store-readiness-checklist)
+
+### Sign your own build
+
+- **Windows.** Build an AppX with `node scripts/build.mjs --store`. For a local test build, use a unique package identity and set `MH_STORE_PUBLISHER` to the subject of your code-signing certificate, such as `CN=Meta-Harness Development`. Sign the resulting package with `signtool sign /fd SHA256 /sha1 <certificate-thumbprint> <package.appx>` from the Windows SDK. For a self-signed certificate, trust its public certificate in the test machine's **Local Computer → Trusted People** certificate store before installing the package. [Microsoft's AppX signing guide](https://learn.microsoft.com/windows/msix/package/sign-msix-package-guide)
+- **macOS.** For a personal copy, drag the app into Applications and sign it locally with `codesign --force --deep --sign - "/Applications/Meta-Harness.app"`. For distribution, sign a source build with your Developer ID Application certificate and notarize the packaged app. [Apple's distribution signing guide](https://developer.apple.com/documentation/xcode/creating-distribution-signed-code-for-the-mac)
+
+### Local development
 
 For quick local development against a hot-reloading frontend:
 
@@ -116,7 +138,7 @@ meta-harness/
 
 ### Versioning & Release Checks
 
-To publish a version, run the [Release build workflow](https://github.com/pan2013e/meta-harness/actions/workflows/release-build.yml) from its `vMAJOR.MINOR.PATCH` tag with **Publish a GitHub release** enabled. GitHub publishes the release once the Windows and macOS builds succeed.
+Run the [Release build workflow](https://github.com/pan2013e/meta-harness/actions/workflows/release-build.yml) from the `vMAJOR.MINOR.PATCH` tag with **Publish a GitHub release** enabled. It publishes the standalone binaries and unsigned macOS disk images. Submit the matching Windows AppX version to Partner Center. Once the Store listing is public, set the repository Actions variable `MH_STORE_PRODUCT_ID` to the 12-character public listing ID and make the listing available in the US market for catalog discovery. The [Store package workflow](https://github.com/pan2013e/meta-harness/actions/workflows/store-release-asset.yml) checks every six hours and can run manually. Its download job uses the public catalog client from the [Store package upload action](https://github.com/JasonWei512/Upload-Microsoft-Store-MSIX-Package-to-GitHub-Release). A separate Windows job checks the package identity, architecture, version, and signature before attaching it to the matching GitHub release.
 
 - Bump versions across Rust, web, and Electron manifests together with `node scripts/version.mjs <patch|minor|major>` and validate alignment with `node scripts/version.mjs --check`.
 - Pre-commit quality gates:

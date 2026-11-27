@@ -1,6 +1,7 @@
 pub mod auth;
 pub mod harness_jobs;
 pub mod mcp_bridge;
+pub mod proxy_health;
 pub mod pty;
 pub mod release;
 pub mod routes;
@@ -38,6 +39,10 @@ pub fn build_router(state: AppState) -> Router {
     let public_and_authed_api = Router::new()
         .route("/api/health", get(routes::health))
         .route("/api/update", get(release::check_handler))
+        .route(
+            "/api/settings/proxy",
+            get(proxy_health::status).post(proxy_health::check),
+        )
         .route("/api/auth/status", get(auth_status))
         .route("/api/auth/session", post(create_auth_session))
         .route("/api/fs/list", get(routes::list_fs))

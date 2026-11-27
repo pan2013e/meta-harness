@@ -230,7 +230,7 @@ async fn published_agy_version() -> Option<String> {
     let manifest = format!(
         "https://antigravity-cli-auto-updater-974169037036.us-central1.run.app/manifests/{os}_{arch}{libc}.json"
     );
-    let http = reqwest::Client::builder()
+    let http = crate::platform::outbound_http_builder()
         .timeout(Duration::from_secs(5))
         .build()
         .ok()?;
@@ -271,7 +271,7 @@ pub async fn cli_version(adapter: &AdapterConfig) -> CliVersion {
                 CliKind::Agy => "",
             };
             let result = async {
-                let http = reqwest::Client::builder()
+                let http = crate::platform::outbound_http_builder()
                     .timeout(Duration::from_secs(5))
                     .build()
                     .ok()?;

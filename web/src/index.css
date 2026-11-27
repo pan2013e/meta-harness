@@ -163,6 +163,20 @@ samp,
   font-variant-ligatures: contextual;
 }
 
+@layer components {
+  .settings-card {
+    @apply rounded-xl border border-line bg-elevated/55 p-4;
+  }
+
+  .settings-heading {
+    @apply text-sm font-semibold text-ink;
+  }
+
+  .settings-button {
+    @apply inline-flex items-center gap-1.5 rounded-lg border border-line bg-elevated px-3 py-1.5 text-xs font-medium text-ink-soft hover:bg-hover hover:text-ink disabled:opacity-50;
+  }
+}
+
 @layer base {
   :where(button, summary, a[href], select, input[type="checkbox"], input[type="radio"], input[type="range"], [role="button"]):not(:disabled, [aria-disabled="true"]) {
     cursor: pointer;

@@ -6,15 +6,27 @@ import { fileURLToPath } from "node:url";
 const root = fileURLToPath(new URL("../", import.meta.url));
 const windows = process.platform === "win32";
 const options = new Set(process.argv.slice(2));
+const store = options.has("--store");
 if (options.has("--help")) {
-  console.log("Usage: node scripts/build.mjs [--cli-only | --unpacked]");
+  console.log("Usage: node scripts/build.mjs [--cli-only | --unpacked | --store]");
   process.exit(0);
 }
 for (const arg of options) {
-  if (!["--cli-only", "--unpacked"].includes(arg)) throw new Error("Unknown build option: " + arg);
+  if (!["--cli-only", "--unpacked", "--store"].includes(arg)) throw new Error("Unknown build option: " + arg);
 }
-if (options.has("--cli-only") && options.has("--unpacked")) {
-  throw new Error("Choose --cli-only or --unpacked.");
+if (options.size > 1) {
+  throw new Error("Choose one of --cli-only, --unpacked, or --store.");
+}
+if (store && !windows) throw new Error("Build the Microsoft Store package on Windows.");
+
+const storeIdentity = store ? {
+  identityName: process.env.MH_STORE_IDENTITY_NAME?.trim(),
+  publisher: process.env.MH_STORE_PUBLISHER?.trim(),
+  publisherDisplayName: process.env.MH_STORE_PUBLISHER_DISPLAY_NAME?.trim(),
+} : null;
+if (storeIdentity && (!/^[a-z0-9.-]{3,50}$/i.test(storeIdentity.identityName ?? "") ||
+    !storeIdentity.publisher || !storeIdentity.publisherDisplayName)) {
+  throw new Error("Set MH_STORE_IDENTITY_NAME, MH_STORE_PUBLISHER, and MH_STORE_PUBLISHER_DISPLAY_NAME from Partner Center's Product identity page.");
 }
 
 function run(program, args, cwd = root, capture = false, env = process.env) {
@@ -29,6 +41,15 @@ function npm(args, folder) {
   const cwd = join(root, folder);
   if (windows) run("cmd.exe", ["/d", "/c", "npm", ...args], cwd);
   else run("npm", args, cwd);
+}
+
+function prepareDesktop(backend, binary) {
+  const desktop = join(root, "desktop");
+  const staging = join(desktop, "staging");
+  mkdirSync(staging, { recursive: true });
+  copyFileSync(backend, join(staging, binary));
+  npm(["ci"], "desktop");
+  return desktop;
 }
 
 function notices(rustHost) {
@@ -75,10 +96,23 @@ npm(["run", "build"], "web");
 const target = join(root, "target", "release-build");
 const binary = windows ? "meta-harness.exe" : "meta-harness";
 run("cargo", ["build", "--locked", "--release", "--bin", "meta-harness", "--target", rustHost, "--target-dir", target], root, false,
-  { ...process.env, MH_RELEASE_BUILD: "1" });
+  { ...process.env, MH_RELEASE_BUILD: store ? "0" : "1" });
+const backend = join(target, rustHost, "release", binary);
+if (storeIdentity) {
+  const desktop = prepareDesktop(backend, binary);
+  const storeEnv = { ...process.env, CSC_IDENTITY_AUTO_DISCOVERY: "false" };
+  delete storeEnv.CSC_LINK;
+  delete storeEnv.WIN_CSC_LINK;
+  run(process.execPath, [join(desktop, "node_modules", "electron-builder", "cli.js"),
+    "--win", "appx", `--${rustArch}`, "--publish", "never", "--config.directories.output=../dist/store",
+    ...Object.entries(storeIdentity).map(([key, value]) => `--config.appx.${key}=${value}`),
+  ], desktop, false, storeEnv);
+  console.log("Microsoft Store package written to " + join(root, "dist", "store"));
+  process.exit(0);
+}
 const cli = join(root, "dist", "cli");
 mkdirSync(cli, { recursive: true });
-copyFileSync(join(target, rustHost, "release", binary), join(cli, binary));
+copyFileSync(backend, join(cli, binary));
 copyFileSync(join(root, "LICENSE"), join(cli, "LICENSE.txt"));
 copyFileSync(join(root, "web", "public", "third-party-licenses.txt"), join(cli, "third-party-licenses.txt"));
 console.log("CLI release written to " + cli);
@@ -89,14 +123,11 @@ const cliAsset = `meta-harness-cli-${platform}-${rustArch}${windows ? ".exe" : "
 copyFileSync(join(cli, binary), join(releaseAssets, cliAsset));
 
 if (!options.has("--cli-only")) {
-  const staging = join(root, "desktop", "staging");
-  mkdirSync(staging, { recursive: true });
-  copyFileSync(join(cli, binary), join(staging, binary));
-  npm(["ci"], "desktop");
+  prepareDesktop(backend, binary);
   npm(["run", options.has("--unpacked") ? "pack" : "release"], "desktop");
   console.log("Desktop release written to " + join(root, "dist", "desktop"));
-  if (!options.has("--unpacked") && (windows || process.platform === "darwin")) {
-    const installer = `meta-harness-desktop-${platform}-${rustArch}.${windows ? "exe" : "dmg"}`;
+  if (!options.has("--unpacked") && process.platform === "darwin") {
+    const installer = `meta-harness-desktop-${platform}-${rustArch}.dmg`;
     copyFileSync(join(root, "dist", "desktop", installer), join(releaseAssets, installer));
   }
 }

@@ -24,6 +24,10 @@ pub enum AcpError {
     PermissionDenied(String),
     #[error("this harness does not accept image inputs")]
     ImageInputUnsupported,
+    #[error(
+        "The harness could not verify your sign-in. Retry when connected, or open Settings → Harnesses to sign in."
+    )]
+    AuthenticationRequired,
     #[error("ACP RPC error ({code}): {message}")]
     Rpc {
         code: i64,

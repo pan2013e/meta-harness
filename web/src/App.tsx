@@ -1,7 +1,8 @@
 import { useEffect, useState } from "react";
-import { KeyRound, Loader2, X } from "lucide-react";
+import { KeyRound, Loader2 } from "lucide-react";
 import { ChatPane } from "./components/chat/ChatPane";
 import { DesktopTitleBar } from "./components/common/DesktopTitleBar";
+import { NotificationViewport } from "./components/common/NotificationViewport";
 import { DiffReviewModal } from "./components/modals/DiffReviewModal";
 import { FilePreviewModal } from "./components/modals/FilePreviewModal";
 import { FolderPickerModal } from "./components/modals/FolderPickerModal";
@@ -21,6 +22,7 @@ export function App() {
     <div className="flex h-dvh w-full flex-col overflow-hidden bg-app text-ink">
       <DesktopTitleBar />
       <AppContent />
+      <NotificationViewport />
     </div>
   );
 }
@@ -32,7 +34,6 @@ function AppContent() {
     bootstrapping,
     startupPhase,
     startupTasks,
-    errorBanner,
     folderModalOpen,
     settingsOpen,
     memoryModalOpen,
@@ -45,7 +46,6 @@ function AppContent() {
     setFilePreview,
     createAndSelectProject,
     toggleSidebar,
-    clearError,
     init,
     authenticateWithToken,
   } = useAppStore();
@@ -93,11 +93,6 @@ function AppContent() {
           <p className="text-xs text-ink-muted leading-relaxed">
             Enter the pairing bearer token printed in the Meta-Harness server terminal.
           </p>
-          {errorBanner && (
-            <p role="alert" className="text-xs text-neg">
-              {errorBanner}
-            </p>
-          )}
           <input
             type="password"
             value={tokenInput}
@@ -119,19 +114,6 @@ function AppContent() {
 
   return (
     <div className="flex min-h-0 flex-1 flex-col overflow-hidden">
-      {errorBanner && (
-        <div className="bg-neg-soft border-b border-neg/35 px-4 py-1.5 text-xs text-neg flex items-center justify-between">
-          <span>{errorBanner}</span>
-          <button
-            type="button"
-            onClick={clearError}
-            className="text-neg hover:opacity-75 p-0.5"
-          >
-            <X className="w-3.5 h-3.5" />
-          </button>
-        </div>
-      )}
-
       {startupTasks.length > 0 && (
         <div role="status" className="flex shrink-0 items-center gap-2 border-b border-line bg-panel px-4 py-1.5 text-xs text-ink-muted">
           <Loader2 aria-hidden="true" className="h-3.5 w-3.5 shrink-0 animate-spin text-brand-ink motion-reduce:animate-none" />

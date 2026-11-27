@@ -1,3 +1,4 @@
+import { notifyInApp, reportInAppError } from "../../inAppNotifications";
 import { useRef, useState } from "react";
 import {
   ChevronDown,
@@ -19,8 +20,7 @@ import { FolderPickerModal } from "./FolderPickerModal";
 
 const fieldClass =
   "w-full min-w-0 rounded-lg border border-line bg-inset px-2.5 py-1.5 text-ink focus:outline-none focus:border-brand";
-const actionClass =
-  "inline-flex items-center gap-1.5 rounded-lg border border-line bg-elevated px-2.5 py-1.5 text-ink-soft hover:bg-hover hover:text-ink disabled:opacity-50 transition-colors";
+const actionClass = "settings-button";
 
 function sourceLabel(source: SkillSource): { text: string; cls: string } {
   switch (source) {
@@ -42,8 +42,6 @@ export function SkillsSettings() {
     useAppStore();
 
   const [busy, setBusy] = useState(false);
-  const [error, setError] = useState<string | null>(null);
-  const [notice, setNotice] = useState<string | null>(null);
 
   const [folderPickerOpen, setFolderPickerOpen] = useState(false);
   const [installMode, setInstallMode] = useState<"none" | "git" | "custom">("none");
@@ -66,12 +64,10 @@ export function SkillsSettings() {
 
   const runAction = async (fn: () => Promise<void>) => {
     setBusy(true);
-    setError(null);
-    setNotice(null);
     try {
       await fn();
     } catch (cause) {
-      setError(cause instanceof Error ? cause.message : String(cause));
+      reportInAppError(cause);
     } finally {
       setBusy(false);
     }
@@ -82,7 +78,6 @@ export function SkillsSettings() {
     setExpandedId(skill.id);
     setDetail(null);
     setDetailLoading(true);
-    setError(null);
     try {
       const res = await api.getSkillDetail(skill.id, {
         projectId: activeProjectId,
@@ -92,7 +87,7 @@ export function SkillsSettings() {
       setDetail(res.detail);
       setDraftContent(res.detail.content);
     } catch (cause) {
-      if (request === detailRequest.current) setError(cause instanceof Error ? cause.message : String(cause));
+      if (request === detailRequest.current) reportInAppError(cause);
     } finally {
       if (request === detailRequest.current) setDetailLoading(false);
     }
@@ -110,17 +105,15 @@ export function SkillsSettings() {
   };
 
   const handleInstallFolder = async (folderPath: string) => {
-    setError(null);
-    setNotice(null);
     setBusy(true);
     try {
       const res = await api.installSkillFromFolder(folderPath);
       await refreshSkills();
       setFolderPickerOpen(false);
-      setNotice(
+      notifyInApp(
         `Installed ${res.installed.length} skill${res.installed.length === 1 ? "" : "s"} (${res.installed
           .map((s) => `/${s.id}`)
-          .join(", ")}).`
+          .join(", ")}).`, "success",
       );
     } finally {
       setBusy(false);
@@ -135,10 +128,10 @@ export function SkillsSettings() {
       setGitUrl("");
       setGitSubpath("");
       setInstallMode("none");
-      setNotice(
+      notifyInApp(
         `Installed ${res.installed.length} skill${res.installed.length === 1 ? "" : "s"} (${res.installed
           .map((s) => `/${s.id}`)
-          .join(", ")}).`
+          .join(", ")}).`, "success",
       );
     });
   };
@@ -157,7 +150,7 @@ export function SkillsSettings() {
       setCustomId("");
       setCustomDesc("");
       setInstallMode("none");
-      setNotice(`Created custom skill /${res.skill.id}.`);
+      notifyInApp(`Created custom skill /${res.skill.id}.`, "success");
     });
   };
 
@@ -171,7 +164,7 @@ export function SkillsSettings() {
       await refreshSkills();
       setDetail(res.detail);
       setDraftContent(res.detail.content);
-      setNotice(`Saved ${res.detail.file_path} for /${res.detail.skill.id}.`);
+      notifyInApp(`Saved ${res.detail.file_path} for /${res.detail.skill.id}.`, "success");
     });
   };
 
@@ -184,7 +177,7 @@ export function SkillsSettings() {
         setDetail(refreshed.detail);
         setDraftContent(refreshed.detail.content);
       }
-      setNotice(`Restored /${res.skill.id} to built-in version.`);
+      notifyInApp(`Restored /${res.skill.id} to built-in version.`, "success");
     });
   };
 
@@ -197,7 +190,7 @@ export function SkillsSettings() {
         setDetail(null);
       }
       await refreshSkills();
-      setNotice(`Uninstalled /${id}.`);
+      notifyInApp(`Uninstalled /${id}.`, "success");
     });
   };
 
@@ -205,9 +198,8 @@ export function SkillsSettings() {
     <section className="space-y-4 text-xs">
       <div className="flex flex-wrap items-start justify-between gap-2">
         <div className="min-w-0">
-          <h2 className="font-semibold text-ink">Agent Skills</h2>
           <p className="mt-1 text-ink-muted">
-            Installed skills are available to all harnesses via MCP (`skill_list` / `skill_read`), brokered read-only access, and{" "}
+            Installed skills are available to every harness and through{" "}
             <code className="font-mono text-skill">/skill</code> composer commands.
           </p>
           {skillsDir && (
@@ -260,14 +252,6 @@ export function SkillsSettings() {
         </button>
       </div>
 
-      {error && (
-        <p role="alert" className="rounded-lg bg-neg-soft border border-neg/30 px-3 py-2 text-neg">
-          {error}
-        </p>
-      )}
-      {notice && (
-        <p className="rounded-lg bg-pos-soft border border-pos/30 px-3 py-2 text-pos">{notice}</p>
-      )}
 
       {/* Install from Git URL Form */}
       {installMode === "git" && (
@@ -276,7 +260,7 @@ export function SkillsSettings() {
             e.preventDefault();
             void handleInstallGit();
           }}
-          className="space-y-2.5 rounded-xl border border-line bg-inset p-3.5"
+          className="settings-card space-y-2.5"
         >
           <div className="font-medium text-ink">Install from Git / GitHub Repository</div>
           <div className="grid grid-cols-1 sm:grid-cols-3 gap-2">
@@ -332,7 +316,7 @@ export function SkillsSettings() {
             e.preventDefault();
             void handleCreateCustom();
           }}
-          className="space-y-2.5 rounded-xl border border-line bg-inset p-3.5"
+          className="settings-card space-y-2.5"
         >
           <div className="font-medium text-ink">Create Custom Skill</div>
           <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
@@ -415,7 +399,7 @@ export function SkillsSettings() {
           return (
             <article
               key={`${skill.source}:${skill.id}`}
-              className="rounded-xl border border-line bg-elevated/55 p-3.5 space-y-2"
+              className="settings-card space-y-2"
             >
               <div className="flex items-start justify-between gap-3">
                 <div className="min-w-0 flex-1 space-y-1">
@@ -531,7 +515,7 @@ export function SkillsSettings() {
               </div>
 
               {isExpanded && (
-                <div className="space-y-2 rounded-xl border border-line bg-inset p-3">
+                <div className="settings-card space-y-3">
                   <div className="flex flex-wrap items-center gap-1.5 border-b border-line pb-2">
                     {skill.files.map((f) => (
                       <button

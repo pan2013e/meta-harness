@@ -122,21 +122,22 @@ Open **Settings** in the bottom-left sidebar.
 ![Settings: Harnesses, Models, & Quotas](media/settings-harnesses.png)
 
 - **Appearance:** Switch between **Obsidian Studio** (default), **Tokyo Night**, **Catppuccin Mocha**, and **Paper Daylight**.
-- **Notifications:** Opt in to approval requests and finished turns. The desktop app uses system notifications. In the standalone web app, click **Enable browser notifications** and keep the browser tab open to receive them.
+- **Notifications:** Status updates and errors appear in dismissible pop-ups in the app. Opt in to system or browser notifications for approval requests and finished turns while away from the chat. In the standalone web app, click **Enable browser notifications** and keep the tab open to receive them.
 - **Harnesses & Models:**
   - Inspect CLI availability, live subscription usage windows, **Check CLI version**, and **Upgrade CLI** where supported.
   - Set adapter-level **Default Model** and **Default Reasoning Effort**.
   - **Separate Profiles:** Click **Create profile & sign in** (or **Use device code** on Codex) to isolate a harness account directory without disturbing your default CLI profile, and switch back anytime with **Use default CLI profile** / **Use saved separate profile**. You can also pin custom directories via `profile_dir` in `harnesses.toml`.
-  - **Antigravity:** Open the Google link for the current sign-in attempt and submit its code or full callback URL. Windows can share credentials through its credential store even when conversation history uses a separate directory.
+  - **Antigravity:** If the harness asks for authentication, open Harnesses settings and choose to sign in when ready. Open the Google link for that attempt and submit its code or full callback URL. Windows can share credentials through its credential store even when conversation history uses a separate directory.
 - **Skills:** Enable/disable installed skills, inspect or edit `SKILL.md` and `references/` files, reset the preinstalled **`Meta-Harness Docs`** (`/meta-harness-docs`) guide, or install additional `SKILL.md` bundles via **Install Folder…**, **Install from Git URL**, or **New Custom Skill**. Repo-local `.agents/skills/` bundles are also discovered automatically.
 - **Global Personas:** Define reusable specialist handles (e.g., `@codex-reviewer`) with custom instructions, adapter binding, and default model/effort. New sessions automatically include templates whose harness is installed, or click **Add to session** for an active chat.
 - **Session:** Reassign the session **Orchestrator**, manage active member models/personas, adjust approval policy, tune **Max Agent Hops** (`2–16`), and prune saved command allow-rules.
-- **Network** in the desktop app accepts an outbound proxy URL. **Save and restart** applies it to the desktop app, its backend, and proxy-aware harness traffic. If the explicit proxy cannot be reached at startup, Meta-Harness connects directly and shows **Proxy not used**. Automatic mode uses the startup proxy environment or the Windows manual system proxy when available.
+- **Network** shows the server proxy status and a **Check now** button for an explicit proxy. Meta-Harness checks the proxy at startup and every minute by requesting HTTP 204 from `https://www.gstatic.com/generate_204`. A failed check switches to direct connections and shows **Proxy not used**. A successful check restores proxy routing. The desktop app saves the proxy URL and restarts when you change it. The standalone app reads its explicit URL from `--proxy` at startup.
+- New network requests and subprocesses follow the current route. ACP harnesses switch on their next turn. A running turn or an open shell keeps its launch environment.
 - **Storage & Data:**
   - View itemized disk usage across SQLite DB, active project worktrees, Quick Sessions, archived sessions, and orphan caches.
   - Run **Clear Caches & Orphans** or **Delete Archived Sessions**.
   - **Settings backup:** Export/import versioned JSON containing your theme, harness model defaults, quota preferences, and global personas.
-- **About:** Displays app version, 6-character build commit, repository link, and third-party license notices.
+- **About:** Displays app version, 6-character build commit, and repository link. Open third-party license notices in the read-only viewer.
 
 ---
 
@@ -157,7 +158,7 @@ meta-harness serve [OPTIONS]
 | `--no-open` | Do not automatically launch a browser tab | Opens on loopback |
 | `--no-tray` | Run in the foreground without system tray / menu bar icon | Tray enabled on Windows/macOS releases |
 | `--config <PATH>` | Path to `harnesses.toml` configuration | Auto-discovered |
-| `--proxy <URL>` | Outbound proxy for the server and its child processes. An unreachable explicit proxy falls back to a direct connection at startup. | Startup proxy environment or Windows manual proxy |
+| `--proxy <URL>` | Outbound proxy for the server and its child processes. Failed checks switch to direct routing and successful checks restore the proxy. | Startup proxy environment or Windows manual proxy |
 | `--data-dir <PATH>` | Override SQLite database & app data directory | OS app-data dir |
 | `MH_CONFIG_DIR`, `MH_DATA_DIR`, `MH_WORKSPACE_DIR` | Override config, data, and Quick Session directories | OS standard dirs / `~/.meta-harness/workspaces` |
 

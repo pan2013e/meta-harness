@@ -1,6 +1,7 @@
 import { create } from "zustand";
 import { api, WsHubClient } from "../api/client";
 import { showNotification } from "../notifications";
+import { notifyInApp, reportInAppError } from "../inAppNotifications";
 import type {
   AdapterConfig,
   AdapterModelCatalog,
@@ -35,6 +36,7 @@ import type {
 
 export type DrawerTab = "trajectory" | "memory" | "settings";
 export type StartupTask = "workspace" | "models" | "quota";
+export type SettingsSection = "appearance" | "notifications" | "harnesses" | "skills" | "personas" | "session" | "network" | "storage" | "about";
 
 const VALID_THEMES: ThemeId[] = ["obsidian", "tokyo-night", "catppuccin", "daylight"];
 
@@ -84,19 +86,18 @@ interface AppState {
   bootstrapping: boolean;
   startupPhase: "connecting" | "detecting";
   startupTasks: StartupTask[];
-  errorBanner: string | null;
 
   theme: ThemeId;
   sidebarCollapsed: boolean;
   folderModalOpen: boolean;
   settingsOpen: boolean;
+  settingsSection: SettingsSection;
   memoryModalOpen: boolean;
   diffModalOpen: boolean;
   filePreview: { sessionId: string; path: string } | null;
   shellOpen: boolean;
   pickingFolder: boolean;
   quotasRefreshing: boolean;
-  promoteBanner: string | null;
   pendingPermissionPolicy: PermissionPolicy;
   notificationPreferences: NotificationPreferences;
 
@@ -155,11 +156,11 @@ interface AppState {
   toggleSidebar: () => void;
   setFolderModalOpen: (open: boolean) => void;
   setSettingsOpen: (open: boolean) => void;
+  setSettingsSection: (section: SettingsSection) => void;
   setMemoryModalOpen: (open: boolean) => void;
   setDiffModalOpen: (open: boolean) => void;
   setFilePreview: (file: { sessionId: string; path: string } | null) => void;
   setShellOpen: (open: boolean) => void;
-  setPromoteBanner: (msg: string | null) => void;
   setPendingPermissionPolicy: (policy: PermissionPolicy) => void;
   saveNotificationPreferences: (prefs: NotificationPreferences) => Promise<void>;
   resolvePermission: (sessionId: string, requestId: string, optionId: string, pattern?: string) => Promise<void>;
@@ -167,7 +168,6 @@ interface AppState {
 
   init: () => Promise<void>;
   authenticateWithToken: (token: string) => Promise<void>;
-  clearError: () => void;
   setError: (msg: string) => void;
 
   selectProject: (projectId: string | null) => Promise<void>;
@@ -242,7 +242,6 @@ const emptySessionState = {
   sessionDiff: null,
   sessionContext: null,
   hopPaused: null,
-  promoteBanner: null,
   messages: [],
   trajectories: [],
   turnEvents: {},
@@ -275,7 +274,7 @@ export const useAppStore = create<AppState>((set, get) => {
   };
 
   const reportError = (error: unknown) =>
-    set({ errorBanner: error instanceof Error ? error.message : String(error) });
+    reportInAppError(error);
 
   return {
     authRequired: false,
@@ -283,7 +282,6 @@ export const useAppStore = create<AppState>((set, get) => {
     bootstrapping: true,
     startupPhase: "connecting",
     startupTasks: [],
-    errorBanner: null,
 
     theme: getInitialTheme(),
     sidebarCollapsed:
@@ -291,13 +289,13 @@ export const useAppStore = create<AppState>((set, get) => {
       window.matchMedia?.("(max-width: 1023px)").matches === true,
     folderModalOpen: false,
     settingsOpen: false,
+    settingsSection: "harnesses",
     memoryModalOpen: false,
     diffModalOpen: false,
     filePreview: null,
     shellOpen: false,
     pickingFolder: false,
     quotasRefreshing: false,
-    promoteBanner: null,
     pendingPermissionPolicy: "require_approval",
     notificationPreferences: { approval_requests: false, turn_completions: false },
 
@@ -353,12 +351,12 @@ export const useAppStore = create<AppState>((set, get) => {
     },
     toggleSidebar: () => set((s) => ({ sidebarCollapsed: !s.sidebarCollapsed })),
     setFolderModalOpen: (open) => set({ folderModalOpen: open }),
-    setSettingsOpen: (open) => set({ settingsOpen: open }),
+    setSettingsOpen: (open) => set({ settingsOpen: open, settingsSection: "harnesses" }),
+    setSettingsSection: (section) => set({ settingsSection: section }),
     setMemoryModalOpen: (open) => set({ memoryModalOpen: open }),
     setDiffModalOpen: (open) => set({ diffModalOpen: open }),
     setFilePreview: (file) => set({ filePreview: file }),
     setShellOpen: (open) => set({ shellOpen: open }),
-    setPromoteBanner: (msg) => set({ promoteBanner: msg }),
     setPendingPermissionPolicy: (policy) => set({ pendingPermissionPolicy: policy }),
     saveNotificationPreferences: async (prefs) => {
       set({ notificationPreferences: await api.saveNotificationPreferences(prefs) });
@@ -386,8 +384,7 @@ export const useAppStore = create<AppState>((set, get) => {
       }
     },
 
-    clearError: () => set({ errorBanner: null }),
-    setError: (msg) => set({ errorBanner: msg }),
+    setError: (message) => notifyInApp(message, "error"),
 
     init: async () => {
       if (initializing) return;
@@ -443,7 +440,10 @@ export const useAppStore = create<AppState>((set, get) => {
             const sessionId = sessionLoad?.id ?? get().activeSession?.id;
             if (sessionId) void get().selectSession(sessionId);
           },
-          () => set({ authenticated: false, authRequired: true, errorBanner: "Session expired. Enter the access token again." })
+          () => {
+            set({ authenticated: false, authRequired: true });
+            notifyInApp("Session expired. Enter the access token again.", "warning");
+          }
         );
         ws.connect(null);
 
@@ -480,8 +480,8 @@ export const useAppStore = create<AppState>((set, get) => {
           bootstrapping: false,
           startupTasks: [],
           ...(auth && { authRequired: auth.required, authenticated: auth.authenticated }),
-          errorBanner: e instanceof Error ? e.message : String(e),
         });
+        reportInAppError(e);
       } finally {
         initializing = false;
       }
@@ -489,7 +489,7 @@ export const useAppStore = create<AppState>((set, get) => {
 
     authenticateWithToken: async (token: string) => {
       if (get().bootstrapping || !token) return;
-      set({ bootstrapping: true, startupPhase: "connecting", errorBanner: null });
+      set({ bootstrapping: true, startupPhase: "connecting" });
       try {
         await api.createAuthSession(token);
         await get().init();
@@ -544,7 +544,6 @@ export const useAppStore = create<AppState>((set, get) => {
       set((state) => ({
         projects: [project, ...state.projects.filter((existing) => existing.id !== project.id)],
         folderModalOpen: false,
-        errorBanner: null,
       }));
       await get().selectProject(project.id);
     },
@@ -981,7 +980,7 @@ export const useAppStore = create<AppState>((set, get) => {
           });
         }
       } catch (e) {
-        set({ errorBanner: e instanceof Error ? e.message : String(e) });
+        reportInAppError(e);
       } finally {
         set({ quotasRefreshing: false });
       }
@@ -1012,6 +1011,13 @@ export const useAppStore = create<AppState>((set, get) => {
       if (sessionLoad && eventSessionId === sessionLoad.id) {
         sessionLoad.events.push(ev);
         return;
+      }
+      if ((ev.type === "chat.message_created" || ev.type === "chat.message_completed") && ev.message.metadata.error === true) {
+        const needsSignIn = ev.message.metadata.authentication_required === true;
+        notifyInApp(ev.message.content, needsSignIn ? "warning" : "error", needsSignIn ? {
+          label: "Open harness settings",
+          run: () => set({ settingsOpen: true, settingsSection: "harnesses" }),
+        } : undefined);
       }
       const activeSid = get().activeSession?.id;
       switch (ev.type) {

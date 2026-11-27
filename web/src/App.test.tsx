@@ -2,6 +2,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { App } from "./App";
 import { MarkdownBlock } from "./components/common/MarkdownBlock";
+import { NotificationViewport } from "./components/common/NotificationViewport";
 import { formatCreditsDisplay, QuotaMeter, QuotaSnapshotSummary } from "./components/common/Badges";
 import { DiffViewer } from "./components/common/DiffViewer";
 import { ChatPane } from "./components/chat/ChatPane";
@@ -22,13 +23,34 @@ import { TrajectoryRow } from "./components/drawer/TrajectoryRow";
 import { terminalDirectory } from "./components/chat/terminalPaths";
 import { api, WsHubClient } from "./api/client";
 import { useAppStore } from "./store/useAppStore";
+import { notifyInApp, useInAppNotifications } from "./inAppNotifications";
 import type { ChatMessage, PendingPermissionView, TrajectoryEvent, TurnTrajectory } from "./types/api";
 
 afterEach(() => {
   cleanup();
   vi.restoreAllMocks();
   vi.unstubAllGlobals();
+  vi.useRealTimers();
   useAppStore.setState(useAppStore.getInitialState(), true);
+  useInAppNotifications.setState({ items: [] });
+});
+
+it("deduplicates in-app notices and supports dismissal and timed fade", () => {
+  vi.useFakeTimers();
+  render(<NotificationViewport />);
+  act(() => {
+    notifyInApp("Could not save the setting.", "error");
+    notifyInApp("Could not save the setting.", "error");
+  });
+  expect(screen.getAllByRole("alert")).toHaveLength(1);
+  fireEvent.click(screen.getByRole("button", { name: "Dismiss notification" }));
+  expect(screen.queryByRole("alert")).toBeNull();
+
+  act(() => notifyInApp("Settings saved.", "success"));
+  act(() => vi.advanceTimersByTime(6500));
+  expect(screen.getByRole("status").parentElement?.parentElement?.classList.contains("opacity-0")).toBe(true);
+  act(() => vi.advanceTimersByTime(220));
+  expect(screen.queryByRole("status")).toBeNull();
 });
 
 describe("Opening project folders", () => {
@@ -87,13 +109,15 @@ it("delivers enabled desktop notifications for activity in another session", () 
   expect(notify).toHaveBeenCalledExactlyOnceWith("@codex is waiting for approval.");
 });
 
-it("shows an inactive proxy badge without an error when the saved proxy is unreachable", async () => {
-  vi.stubGlobal("metaHarnessDesktop", {
-    proxySettings: vi.fn().mockResolvedValue({ host: "proxy.example:8080", proxyNotUsed: true }),
-  });
+it("shows direct fallback and recovery from a manual proxy check", async () => {
+  vi.spyOn(api, "proxyStatus").mockResolvedValue({ host: "proxy.example:8080", checked_at: 1, proxy_not_used: true });
+  const check = vi.spyOn(api, "checkProxy").mockResolvedValue({ host: "proxy.example:8080", checked_at: 2, proxy_not_used: false });
   render(<NetworkSettings />);
   await screen.findByText("Proxy not used");
   expect(screen.queryByRole("alert")).toBeNull();
+  fireEvent.click(screen.getByRole("button", { name: "Check now" }));
+  await screen.findByText("Proxy active");
+  expect(check).toHaveBeenCalledTimes(1);
 });
 
 it("switches away from a session while its background deletion is pending", async () => {
@@ -505,6 +529,37 @@ describe("UI primitives", () => {
     fireEvent.click(await screen.findByRole("button", { name: "Update and quit" }));
     expect(check).toHaveBeenCalledWith("desktop");
     expect(installUpdate).toHaveBeenCalledWith("0.6.1");
+  });
+
+  it("shows Microsoft Store update ownership for the packaged Windows app", () => {
+    vi.stubGlobal("metaHarnessDesktop", { windowsStore: true });
+    const check = vi.spyOn(api, "checkForUpdate");
+    render(<AboutUpdates />);
+    expect(screen.getByText("Microsoft Store manages updates for this build.")).toBeTruthy();
+    expect(screen.queryByRole("button", { name: "Check for updates" })).toBeNull();
+    expect(check).not.toHaveBeenCalled();
+  });
+
+  it("opens third-party notices as read-only text within Settings", async () => {
+    const previous = HTMLDialogElement.prototype.showModal;
+    HTMLDialogElement.prototype.showModal = function () { this.setAttribute("open", ""); };
+    try {
+      vi.spyOn(api, "buildInfo").mockResolvedValue({ version: "0.9.0", commit: null, release_build: false });
+      vi.stubGlobal("fetch", vi.fn().mockResolvedValue(new Response("Dependency notices", {
+        headers: { "content-type": "text/plain; charset=utf-8" },
+      })));
+      render(<SettingsDialog onClose={() => {}} />);
+      fireEvent.click(screen.getByRole("button", { name: "About" }));
+      fireEvent.click(screen.getByRole("button", { name: "Third-party license notices" }));
+      const dialog = screen.getByRole("dialog", { name: "Settings" });
+      const notices = await within(dialog).findByText("Dependency notices");
+      expect(notices.tagName).toBe("PRE");
+      expect(dialog.querySelector("a[download]")).toBeNull();
+      fireEvent.click(within(dialog).getByRole("button", { name: "Back to About" }));
+      expect(within(dialog).getByRole("heading", { name: "Meta-Harness" })).toBeTruthy();
+    } finally {
+      HTMLDialogElement.prototype.showModal = previous;
+    }
   });
 
   it("shows a shared usage note with private-profile quota windows in compact views", () => {
@@ -1383,7 +1438,7 @@ describe("UI primitives", () => {
     });
     vi.spyOn(api, "listStandaloneSessions").mockResolvedValue({ sessions: [] });
 
-    render(<SettingsDialog onClose={() => {}} />);
+    render(<><SettingsDialog onClose={() => {}} /><NotificationViewport /></>);
     fireEvent.click(screen.getByRole("button", { name: "Storage & Data" }));
 
     await waitFor(() => {
@@ -1396,7 +1451,8 @@ describe("UI primitives", () => {
     fireEvent.click(screen.getByRole("button", { name: "Delete sessions" }));
     await waitFor(() => {
       expect(api.cleanupStorage).toHaveBeenCalledWith("delete_archived");
-      expect(screen.getByText(/Deleted 2 archived sessions/)).toBeTruthy();
+      expect(within(screen.getByRole("dialog", { name: "Settings" })).getByRole("status").textContent)
+        .toMatch(/Deleted 2 archived sessions/);
     });
   });
 

@@ -8,6 +8,7 @@ import {
   Search,
   X,
 } from "lucide-react";
+import { notifyInApp, reportInAppError } from "../../inAppNotifications";
 import { api } from "../../api/client";
 import { useAppStore } from "../../store/useAppStore";
 import type { FsEntry } from "../../types/api";
@@ -69,7 +70,6 @@ export function FolderPickerModal({
   const [submitting, setSubmitting] = useState(false);
   const [manualPath, setManualPath] = useState("");
   const [selectedPath, setSelectedPath] = useState("");
-  const [err, setErr] = useState<string | null>(null);
   const browseRequest = useRef<AbortController | null>(null);
   const openRequest = useRef<AbortController | null>(null);
 
@@ -81,7 +81,6 @@ export function FolderPickerModal({
     const timeout = AbortSignal.timeout(10_000);
     const signal = AbortSignal.any([request.signal, timeout]);
     setLoading(true);
-    setErr(null);
     setFilterQuery("");
     try {
       const res = await api.listFs(target, signal);
@@ -98,7 +97,7 @@ export function FolderPickerModal({
     } catch (e) {
       if (!request.signal.aborted) {
         const message = e instanceof Error ? e.message : String(e);
-        setErr(timeout.aborted ? "Reading folders timed out. Try entering the folder path directly." : message);
+        notifyInApp(timeout.aborted ? "Reading folders timed out. Try entering the folder path directly." : message, "error");
       }
     } finally {
       if (browseRequest.current === request) {
@@ -122,11 +121,10 @@ export function FolderPickerModal({
     const request = new AbortController();
     openRequest.current = request;
     setSubmitting(true);
-    setErr(null);
     try {
       await onSelect(cleaned, request.signal);
     } catch (e) {
-      if (!request.signal.aborted) setErr(e instanceof Error ? e.message : String(e));
+      if (!request.signal.aborted) reportInAppError(e);
     } finally {
       openRequest.current = null;
       if (!request.signal.aborted) setSubmitting(false);
@@ -259,12 +257,6 @@ export function FolderPickerModal({
                   <span className="truncate max-w-[140px]">{p.name}</span>
                 </button>
               ))}
-            </div>
-          )}
-
-          {err && (
-            <div role="alert" className="rounded-xl bg-neg-soft border border-neg/30 px-3 py-2 text-xs text-neg">
-              {err}
             </div>
           )}
 

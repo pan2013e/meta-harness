@@ -1,3 +1,4 @@
+import { notifyInApp, reportInAppError } from "../../inAppNotifications";
 import { useState } from "react";
 import { Pencil, Plus, Trash2 } from "lucide-react";
 import { api } from "../../api/client";
@@ -6,7 +7,7 @@ import type { GlobalPersona } from "../../types/api";
 import { PersonaModelFields } from "./PersonaModelFields";
 
 const fieldClass = "w-full min-w-0 rounded-lg border border-line bg-inset px-2.5 py-1.5 text-ink";
-const actionClass = "rounded-lg border border-line bg-elevated px-2.5 py-1.5 text-ink-soft hover:bg-hover disabled:opacity-50";
+const actionClass = "settings-button";
 
 export function GlobalPersonas() {
   const {
@@ -15,16 +16,14 @@ export function GlobalPersonas() {
   } = useAppStore();
   const [editor, setEditor] = useState<{ persona: GlobalPersona; creating: boolean } | null>(null);
   const [saving, setSaving] = useState(false);
-  const [error, setError] = useState<string | null>(null);
   const adapterIds = Object.keys(adapters);
 
   const run = async (action: () => Promise<void>) => {
     setSaving(true);
-    setError(null);
     try {
       await action();
     } catch (error) {
-      setError(error instanceof Error ? error.message : String(error));
+      reportInAppError(error);
     } finally {
       setSaving(false);
     }
@@ -59,7 +58,7 @@ export function GlobalPersonas() {
     if (!editor) return;
     const handle = editor.persona.handle.trim().replace(/^@+/, "").toLowerCase();
     if (editor.creating && globalPersonas.some((persona) => persona.handle === handle)) {
-      setError("That persona already exists. Edit it from the list.");
+      notifyInApp("That persona already exists. Edit it from the list.", "error");
       return;
     }
     await run(async () => {
@@ -72,7 +71,6 @@ export function GlobalPersonas() {
     <section className="space-y-4 text-xs">
       <div className="flex flex-wrap items-start justify-between gap-2">
         <div>
-          <h2 className="font-semibold text-ink">Global personas</h2>
           <p className="mt-1 text-ink-muted">New sessions include personas with available harnesses. You can also add them to the current session.</p>
         </div>
         <button type="button" className={actionClass} disabled={saving || !adapterIds.length}
@@ -80,9 +78,8 @@ export function GlobalPersonas() {
           <Plus className="mr-1 inline h-3.5 w-3.5" /> New global persona
         </button>
       </div>
-      {error && <p role="alert" className="text-neg">{error}</p>}
       {editor && (
-        <form className="space-y-3 rounded-xl border border-line bg-inset p-3"
+        <form className="settings-card space-y-3"
           onSubmit={(event) => { event.preventDefault(); void save(); }}>
           <div className="grid gap-2 sm:grid-cols-3">
             <label className="space-y-1">
@@ -126,7 +123,7 @@ export function GlobalPersonas() {
         const installed = probes.some((probe) => probe.adapter_id === persona.adapter_id && probe.installed);
         const inSession = members.some((member) => member.handle.toLowerCase() === persona.handle);
         return (
-          <article key={persona.handle} className="space-y-2 rounded-xl border border-line bg-inset px-3 py-2.5">
+          <article key={persona.handle} className="settings-card space-y-2">
             <div className="flex flex-wrap items-center justify-between gap-2">
               <div className="min-w-0">
                 <h3 className="break-words font-medium text-ink">{persona.display_name}</h3>

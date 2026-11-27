@@ -51,7 +51,9 @@ jobs:
           test "$CLI_ONLY" = false
           test "$GITHUB_REF_TYPE" = tag
           test "$GITHUB_REF_NAME" = "v$(node -p 'require("./web/package.json").version')"
-      - run: node scripts/build.mjs ${{ inputs.cli_only && '--cli-only' || '' }}
+      - run: node scripts/build.mjs ${{ (inputs.cli_only || (inputs.publish && matrix.target == 'windows-x64')) && '--cli-only' || '' }}
+        env:
+          CSC_IDENTITY_AUTO_DISCOVERY: "false"
       - uses: actions/upload-artifact@v7
         with:
           name: meta-harness-${{ matrix.target }}
@@ -80,18 +82,20 @@ jobs:
           pattern: release-*
           path: release-assets
           merge-multiple: true
-      - name: Publish the installers and standalone binaries
+      - name: Publish macOS disk images and standalone binaries
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
+          assets=()
           for asset in meta-harness-cli-windows-x64.exe meta-harness-cli-macos-arm64 meta-harness-cli-macos-x64 \
-            meta-harness-desktop-windows-x64.exe meta-harness-desktop-macos-arm64.dmg meta-harness-desktop-macos-x64.dmg; do
+            meta-harness-desktop-macos-arm64.dmg meta-harness-desktop-macos-x64.dmg; do
             test -s "release-assets/$asset"
+            assets+=("release-assets/$asset")
           done
           version="${GITHUB_REF_NAME#v}"
           awk -v header="## $version" '$0 == header { section=1; next } section && /^## / { exit } section { print }' CHANGELOG.md > release-notes.md
           if grep -q '[^[:space:]]' release-notes.md; then
-            gh release create "$GITHUB_REF_NAME" release-assets/* --repo "$GITHUB_REPOSITORY" --verify-tag --title "Meta-Harness $version" --notes-file release-notes.md
+            gh release create "$GITHUB_REF_NAME" "${assets[@]}" --repo "$GITHUB_REPOSITORY" --verify-tag --title "Meta-Harness $version" --notes-file release-notes.md
           else
-            gh release create "$GITHUB_REF_NAME" release-assets/* --repo "$GITHUB_REPOSITORY" --verify-tag --title "Meta-Harness $version" --generate-notes
+            gh release create "$GITHUB_REF_NAME" "${assets[@]}" --repo "$GITHUB_REPOSITORY" --verify-tag --title "Meta-Harness $version" --generate-notes
           fi

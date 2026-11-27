@@ -92,7 +92,7 @@ fn update_api_error(error: anyhow::Error) -> (StatusCode, Json<serde_json::Value
 }
 
 fn github_client() -> Result<Client> {
-    Ok(Client::builder()
+    Ok(mh_acp::outbound_http_builder()
         .https_only(true)
         .connect_timeout(Duration::from_secs(10))
         .user_agent(concat!("meta-harness/", env!("CARGO_PKG_VERSION")))
@@ -124,7 +124,7 @@ fn artifact_name(kind: ArtifactKind, os: &str, arch: &str) -> Option<String> {
     let (artifact, extension) = match (kind, os) {
         (ArtifactKind::Cli, "windows") => ("cli", ".exe"),
         (ArtifactKind::Cli, "macos" | "linux") => ("cli", ""),
-        (ArtifactKind::Desktop, "windows") => ("desktop", ".exe"),
+        (ArtifactKind::Desktop, "windows") => ("desktop", ".appx"),
         (ArtifactKind::Desktop, "macos") => ("desktop", ".dmg"),
         _ => return None,
     };
@@ -187,8 +187,11 @@ fn inspect_release(
         .context("GitHub published a release without a stable version tag")?;
     let release_url = format!("{RELEASES_URL}/tag/{}", release.tag_name);
     let asset = if &version > current {
+        let bundle = filename
+            .ends_with(".appx")
+            .then(|| format!("{filename}bundle"));
         release.assets.into_iter().find_map(|asset| {
-            if asset.name != filename
+            if (asset.name != filename && bundle.as_deref() != Some(&asset.name))
                 || asset.state != "uploaded"
                 || asset.size == 0
                 || asset.size > MAX_DOWNLOAD_BYTES
@@ -201,8 +204,8 @@ fn inspect_release(
                 .ok()?;
             Some(Asset {
                 url: format!(
-                    "https://github.com/{REPOSITORY}/releases/download/{}/{filename}",
-                    release.tag_name
+                    "https://github.com/{REPOSITORY}/releases/download/{}/{}",
+                    release.tag_name, asset.name
                 ),
                 name: asset.name,
                 size: asset.size,
@@ -514,6 +517,16 @@ mod tests {
             )
             .is_err()
         );
+        let appx = artifact_name(ArtifactKind::Desktop, "windows", "x86_64").unwrap();
+        let bundle = format!("{appx}bundle");
+        let (report, asset) = inspect_release(
+            Some(parse("v0.5.10", &bundle, Some(&good_digest))),
+            &current,
+            &appx,
+        )
+        .unwrap();
+        assert_eq!(report.status, UpdateStatus::Available);
+        assert!(asset.unwrap().url.ends_with(&bundle));
     }
 
     #[test]

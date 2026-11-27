@@ -50,6 +50,7 @@ pub struct ManagedMemberClient {
     approval_provider: Option<&'static str>,
     adapter_id: String,
     profile_dir: Option<PathBuf>,
+    proxy_generation: u64,
 }
 
 impl ManagedMemberClient {
@@ -121,6 +122,7 @@ impl AcpSupervisor {
             return Err(AcpError::Cancelled);
         }
         let key = (spec.session_id.clone(), spec.member_handle.clone());
+        let proxy_generation = mh_core::outbound_proxy::generation();
         let retired = {
             let mut clients = self.clients.lock().await;
             if let Some(existing) = clients.get(&key)
@@ -128,6 +130,7 @@ impl AcpSupervisor {
                 && existing.permission_policy == spec.permission_policy
                 && existing.adapter_id == spec.adapter_id
                 && existing.profile_dir == spec.adapter.profile_dir
+                && existing.proxy_generation == proxy_generation
                 && existing.client.is_alive().await
             {
                 *existing.last_used.lock().await = Instant::now();
@@ -153,6 +156,9 @@ impl AcpSupervisor {
             crate::approval::acp_provider(&spec.adapter.quota_provider, &command, &args);
         crate::approval::apply_launch_mode(&command, &mut args, spec.permission_policy);
         let mut extra_env = spec.extra_env;
+        if crate::profile::is_agy(&command) {
+            extra_env.push(("AGY_CLI_NONINTERACTIVE_HEADLESS".into(), "true".into()));
+        }
         crate::profile::apply_profile(&spec.adapter, &command, &mut args, &mut extra_env).await?;
         let active_turn_id = Arc::new(RwLock::new(None));
         let broker_ctx = MemberBrokerContext {
@@ -183,10 +189,14 @@ impl AcpSupervisor {
             let resumed = if init.agent_capabilities.load_session
                 && let Some(prev_sid) = spec.existing_acp_session_id.as_deref()
             {
-                client
+                match client
                     .load_session(prev_sid, &spec.member_worktree, mcp_servers.clone())
                     .await
-                    .is_ok()
+                {
+                    Ok(_) => true,
+                    Err(error @ AcpError::AuthenticationRequired) => return Err(error),
+                    Err(_) => false,
+                }
             } else {
                 false
             };
@@ -224,6 +234,7 @@ impl AcpSupervisor {
             approval_provider,
             adapter_id: spec.adapter_id,
             profile_dir: spec.adapter.profile_dir,
+            proxy_generation,
         });
 
         let inserted = {
@@ -542,7 +553,10 @@ async fn probe_agy_profile_catalog(
     }
     let temp = tempfile::tempdir().ok()?;
     let (command, mut args) = resolve_adapter_command(adapter).ok()?;
-    let mut env = vec![("AGY_CLI_DISABLE_AUTO_UPDATE".into(), "true".into())];
+    let mut env = vec![
+        ("AGY_CLI_DISABLE_AUTO_UPDATE".into(), "true".into()),
+        ("AGY_CLI_NONINTERACTIVE_HEADLESS".into(), "true".into()),
+    ];
     crate::profile::apply_profile(adapter, &command, &mut args, &mut env)
         .await
         .ok()?;

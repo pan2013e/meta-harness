@@ -99,7 +99,13 @@ pub struct QuotaTracker {
     prefs: RwLock<HashMap<String, AdapterQuotaPrefs>>,
     turns: RwLock<HashMap<String, Vec<TurnUsageEntry>>>,
     live_cache: RwLock<HashMap<String, CachedLiveQuota>>,
-    http: reqwest::Client,
+}
+
+fn quota_http() -> reqwest::Client {
+    crate::platform::outbound_http_builder()
+        .timeout(Duration::from_secs(6))
+        .build()
+        .unwrap_or_default()
 }
 
 impl QuotaTracker {
@@ -132,7 +138,7 @@ impl QuotaTracker {
             ));
         }
         let (outcome, _) = probe_google_live(
-            &self.http,
+            &quota_http(),
             chrono::Utc::now().timestamp_millis(),
             None,
             Some(&command),
@@ -166,15 +172,10 @@ impl QuotaTracker {
     }
 
     pub fn new() -> Self {
-        let http = reqwest::Client::builder()
-            .timeout(Duration::from_secs(6))
-            .build()
-            .unwrap_or_default();
         Self {
             prefs: RwLock::new(HashMap::new()),
             turns: RwLock::new(HashMap::new()),
             live_cache: RwLock::new(HashMap::new()),
-            http,
         }
     }
 
@@ -389,16 +390,13 @@ impl QuotaTracker {
         } else if lookup == QuotaLookup::Cached {
             LiveProbeOutcome::default()
         } else {
+            let http = quota_http();
             let (fresh, ttl_ms) = match quota_provider {
-                "codex_local" => {
-                    probe_codex_live(&self.http, now, pref.profile_dir.as_deref()).await
-                }
-                "claude_local" => {
-                    probe_claude_live(&self.http, now, pref.profile_dir.as_deref()).await
-                }
+                "codex_local" => probe_codex_live(&http, now, pref.profile_dir.as_deref()).await,
+                "claude_local" => probe_claude_live(&http, now, pref.profile_dir.as_deref()).await,
                 "google_local" => {
                     probe_google_live(
-                        &self.http,
+                        &http,
                         now,
                         pref.profile_dir.as_deref(),
                         pref.google_cli.as_deref(),

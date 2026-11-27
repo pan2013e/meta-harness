@@ -151,12 +151,8 @@ fn main() -> anyhow::Result<()> {
             std::env::remove_var("MH_DESKTOP_TOKEN");
         }
     }
-    for (key, value) in mh_core::outbound_proxy::outbound_proxy_environment(cli.proxy.as_deref())
-        .map_err(anyhow::Error::msg)?
-    {
-        // SAFETY: the runtime and background threads have not started. HTTP clients and
-        // CLI children both read the proxy variables set for this process.
-        unsafe { std::env::set_var(key, value) };
+    if !matches!(cli.command, Some(Commands::McpBridge { .. })) {
+        mh_core::outbound_proxy::initialize(cli.proxy.as_deref()).map_err(anyhow::Error::msg)?;
     }
     let runtime = tokio::runtime::Runtime::new()?;
     #[cfg(any(windows, target_os = "macos"))]
@@ -175,6 +171,12 @@ async fn run(
     tray_shutdown: Option<oneshot::Receiver<()>>,
     tray_ready: Option<oneshot::Sender<String>>,
 ) -> anyhow::Result<()> {
+    if !matches!(
+        cli.command,
+        Some(Commands::McpBridge { .. } | Commands::Install { .. } | Commands::Uninstall { .. })
+    ) {
+        mh_server::proxy_health::check_at_startup(cli.desktop_child).await;
+    }
     match &cli.command {
         Some(Commands::Update { check }) => return mh_server::release::update_cli(*check).await,
         Some(Commands::Install { bin_dir }) => {
@@ -277,6 +279,8 @@ async fn run(
         paths,
     );
 
+    let proxy_health_task = tokio::spawn(mh_server::proxy_health::run_periodically());
+
     let state = AppState {
         switch: Arc::clone(&switch),
         auth: auth.clone(),
@@ -353,6 +357,7 @@ async fn run(
     info!("shutting down ACP child processes...");
     supervisor.shutdown_all().await;
     bridge_task.abort();
+    proxy_health_task.abort();
     Ok(result?)
 }
 
@@ -379,5 +384,47 @@ async fn shutdown_signal(tray: Option<oneshot::Receiver<()>>, desktop_child: boo
                 std::future::pending::<()>().await;
             }
         } => {}
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use mh_server::proxy_health::proxy_reaches_internet;
+    use std::io::{BufRead, BufReader, Write};
+    use std::net::TcpListener;
+    use std::time::Duration;
+
+    #[tokio::test]
+    async fn a_reachable_proxy_without_internet_fails_health_check() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let server = std::thread::spawn(move || {
+            let deadline = std::time::Instant::now() + Duration::from_secs(3);
+            let mut connection = loop {
+                match listener.accept() {
+                    Ok((connection, _)) => break connection,
+                    Err(error)
+                        if error.kind() == std::io::ErrorKind::WouldBlock
+                            && std::time::Instant::now() < deadline =>
+                    {
+                        std::thread::sleep(Duration::from_millis(10));
+                    }
+                    Err(error) => panic!("proxy did not receive the connectivity check: {error}"),
+                }
+            };
+            connection
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .unwrap();
+            let mut request = String::new();
+            let mut reader = BufReader::new(&mut connection);
+            reader.read_line(&mut request).unwrap();
+            assert!(request.starts_with("CONNECT www.gstatic.com:443 "));
+            connection
+                .write_all(b"HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\n\r\n")
+                .unwrap();
+        });
+        assert!(!proxy_reaches_internet(&format!("http://{address}")).await);
+        server.join().unwrap();
     }
 }

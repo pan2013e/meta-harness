@@ -9,7 +9,7 @@ Meta-Harness separates concerns across five strictly layered Rust crates (`Editi
 ```text
 mh-core       (domain DTOs, mention parser, skill metadata, WaitForGraph, AppPaths, config, token estimator)
   ▲
-mh-store      (SQLite WAL + FTS5 schema migrations v1..v6, projects, sessions, messages, trajectories, memory, skill_states)
+mh-store      (SQLite WAL + FTS5, projects, sessions, messages, trajectories, project facts, settings, skill states)
   ▲
 mh-acp        (ACP JSON-RPC client & stdio supervisor, Git worktree broker, WorkspaceBroker permissions, quota probes, profiles)
   ▲
@@ -31,6 +31,7 @@ Never introduce upward or cyclic crate dependencies.
 - `dag.rs` — `WaitForGraph` tracking active `caller -> target` consult edges to detect and reject deadlocks.
 - `paths.rs` — `AppPaths::resolve()` (`MH_CONFIG_DIR`, `MH_DATA_DIR`, `MH_WORKSPACE_DIR`, `skills_dir()`), `expand_user_path`, `dunce::canonicalize`-based `normalize_path` / `normalize_for_create` / `is_path_within`.
 - `config.rs` & `tokens.rs` — `harnesses.toml` loader + `gpt-6*` 1M-window & token estimator.
+- `outbound_proxy.rs` — Resolves the server and harness proxy at startup and keeps loopback connections direct.
 
 ### `crates/mh-store/src/`
 - `migrations.rs` — SQLite `WAL` + `NORMAL` sync + foreign keys. Schema versions:

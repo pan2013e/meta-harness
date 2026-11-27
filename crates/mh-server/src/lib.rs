@@ -53,6 +53,10 @@ pub fn build_router(state: AppState) -> Router {
             get(settings::export_settings).post(settings::import_settings),
         )
         .route(
+            "/api/settings/notifications",
+            get(settings::notification_preferences).put(settings::save_notification_preferences),
+        )
+        .route(
             "/api/skills",
             get(skills::list_skills).post(skills::create_custom_skill),
         )
@@ -130,7 +134,7 @@ pub fn build_router(state: AppState) -> Router {
         )
         .route(
             "/api/projects/{id}/memory/facts/{fact_id}",
-            delete(routes::delete_project_fact),
+            patch(routes::revise_project_fact).delete(routes::delete_project_fact),
         )
         .route(
             "/api/memory/jobs/{job_id}",

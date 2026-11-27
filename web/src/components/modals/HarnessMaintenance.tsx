@@ -87,7 +87,12 @@ export function HarnessMaintenance({ adapterId, profile, hasSavedProfile, offers
   });
 
   const output = (operation?.output ?? "").replace(/\x1b\[[0-?]*[ -/]*[@-~]/g, "");
-  const links = operation?.kind === "sign_in" && running ? signInLinks(output) : [];
+  const authorization = operation?.authorization_url;
+  const links = operation?.kind === "sign_in" && running
+    ? authorization
+      ? operation.accepts_input ? signInLinks(authorization) : []
+      : signInLinks(output.slice(0, output.lastIndexOf("\n") + 1))
+    : [];
 
   return (
     <div className="space-y-2 border-t border-line pt-2 text-xs">
@@ -140,20 +145,28 @@ export function HarnessMaintenance({ adapterId, profile, hasSavedProfile, offers
           {links.map((link, index) => <a className="block text-brand-ink underline" key={link} href={link} target="_blank" rel="noreferrer noopener">
             {index === 0 ? "Open provider sign-in" : "Open alternate sign-in link"}
           </a>)}
-          {output.trim() && <pre className="max-h-36 overflow-auto whitespace-pre-wrap break-all text-[11px] text-ink-soft">{output}</pre>}
+          {authorization ? (
+            <p className="text-ink-soft">{operation.accepts_input
+              ? "Finish Google sign-in, then paste the authorization code or the full Antigravity callback URL."
+              : "Verifying sign-in…"}</p>
+          ) : output.trim() && <pre className="max-h-36 overflow-auto whitespace-pre-wrap break-all text-[11px] text-ink-soft">{output}</pre>}
           {running && operation.accepts_input && (
             <div className="flex gap-2">
               <input
-                aria-label="Provider authorization code"
+                aria-label={authorization ? "Authorization code or callback URL" : "Provider authorization code"}
                 type="password"
                 autoComplete="off"
                 value={code}
                 onChange={(event) => setCode(event.target.value)}
-                placeholder="Authorization code, if requested"
+                placeholder={authorization ? "Paste code or callback URL" : "Authorization code, if requested"}
                 className="min-w-0 flex-1 rounded-lg border border-line bg-panel px-2 py-1.5"
               />
               <button type="button" className={actionClass} disabled={working || !code.trim()}
-                onClick={() => void run(async () => { await api.sendHarnessSignInInput(adapterId, code); setCode(""); })}>
+                onClick={() => void run(async () => {
+                  await api.sendHarnessSignInInput(adapterId, code);
+                  setCode("");
+                  if (authorization) setOperation((current) => current ? { ...current, accepts_input: false } : current);
+                })}>
                 Submit code
               </button>
             </div>

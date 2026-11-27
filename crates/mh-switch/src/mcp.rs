@@ -88,14 +88,16 @@ pub fn list_switch_tools() -> Vec<Value> {
         }),
         json!({
             "name": "memory_record_fact",
-            "description": "Save a concise high-level architectural, ownership, or harness convention fact to project memory.",
+            "description": "Save a durable project fact. To correct an outdated agent-authored fact, pass its ID and updated_at from memory_recall so the correction replaces it.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "category": { "type": "string" },
-                    "summary": { "type": "string" }
+                    "summary": { "type": "string" },
+                    "fact_id": { "type": "string" },
+                    "expected_updated_at": { "type": "integer" }
                 },
-                "required": ["category", "summary"]
+                "required": ["summary"]
             }
         }),
         json!({
@@ -325,24 +327,40 @@ pub async fn execute_mcp_tool(
                 return Ok(json!({ "jobs": [], "facts": [] }));
             };
             let jobs = engine.store.recall_jobs(project_id, query, limit)?;
-            let facts = engine.store.list_facts(project_id, 20)?;
+            let facts = engine.store.recall_facts(project_id, query, 20)?;
             Ok(json!({ "jobs": jobs, "facts": facts }))
         }
         "memory_record_fact" => {
             let Some(ref project_id) = session.project_id else {
                 return Ok(json!({ "skipped": "standalone session has no project memory" }));
             };
-            let category = args
-                .get("category")
-                .and_then(|v| v.as_str())
-                .unwrap_or("architecture");
+            let category = args.get("category").and_then(|v| v.as_str());
             let summary = args
                 .get("summary")
                 .and_then(|v| v.as_str())
                 .ok_or_else(|| SwitchError::Validation("missing `summary`".into()))?;
-            let fact = engine
-                .store
-                .record_fact(project_id, category, summary, caller)?;
+            let fact = if let Some(fact_id) = args.get("fact_id").and_then(Value::as_str) {
+                let updated_at = args.get("expected_updated_at").and_then(Value::as_i64)
+                    .ok_or_else(|| SwitchError::Validation("Read the fact with memory_recall and supply its updated_at as expected_updated_at.".into()))?;
+                engine.store.revise_fact(
+                    project_id,
+                    fact_id,
+                    category,
+                    summary,
+                    Some(caller),
+                    updated_at,
+                )?
+            } else {
+                engine.store.record_fact(
+                    project_id,
+                    category.unwrap_or("architecture"),
+                    summary,
+                    caller,
+                )?
+            };
+            let _ = engine
+                .events_tx
+                .send(WsEvent::MemoryFactUpdated { fact: fact.clone() });
             Ok(json!({ "fact": fact }))
         }
         "quota_get_status" => {
@@ -507,10 +525,12 @@ pub async fn execute_mcp_tool(
 
             if let Some(fact_text) = args.get("project_fact").and_then(|v| v.as_str())
                 && !fact_text.trim().is_empty()
+                && let Ok(fact) =
+                    engine
+                        .store
+                        .record_fact(project_id, "ownership", fact_text, caller)
             {
-                let _ = engine
-                    .store
-                    .record_fact(project_id, "ownership", fact_text, caller);
+                let _ = engine.events_tx.send(WsEvent::MemoryFactUpdated { fact });
             }
 
             let _ = engine

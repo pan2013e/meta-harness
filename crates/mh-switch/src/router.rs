@@ -16,11 +16,11 @@ use mh_acp::{
     sync_member_worktree,
 };
 use mh_core::{
-    AppConfig, AppPaths, ChatImage, ChatMessage, DiffStat, DiscoveredConfigOption,
-    DispatchTaskSpec, IsolationMode, MemberContextBreakdown, MemberRole, MemberStatus, MessageKind,
-    PendingPermissionView, SenderKind, Session, SessionContextReport, SessionMember, SkillSummary,
-    TrajectoryEventKind, TurnModelSelection, TurnStatus, WaitForGraph, WsEvent,
-    context_window_for_model, estimate_tokens, parse_mentions, parse_slash_tokens,
+    ActivityNotificationKind, AppConfig, AppPaths, ChatImage, ChatMessage, DiffStat,
+    DiscoveredConfigOption, DispatchTaskSpec, IsolationMode, MemberContextBreakdown, MemberRole,
+    MemberStatus, MessageKind, PendingPermissionView, SenderKind, Session, SessionContextReport,
+    SessionMember, SkillSummary, TrajectoryEventKind, TurnModelSelection, TurnStatus, WaitForGraph,
+    WsEvent, context_window_for_model, estimate_tokens, parse_mentions, parse_slash_tokens,
     parse_user_mentions,
 };
 use mh_store::{
@@ -1335,6 +1335,12 @@ impl SwitchEngine {
                         metadata: json!({"error": true}),
                     }) {
                         let _ = self.events_tx.send(WsEvent::ChatMessageCreated { message });
+                        let _ = self.events_tx.send(WsEvent::ActivityNotification {
+                            session_id: session_id.into(),
+                            id: turn_id.clone(),
+                            member_handle: member.handle.clone(),
+                            kind: ActivityNotificationKind::TurnFailed,
+                        });
                     }
                     return Err(e.into());
                 }
@@ -1574,6 +1580,7 @@ impl SwitchEngine {
                     .await;
                     self.publish_session_context(session_id).await;
 
+                    stream_listener.notify(ActivityNotificationKind::TurnCompleted);
                     Ok((turn_id, reply_text))
                 }
                 Err(AcpError::RateLimited(msg)) => {
@@ -1609,6 +1616,7 @@ impl SwitchEngine {
                             "error",
                         )))
                         .await?;
+                    stream_listener.notify(ActivityNotificationKind::TurnFailed);
                     Err(SwitchError::Acp(AcpError::RateLimited(msg)))
                 }
                 Err(AcpError::Cancelled) => {
@@ -1644,6 +1652,7 @@ impl SwitchEngine {
                         .await?;
                     self.set_member_status(session_id, &member.handle, MemberStatus::Error, None)
                         .await;
+                    stream_listener.notify(ActivityNotificationKind::TurnFailed);
                     Err(err.into())
                 }
             }
@@ -2892,6 +2901,12 @@ impl BrokerCallbacks for SwitchCallbacks {
             metadata: serde_json::to_value(&prompt).unwrap_or(Value::Null),
         });
 
+        let _ = engine.events_tx.send(WsEvent::ActivityNotification {
+            session_id: self.session_id.clone(),
+            id: req_id,
+            member_handle: self.member_handle.clone(),
+            kind: ActivityNotificationKind::ApprovalRequired,
+        });
         let _ = engine
             .events_tx
             .send(WsEvent::PermissionRequested { prompt });
@@ -2999,6 +3014,18 @@ struct SwitchStreamListener {
 }
 
 impl SwitchStreamListener {
+    fn notify(&self, kind: ActivityNotificationKind) {
+        if let (Some(chat), Some(engine)) = (&self.chat, self.engine.upgrade())
+            && let Some(id) = &chat.turn_id
+        {
+            let _ = engine.events_tx.send(WsEvent::ActivityNotification {
+                session_id: self.session_id.clone(),
+                id: id.clone(),
+                member_handle: self.member_handle.clone(),
+                kind,
+            });
+        }
+    }
     fn complete_segment(
         engine: &SwitchEngine,
         id: &str,

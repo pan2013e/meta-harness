@@ -9,7 +9,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.8.0"
+version = "0.9.0"
 edition = "2024"
 license = "MIT"
 
@@ -39,7 +39,7 @@ hex = "0.4"
 rand = "0.8"
 chrono = { version = "0.4", features = ["serde"] }
 async-trait = "0.1"
-reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "socks"] }
 clap = { version = "4", features = ["derive"] }
 rust-embed = { version = "8", features = ["interpolate-folder-path"] }
 tempfile = "3"

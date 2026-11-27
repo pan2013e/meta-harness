@@ -56,6 +56,8 @@ node scripts/build.mjs
 node scripts/build.mjs --cli-only
 ```
 
+On Windows, the desktop build writes its GUI installer to `dist/desktop/meta-harness-desktop-windows-x64.exe` for an x64 build.
+
 For quick local development against a hot-reloading frontend:
 
 ```sh

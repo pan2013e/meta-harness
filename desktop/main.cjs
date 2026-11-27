@@ -1,7 +1,9 @@
-const { app, BrowserWindow, Menu, Tray, clipboard, dialog, ipcMain, nativeImage, shell } = require("electron");
+const { app, BrowserWindow, Menu, Notification, Tray, clipboard, dialog, ipcMain, nativeImage, session, shell } = require("electron");
 const { execFile, spawn } = require("node:child_process");
 const { randomBytes } = require("node:crypto");
+const { readFile, rename, writeFile } = require("node:fs/promises");
 const { homedir } = require("node:os");
+const { createConnection } = require("node:net");
 const { delimiter, join } = require("node:path");
 const { createInterface } = require("node:readline");
 const { promisify } = require("node:util");
@@ -16,6 +18,8 @@ let startupTimer;
 let preparingUpdate = false;
 let updateDownloader;
 let updateInstaller;
+let configuredProxy;
+let proxyNotUsed = false;
 
 const windows = process.platform === "win32";
 const titleBarHeight = 36;
@@ -107,6 +111,76 @@ function fromMainWindow(event) {
     frame && !frame.parent && backendUrl && new URL(frame.url).origin === new URL(backendUrl).origin;
 }
 
+function parseProxy(value) {
+  const input = value.trim();
+  let url;
+  try { url = new URL(input.includes("://") ? input : `http://${input}`); } catch {
+    throw new Error("Enter a valid proxy URL.");
+  }
+  if (!["http:", "https:", "socks5:", "socks5h:"].includes(url.protocol) || !url.hostname ||
+      !["", "/"].includes(url.pathname) || url.search || url.hash) {
+    throw new Error("Use an HTTP, HTTPS, or SOCKS5 proxy URL without a path.");
+  }
+  return url;
+}
+
+function proxySettingsPath() {
+  return join(app.getPath("userData"), "network.json");
+}
+
+function nativeEnvironment() {
+  if (proxyNotUsed) return { ...process.env, MH_OUTBOUND_PROXY_DIRECT: "1" };
+  return configuredProxy ? { ...process.env, MH_OUTBOUND_PROXY: configuredProxy } : process.env;
+}
+
+function proxyReachable(proxy) {
+  const port = Number(proxy.port || ({ "http:": 80, "https:": 443 })[proxy.protocol] || 1080);
+  return new Promise((resolve) => {
+    const socket = createConnection({ host: proxy.hostname.replace(/^\[|\]$/g, ""), port });
+    const finish = (available) => {
+      clearTimeout(deadline);
+      socket.destroy();
+      resolve(available);
+    };
+    const deadline = setTimeout(() => finish(false), 1000);
+    socket.once("connect", () => finish(true));
+    socket.once("error", () => finish(false));
+  });
+}
+
+async function loadProxySettings() {
+  try {
+    const { proxy } = JSON.parse(await readFile(proxySettingsPath(), "utf8"));
+    if (typeof proxy === "string" && proxy.trim()) configuredProxy = parseProxy(proxy).href;
+  } catch (error) {
+    if (error.code !== "ENOENT") console.warn("Could not read the desktop proxy setting.");
+  }
+  const explicit = configuredProxy || process.env.MH_OUTBOUND_PROXY;
+  if (explicit?.trim() && !await proxyReachable(parseProxy(explicit))) {
+    proxyNotUsed = true;
+    await session.defaultSession.setProxy({ mode: "direct" });
+    return;
+  }
+  const all = process.env.ALL_PROXY || process.env.all_proxy;
+  const sources = [
+    ["http", explicit || process.env.HTTP_PROXY || process.env.http_proxy || all],
+    ["https", explicit || process.env.HTTPS_PROXY || process.env.https_proxy || all],
+  ];
+  const rules = sources.flatMap(([scheme, value]) => {
+    if (!value?.trim()) return [];
+    const proxy = parseProxy(value);
+    const protocol = proxy.protocol === "socks5h:" ? "socks5:" : proxy.protocol;
+    return `${scheme}=${protocol}//${proxy.host}`;
+  });
+  if (rules.length) {
+    const bypass = process.env.NO_PROXY || process.env.no_proxy;
+    await session.defaultSession.setProxy({
+      proxyRules: rules.join(";"),
+      proxyBypassRules: [bypass, "localhost", "127.0.0.1", "[::1]"].filter(Boolean).join(","),
+    });
+  }
+}
+
 function showTextMenu(event, kind, selection, canPaste) {
   if (!fromMainWindow(event) || typeof selection !== "string" || !["message", "composer", "terminal"].includes(kind)) return null;
   const isMessage = kind === "message";
@@ -173,6 +247,7 @@ async function prepareDesktopUpdate(event, version) {
   try {
     const download = promisify(execFile)(nativeBinary, ["stage-desktop-update", "--version", version], {
       windowsHide: true,
+      env: nativeEnvironment(),
       timeout: 9 * 60 * 1000,
       maxBuffer: 64 * 1024,
     });
@@ -194,7 +269,7 @@ async function prepareDesktopUpdate(event, version) {
 
 function startBackend() {
   const token = randomBytes(24).toString("hex");
-  const env = { ...process.env, MH_DESKTOP_TOKEN: token };
+  const env = { ...nativeEnvironment(), MH_DESKTOP_TOKEN: token };
   if (process.platform === "darwin") {
     env.PATH = [env.PATH, "/opt/homebrew/bin", "/usr/local/bin", join(homedir(), ".local", "bin"), join(homedir(), ".cargo", "bin")]
       .filter(Boolean).join(delimiter);
@@ -242,6 +317,36 @@ if (process.getuid?.() === 0 || process.geteuid?.() === 0) {
   ipcMain.handle("meta-harness:install-update", prepareDesktopUpdate);
   ipcMain.handle("meta-harness:text-menu", showTextMenu);
   ipcMain.handle("meta-harness:title-bar-colors", setTitleBarColors);
+  ipcMain.handle("meta-harness:project-folder", async (event) => {
+    if (!fromMainWindow(event)) return null;
+    const { canceled, filePaths } = await dialog.showOpenDialog(window, {
+      title: "Open Project Folder",
+      properties: ["openDirectory"],
+    });
+    return canceled ? null : filePaths[0] ?? null;
+  });
+  ipcMain.handle("meta-harness:notify", (event, body) => {
+    if (!fromMainWindow(event) || !Notification.isSupported() || typeof body !== "string" || body.length > 200) return false;
+    const notification = new Notification({ title: "Meta-Harness", body });
+    notification.on("click", openWindow);
+    notification.show();
+    return true;
+  });
+  ipcMain.handle("meta-harness:proxy-settings", (event) => {
+    if (!fromMainWindow(event)) return { host: null, proxyNotUsed: false };
+    return { host: configuredProxy ? parseProxy(configuredProxy).host : null, proxyNotUsed };
+  });
+  ipcMain.handle("meta-harness:save-proxy", async (event, value) => {
+    if (!fromMainWindow(event) || quitting) throw new Error("The desktop app is closing.");
+    if (value !== null && (typeof value !== "string" || value.length > 2048)) throw new Error("Invalid proxy URL.");
+    const proxy = value === null ? null : parseProxy(value).href;
+    const path = proxySettingsPath();
+    const staged = path + ".tmp";
+    await writeFile(staged, JSON.stringify({ proxy }), { mode: 0o600 });
+    await rename(staged, path);
+    app.relaunch();
+    app.quit();
+  });
   app.on("second-instance", openWindow);
   app.on("activate", openWindow);
   app.on("window-all-closed", () => undefined);
@@ -265,8 +370,9 @@ if (process.getuid?.() === 0 || process.geteuid?.() === 0) {
       dialog.showErrorBox("Could not open the update installer", error.message);
     }).finally(() => app.quit());
   });
-  void app.whenReady().then(() => {
+  void app.whenReady().then(async () => {
     if (windows) app.setAppUserModelId("com.pan2013e.meta-harness");
-    startBackend();
+    await loadProxySettings();
+    if (!quitting) startBackend();
   }).catch(showStartupError);
 }

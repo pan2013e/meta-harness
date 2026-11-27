@@ -68,6 +68,71 @@ mod tests {
     use serde_json::json;
 
     #[test]
+    fn project_memory_replaces_facts_with_revision_checks() {
+        let store = Store::open_in_memory().unwrap();
+        let project = store
+            .upsert_project("demo", "/tmp/evolving-memory", false)
+            .unwrap();
+        let first = store
+            .record_fact(&project.id, "architecture", "The cache is blue", "codex")
+            .unwrap();
+        let repeated = store
+            .record_fact(&project.id, "architecture", " The cache is blue ", "claude")
+            .unwrap();
+        assert_eq!(first.id, repeated.id);
+        let changed = store
+            .revise_fact(
+                &project.id,
+                &first.id,
+                None,
+                "The cache is green",
+                Some("codex"),
+                first.updated_at,
+            )
+            .unwrap();
+        assert_eq!(changed.id, first.id);
+        assert!(changed.updated_at > first.updated_at);
+        assert!(
+            store
+                .recall_facts(&project.id, Some("blue"), 10)
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            store.recall_facts(&project.id, Some("green"), 10).unwrap()[0].id,
+            first.id
+        );
+        assert!(
+            store
+                .revise_fact(
+                    &project.id,
+                    &first.id,
+                    None,
+                    "Stale revision",
+                    Some("claude"),
+                    first.updated_at
+                )
+                .is_err()
+        );
+        let pinned = store
+            .record_fact(&project.id, "convention", "Keep the cache local", "user")
+            .unwrap();
+        assert!(
+            store
+                .revise_fact(
+                    &project.id,
+                    &pinned.id,
+                    None,
+                    "Use a remote cache",
+                    Some("user"),
+                    pinned.updated_at
+                )
+                .is_err()
+        );
+        assert!(store.delete_fact("unrelated-project", &pinned.id).is_err());
+    }
+
+    #[test]
     fn store_crud_deltas_trajectories_and_fts5_memory() {
         let store = Store::open_in_memory().unwrap();
         let proj = store.upsert_project("demo", "/tmp/demo", true).unwrap();

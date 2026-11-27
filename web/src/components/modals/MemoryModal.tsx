@@ -1,7 +1,8 @@
-import { useState } from "react";
-import { Brain, Pin, Plus, Search, Trash2, X } from "lucide-react";
+import { useEffect, useState } from "react";
+import { Brain, Pencil, Pin, Plus, Search, Trash2, X } from "lucide-react";
 import { api } from "../../api/client";
 import { useAppStore } from "../../store/useAppStore";
+import type { ProjectFact } from "../../types/api";
 
 export function MemoryModal({ onClose }: { onClose: () => void }) {
   const {
@@ -15,6 +16,35 @@ export function MemoryModal({ onClose }: { onClose: () => void }) {
   const [memQuery, setMemQuery] = useState("");
   const [newFact, setNewFact] = useState("");
   const [factCategory, setFactCategory] = useState("architecture");
+  const [editingFact, setEditingFact] = useState<ProjectFact | null>(null);
+  const [factError, setFactError] = useState<string | null>(null);
+  const [savingFact, setSavingFact] = useState(false);
+
+  useEffect(() => {
+    setEditingFact(null);
+    setNewFact("");
+    setFactError(null);
+  }, [activeProjectId]);
+
+  const saveFact = async () => {
+    const summary = newFact.trim();
+    if (!activeProjectId || !summary || savingFact || (editingFact && editingFact.project_id !== activeProjectId)) return;
+    setSavingFact(true);
+    setFactError(null);
+    try {
+      if (editingFact) await api.reviseFact(editingFact, factCategory, summary);
+      else await api.createFact(activeProjectId, factCategory, summary);
+      if (activeProjectId === useAppStore.getState().activeProjectId) {
+        setNewFact("");
+        setEditingFact(null);
+        await refreshMemory(memQuery);
+      }
+    } catch (error) {
+      setFactError(error instanceof Error ? error.message : String(error));
+    } finally {
+      setSavingFact(false);
+    }
+  };
 
   const activeProject = projects.find((p) => p.id === activeProjectId) ?? null;
 
@@ -64,7 +94,7 @@ export function MemoryModal({ onClose }: { onClose: () => void }) {
                 setMemQuery(e.target.value);
                 void refreshMemory(e.target.value);
               }}
-              placeholder="Search completed jobs, harnesses, or touched files..."
+              placeholder="Search jobs and project facts"
               className="w-full rounded-xl bg-inset border border-line focus:border-brand pl-9 pr-3 py-2 text-xs text-ink placeholder-ink-muted focus:outline-none"
             />
           </div>
@@ -188,39 +218,29 @@ export function MemoryModal({ onClose }: { onClose: () => void }) {
                     </button>
                   ))}
                 </div>
-                <div className="flex gap-1.5 text-xs">
+                <form className="flex gap-1.5 text-xs" onSubmit={(event) => { event.preventDefault(); void saveFact(); }}>
                   <input
                     type="text"
+                    aria-label={editingFact ? "Edit project fact" : "New project fact"}
                     value={newFact}
+                    disabled={savingFact}
                     onChange={(e) => setNewFact(e.target.value)}
-                    onKeyDown={(e) => {
-                      if (e.key === "Enter" && newFact.trim()) {
-                        e.preventDefault();
-                        void api
-                          .createFact(activeProjectId, factCategory, newFact.trim())
-                          .then(() => {
-                            setNewFact("");
-                            return refreshMemory(memQuery);
-                          });
-                      }
-                    }}
                     placeholder="Add a project convention, owner rule, or architectural note..."
                     className="flex-1 rounded-xl bg-inset border border-line focus:border-brand px-3 py-2 text-ink focus:outline-none"
                   />
                   <button
-                    type="button"
-                    onClick={async () => {
-                      if (!newFact.trim()) return;
-                      await api.createFact(activeProjectId, factCategory, newFact.trim());
-                      setNewFact("");
-                      await refreshMemory(memQuery);
-                    }}
+                    type="submit"
+                    disabled={savingFact || !newFact.trim()}
                     className="inline-flex items-center gap-1 px-3 py-2 rounded-xl bg-brand hover:bg-brand-hover text-white font-medium"
                   >
-                    <Plus className="w-3.5 h-3.5" />
-                    <span>Pin</span>
+                    {!editingFact && <Plus className="w-3.5 h-3.5" />}
+                    <span>{editingFact ? "Save" : "Pin"}</span>
                   </button>
-                </div>
+                  {editingFact && <button type="button" disabled={savingFact}
+                    onClick={() => { setEditingFact(null); setNewFact(""); setFactError(null); }}
+                    className="rounded-lg border border-line px-2">Cancel</button>}
+                </form>
+                {factError && <p role="alert" className="text-xs text-neg">{factError}</p>}
               </div>
             )}
 
@@ -237,16 +257,29 @@ export function MemoryModal({ onClose }: { onClose: () => void }) {
                     <span className="text-ink">{f.summary}</span>
                   </div>
                   {activeProjectId && (
+                    <div className="flex shrink-0 gap-1">
+                    <button type="button" aria-label="Edit fact" disabled={savingFact}
+                      onClick={() => { setEditingFact(f); setFactCategory(f.category); setNewFact(f.summary); setFactError(null); }}
+                      className="p-1 text-ink-muted hover:text-ink"><Pencil className="h-3.5 w-3.5" /></button>
                     <button
                       type="button"
+                      aria-label="Delete fact"
+                      disabled={savingFact}
                       onClick={async () => {
-                        await api.deleteFact(activeProjectId, f.id);
-                        await refreshMemory(memQuery);
+                        setFactError(null);
+                        try {
+                          await api.deleteFact(activeProjectId, f.id);
+                          if (editingFact?.id === f.id) { setEditingFact(null); setNewFact(""); }
+                          await refreshMemory(memQuery);
+                        } catch (error) {
+                          setFactError(error instanceof Error ? error.message : String(error));
+                        }
                       }}
                       className="text-ink-muted hover:text-neg p-1"
                     >
                       <Trash2 className="w-3.5 h-3.5" />
                     </button>
+                    </div>
                   )}
                 </div>
               ))}

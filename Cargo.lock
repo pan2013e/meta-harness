@@ -1785,7 +1785,7 @@ dependencies = [
 
 [[package]]
 name = "mh-acp"
-version = "0.8.0"
+version = "0.9.0"
 dependencies = [
  "async-trait",
  "chrono",
@@ -1809,7 +1809,7 @@ dependencies = [
 
 [[package]]
 name = "mh-core"
-version = "0.8.0"
+version = "0.9.0"
 dependencies = [
  "base64 0.22.1",
  "dirs 6.0.0",
@@ -1819,12 +1819,14 @@ dependencies = [
  "thiserror 2.0.21",
  "tiktoken-rs",
  "toml 0.8.23",
+ "url",
  "uuid",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
 name = "mh-server"
-version = "0.8.0"
+version = "0.9.0"
 dependencies = [
  "anyhow",
  "axum",
@@ -1864,7 +1866,7 @@ dependencies = [
 
 [[package]]
 name = "mh-store"
-version = "0.8.0"
+version = "0.9.0"
 dependencies = [
  "chrono",
  "mh-core",
@@ -1878,7 +1880,7 @@ dependencies = [
 
 [[package]]
 name = "mh-switch"
-version = "0.8.0"
+version = "0.9.0"
 dependencies = [
  "async-trait",
  "chrono",

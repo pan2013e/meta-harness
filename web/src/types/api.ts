@@ -214,6 +214,7 @@ export interface HarnessOperation {
   status: "running" | "completed" | "failed";
   output: string;
   accepts_input: boolean;
+  authorization_url?: string;
 }
 
 export interface ConfigOptionChoice {
@@ -306,6 +307,7 @@ export interface SettingsFile {
   preferences: {
     global_personas: GlobalPersona[];
     adapter_defaults: AdapterModelPref[];
+    notifications?: NotificationPreferences;
     quota_preferences: Array<{
       adapter_id: string;
       plan_label: string | null;
@@ -380,7 +382,15 @@ export interface ProjectFact {
   summary: string;
   author_id: string;
   created_at: number;
+  updated_at: number;
 }
+
+export interface NotificationPreferences {
+  approval_requests: boolean;
+  turn_completions: boolean;
+}
+
+export type ActivityNotificationKind = "approval_required" | "turn_completed" | "turn_failed";
 
 export interface PermissionPromptOption {
   option_id: string;
@@ -502,6 +512,8 @@ export type WsEvent =
     }
   | { type: "quota.updated"; snapshot: QuotaSnapshot }
   | { type: "memory.job_curated"; job: EpisodicJob }
+  | { type: "memory.fact_updated"; fact: ProjectFact }
+  | { type: "activity.notification"; id: string; session_id: string; member_handle: string; kind: ActivityNotificationKind }
   | { type: "session.updated"; session: Session }
   | { type: "context.updated"; session_id: string; report: SessionContextReport };
 export interface AppUpdateCheck {

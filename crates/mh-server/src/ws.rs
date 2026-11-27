@@ -118,6 +118,8 @@ fn should_forward(
         WsEvent::ContextUpdated { session_id, .. } => Some(session_id.as_str()),
         WsEvent::QuotaUpdated { .. }
         | WsEvent::MemoryJobCurated { .. }
+        | WsEvent::MemoryFactUpdated { .. }
+        | WsEvent::ActivityNotification { .. }
         | WsEvent::SessionUpdated { .. } => None,
     };
 

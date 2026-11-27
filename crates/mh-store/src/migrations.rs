@@ -296,5 +296,21 @@ pub fn apply_migrations(conn: &Connection) -> Result<(), StoreError> {
              COMMIT;",
         )?;
     }
+    if current_ver < 8 {
+        conn.execute_batch(
+            "BEGIN;
+             ALTER TABLE project_facts ADD COLUMN updated_at INTEGER NOT NULL DEFAULT 0;
+             ALTER TABLE project_facts ADD COLUMN superseded_at INTEGER;
+             UPDATE project_facts SET updated_at = created_at;
+             CREATE INDEX idx_project_facts_updated ON project_facts(project_id, updated_at DESC);
+             CREATE TABLE notification_preferences (
+                 singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+                 approval_requests INTEGER NOT NULL,
+                 turn_completions INTEGER NOT NULL
+             );
+             INSERT INTO schema_migrations (version) VALUES (8);
+             COMMIT;",
+        )?;
+    }
     Ok(())
 }

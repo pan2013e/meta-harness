@@ -41,6 +41,9 @@ struct Cli {
     config: Option<PathBuf>,
     #[arg(long)]
     data_dir: Option<PathBuf>,
+    /// Server-side outbound proxy URL for Meta-Harness and its harnesses.
+    #[arg(long, global = true)]
+    proxy: Option<String>,
     /// PEM certificate chain for HTTPS. Required when listening on a LAN address.
     #[arg(long, global = true, requires = "tls_key")]
     tls_cert: Option<PathBuf>,
@@ -147,6 +150,13 @@ fn main() -> anyhow::Result<()> {
         unsafe {
             std::env::remove_var("MH_DESKTOP_TOKEN");
         }
+    }
+    for (key, value) in mh_core::outbound_proxy::outbound_proxy_environment(cli.proxy.as_deref())
+        .map_err(anyhow::Error::msg)?
+    {
+        // SAFETY: the runtime and background threads have not started. HTTP clients and
+        // CLI children both read the proxy variables set for this process.
+        unsafe { std::env::set_var(key, value) };
     }
     let runtime = tokio::runtime::Runtime::new()?;
     #[cfg(any(windows, target_os = "macos"))]

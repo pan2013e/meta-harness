@@ -8,7 +8,7 @@ This guide covers day-to-day workflows in Meta-Harness: managing projects and Qu
 
 Meta-Harness supports three workspace modes from the left sidebar (`Ctrl+B` / `Cmd+B` to collapse or expand):
 
-- **Git-backed Projects (Recommended).** Click **Open** in the sidebar to browse and open a local repository. Each session automatically branches from your current `HEAD` into an isolated integration checkout (`mh/<session_id>/integration`) and spins up per-executor checkouts (`mh/<session_id>/exec-<handle>`) on demand—keeping your main working tree untouched until you choose to promote changes.
+- **Git-backed Projects.** Click **Open** in the sidebar to choose a local repository. The desktop app opens the system directory picker. A browser connected to the standalone server browses folders on the server. Each session branches from the current `HEAD` into an isolated integration checkout (`mh/<session_id>/integration`) and creates executor checkouts (`mh/<session_id>/exec-<handle>`) as needed.
 - **Non-Git Folders.** Folders without `.git` run in serialized **Shared Folder** mode, or you can click **Initialize Git** directly from the sidebar or Welcome screen to enable full worktree isolation.
 - **Quick Sessions.** Select **Quick Sessions** in the project switcher to start standalone sessions outside any named repository. Workspaces live under `~/.meta-harness/workspaces/<session_id>` (overridable via `MH_WORKSPACE_DIR`), automatically initialized with Git.
 
@@ -18,6 +18,7 @@ Right-click any session (or click `...`) to **Rename**, **Archive**, or **Delete
 
 - **Archive** checkpoints dirty worktree edits, removes on-disk checkouts to save space, and keeps chat history and Git branches (`mh/<session_id>/*`) intact under the collapsible **Archived (N)** list.
 - **Unarchive** restores the integration worktree so you can continue where you left off.
+- **Delete** closes the confirmation and continues cleanup in the background while the server runs. The sidebar shows when a session is being removed.
 - For **Codex** and supported **Claude Code** adapters, archiving, restoring, and deleting also synchronize linked conversations in the harness's native storage.
 
 ---
@@ -110,24 +111,27 @@ Open **Memory** in the top header (or type `/memory`) to view and curate project
 ![Project Memory Modal](media/memory.png)
 
 - **Recent Jobs ("Who Did What"):** Automatically summarizes completed turns across sessions, including the responsible harness, model, touched modules, and outcome. Pin important entries to keep them prioritized.
-- **Pinned Architecture & Rules:** Record durable team conventions, ownership notes, or API contracts so the Orchestrator and executors recall them automatically in future sessions.
+- **Pinned Architecture & Rules:** Record durable team conventions, ownership notes, or API contracts. Use **Edit fact** to update a note in place or delete it when it no longer applies. Agents can revise their own and other agent-authored facts using the current revision. Search covers both current facts and historical jobs.
 
 ---
 
 ## 6. Settings, Separate Profiles, Global Personas, & Backups
 
-Click **Settings** in the bottom-left sidebar to manage six sections:
+Open **Settings** in the bottom-left sidebar.
 
 ![Settings: Harnesses, Models, & Quotas](media/settings-harnesses.png)
 
 - **Appearance:** Switch between **Obsidian Studio** (default), **Tokyo Night**, **Catppuccin Mocha**, and **Paper Daylight**.
+- **Notifications:** Opt in to approval requests and finished turns. The desktop app uses system notifications. In the standalone web app, click **Enable browser notifications** and keep the browser tab open to receive them.
 - **Harnesses & Models:**
   - Inspect CLI availability, live subscription usage windows, **Check CLI version**, and **Upgrade CLI** where supported.
   - Set adapter-level **Default Model** and **Default Reasoning Effort**.
   - **Separate Profiles:** Click **Create profile & sign in** (or **Use device code** on Codex) to isolate a harness account directory without disturbing your default CLI profile, and switch back anytime with **Use default CLI profile** / **Use saved separate profile**. You can also pin custom directories via `profile_dir` in `harnesses.toml`.
+  - **Antigravity:** Open the Google link for the current sign-in attempt and submit its code or full callback URL. Windows can share credentials through its credential store even when conversation history uses a separate directory.
 - **Skills:** Enable/disable installed skills, inspect or edit `SKILL.md` and `references/` files, reset the preinstalled **`Meta-Harness Docs`** (`/meta-harness-docs`) guide, or install additional `SKILL.md` bundles via **Install Folder…**, **Install from Git URL**, or **New Custom Skill**. Repo-local `.agents/skills/` bundles are also discovered automatically.
 - **Global Personas:** Define reusable specialist handles (e.g., `@codex-reviewer`) with custom instructions, adapter binding, and default model/effort. New sessions automatically include templates whose harness is installed, or click **Add to session** for an active chat.
 - **Session:** Reassign the session **Orchestrator**, manage active member models/personas, adjust approval policy, tune **Max Agent Hops** (`2–16`), and prune saved command allow-rules.
+- **Network** in the desktop app accepts an outbound proxy URL. **Save and restart** applies it to the desktop app, its backend, and proxy-aware harness traffic. If the explicit proxy cannot be reached at startup, Meta-Harness connects directly and shows **Proxy not used**. Automatic mode uses the startup proxy environment or the Windows manual system proxy when available.
 - **Storage & Data:**
   - View itemized disk usage across SQLite DB, active project worktrees, Quick Sessions, archived sessions, and orphan caches.
   - Run **Clear Caches & Orphans** or **Delete Archived Sessions**.
@@ -153,10 +157,13 @@ meta-harness serve [OPTIONS]
 | `--no-open` | Do not automatically launch a browser tab | Opens on loopback |
 | `--no-tray` | Run in the foreground without system tray / menu bar icon | Tray enabled on Windows/macOS releases |
 | `--config <PATH>` | Path to `harnesses.toml` configuration | Auto-discovered |
+| `--proxy <URL>` | Outbound proxy for the server and its child processes. An unreachable explicit proxy falls back to a direct connection at startup. | Startup proxy environment or Windows manual proxy |
 | `--data-dir <PATH>` | Override SQLite database & app data directory | OS app-data dir |
 | `MH_CONFIG_DIR`, `MH_DATA_DIR`, `MH_WORKSPACE_DIR` | Override config, data, and Quick Session directories | OS standard dirs / `~/.meta-harness/workspaces` |
 
 Direct LAN access requires HTTPS. Supply a certificate trusted by your clients and use the hostname or IP address on that certificate when opening the pairing URL. The `#token=…` fragment is exchanged for a browser session that expires after 24 hours. Chat and terminal WebSockets close at expiry, and the browser prompts for pairing again. API clients can send `Authorization: Bearer <TOKEN>` over HTTPS.
+
+For example, `meta-harness serve --proxy http://127.0.0.1:7890` configures the machine running the server. Browsers opening the web UI use their own network settings. The server keeps its loopback connections direct.
 
 ```sh
 meta-harness serve --bind harness.example:4410 --tls-cert fullchain.pem --tls-key key.pem

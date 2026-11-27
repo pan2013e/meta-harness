@@ -89,6 +89,7 @@ pub async fn build_orchestrator_telemetry_block(
 
     if !jobs.is_empty() || !facts.is_empty() {
         out.push_str("  <episodic_memory>\n");
+        out.push_str("    Completed jobs are historical. Check current project state before relying on them.\n");
         for j in &jobs {
             out.push_str(&format!(
                 "    - job({}@{}) [{}]: {} (modules: {})\n",
@@ -101,8 +102,10 @@ pub async fn build_orchestrator_telemetry_block(
         }
         for f in &facts {
             out.push_str(&format!(
-                "    - fact[{}]: {}\n",
+                "    - fact[{}] id={} updated_at={}: {}\n",
                 f.category,
+                f.id,
+                f.updated_at,
                 truncate_str(&f.summary, 120)
             ));
         }
@@ -164,6 +167,7 @@ pub fn build_memory_curation_prompt(input: MemoryCurationPromptInput<'_>) -> Str
          Call `memory_curate_job` with turn_id=\"{}\", member_handle=\"{}\", touched_modules, \
          and a crisp 1-2 sentence `curated_summary` capturing who did what job, \
          which modules changed, and any notable outcome (plus optional `project_fact`).\n\
+         Use `memory_recall` before saving durable project facts. When verified work replaces an older agent-authored fact, call `memory_record_fact` with its `fact_id` and `expected_updated_at` to revise it.\n\
          </memory_curation_request>",
         input.member_handle,
         input.adapter_id,

@@ -6,5 +6,9 @@ if (process.isMainFrame) {
     textMenu: (kind, selection, canPaste) => ipcRenderer.invoke("meta-harness:text-menu", kind, selection, canPaste),
     windowsTitleBar: process.platform === "win32",
     setTitleBarColors: (color, symbolColor) => ipcRenderer.invoke("meta-harness:title-bar-colors", color, symbolColor),
+    selectProjectFolder: () => ipcRenderer.invoke("meta-harness:project-folder"),
+    notify: (body) => ipcRenderer.invoke("meta-harness:notify", body),
+    proxySettings: () => ipcRenderer.invoke("meta-harness:proxy-settings"),
+    saveProxy: (value) => ipcRenderer.invoke("meta-harness:save-proxy", value),
   });
 }

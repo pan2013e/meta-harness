@@ -439,6 +439,22 @@ pub struct ProjectFact {
     pub summary: String,
     pub author_id: String,
     pub created_at: i64,
+    pub updated_at: i64,
+}
+
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct NotificationPreferences {
+    pub approval_requests: bool,
+    pub turn_completions: bool,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ActivityNotificationKind {
+    ApprovalRequired,
+    TurnCompleted,
+    TurnFailed,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -661,6 +677,15 @@ pub enum WsEvent {
     QuotaUpdated { snapshot: QuotaSnapshot },
     #[serde(rename = "memory.job_curated")]
     MemoryJobCurated { job: EpisodicJob },
+    #[serde(rename = "memory.fact_updated")]
+    MemoryFactUpdated { fact: ProjectFact },
+    #[serde(rename = "activity.notification")]
+    ActivityNotification {
+        session_id: String,
+        id: String,
+        member_handle: String,
+        kind: ActivityNotificationKind,
+    },
     #[serde(rename = "session.updated")]
     SessionUpdated { session: Session },
     #[serde(rename = "context.updated")]

@@ -44,12 +44,15 @@ struct Snapshot {
     status: &'static str,
     output: String,
     accepts_input: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    authorization_url: Option<String>,
 }
 
 struct Job {
     snapshot: Snapshot,
     input: Option<Arc<Mutex<ChildStdin>>>,
     cancel: watch::Sender<bool>,
+    agy_code_flow: bool,
 }
 
 #[derive(Clone, Default)]
@@ -274,12 +277,15 @@ pub async fn start(
             )
         })?,
     };
+    let agy_code_flow = request.kind == Operation::SignIn
+        && command.as_std().get_args().any(|arg| arg == "--login");
     let (cancel, signal) = watch::channel(false);
     let snapshot = Snapshot {
         kind: request.kind,
         status: "running",
         output: String::new(),
         accepts_input: false,
+        authorization_url: None,
     };
     state.harness_jobs.0.lock().await.insert(
         id.clone(),
@@ -287,6 +293,7 @@ pub async fn start(
             snapshot: snapshot.clone(),
             input: None,
             cancel,
+            agy_code_flow,
         },
     );
     tokio::spawn(run_operation(
@@ -313,19 +320,33 @@ pub async fn input(
             "Enter the one-line authorization code or callback URL.",
         ));
     }
-    let writer = state
-        .harness_jobs
-        .0
-        .lock()
-        .await
-        .get(&id)
-        .and_then(|job| job.input.clone())
-        .ok_or_else(|| {
-            error(
-                StatusCode::CONFLICT,
-                "The sign-in process is not accepting input.",
-            )
-        })?;
+    let unavailable = || {
+        error(
+            StatusCode::CONFLICT,
+            "The sign-in process is not accepting input.",
+        )
+    };
+    let (writer, value) = {
+        let mut jobs = state.harness_jobs.0.lock().await;
+        let job = jobs
+            .get_mut(&id)
+            .filter(|job| job.snapshot.accepts_input)
+            .ok_or_else(unavailable)?;
+        if job.agy_code_flow {
+            let authorization = job
+                .snapshot
+                .authorization_url
+                .as_deref()
+                .ok_or_else(unavailable)?;
+            let code = agy_authorization_code(value, authorization)
+                .map_err(|message| error(StatusCode::BAD_REQUEST, message))?;
+            let writer = job.input.take().ok_or_else(unavailable)?;
+            job.snapshot.accepts_input = false;
+            (writer, code)
+        } else {
+            (job.input.clone().ok_or_else(unavailable)?, value.to_owned())
+        }
+    };
     let mut writer = writer.lock().await;
     writer
         .write_all(format!("{value}\n").as_bytes())
@@ -370,7 +391,64 @@ async fn collect_output(mut reader: impl AsyncRead + Unpin, jobs: HarnessJobs, i
                 .ceil_char_boundary(job.snapshot.output.len() - MAX_OUTPUT_CHARS);
             job.snapshot.output.drain(..start);
         }
+        if job.agy_code_flow && job.snapshot.authorization_url.is_none() {
+            job.snapshot.authorization_url = agy_authorization_url(&job.snapshot.output);
+            job.snapshot.accepts_input =
+                job.input.is_some() && job.snapshot.authorization_url.is_some();
+        }
     }
+}
+
+fn agy_authorization_url(output: &str) -> Option<String> {
+    // The CLI writes the URL on its own line. A polling client may see an incomplete chunk.
+    let (complete, _) = output.rsplit_once('\n')?;
+    complete.lines().find_map(|line| {
+        let start = line.find("https://")?;
+        let candidate = line[start..]
+            .split(|ch: char| ch.is_whitespace() || ch.is_control())
+            .next()?;
+        let url = reqwest::Url::parse(candidate).ok()?;
+        (url.scheme() == "https"
+            && url.host_str() == Some("accounts.google.com")
+            && url.path().starts_with("/o/oauth")
+            && url
+                .query_pairs()
+                .any(|(key, value)| key == "response_type" && value == "code")
+            && url.query_pairs().any(|(key, value)| {
+                key == "redirect_uri" && value == "https://antigravity.google/oauth-callback"
+            }))
+        .then(|| url.to_string())
+    })
+}
+
+fn agy_authorization_code(value: &str, authorization: &str) -> Result<String, &'static str> {
+    if !value.contains("://") && !value.chars().any(char::is_whitespace) {
+        return Ok(value.to_owned());
+    }
+    let callback = reqwest::Url::parse(value)
+        .map_err(|_| "Paste the authorization code or the full Antigravity callback URL.")?;
+    if callback.scheme() != "https"
+        || callback.host_str() != Some("antigravity.google")
+        || callback.path() != "/oauth-callback"
+    {
+        return Err("Paste the URL of the Antigravity page Google redirected you to.");
+    }
+    let state = callback
+        .query_pairs()
+        .find(|(key, _)| key == "state")
+        .map(|(_, value)| value.into_owned());
+    let requested_state = reqwest::Url::parse(authorization).ok().and_then(|url| {
+        url.query_pairs()
+            .find(|(key, _)| key == "state")
+            .map(|(_, value)| value.into_owned())
+    });
+    if state.is_some() && requested_state.is_some() && state != requested_state {
+        return Err(
+            "This callback belongs to a different sign-in attempt. Open the link for the current attempt.",
+        );
+    }
+    callback.query_pairs().find(|(key, value)| key == "code" && !value.is_empty() && !value.chars().any(|ch| ch.is_whitespace() || ch.is_control()))
+        .map(|(_, value)| value.into_owned()).ok_or("Google did not return an authorization code. Open the current sign-in link and try again.")
 }
 
 async fn run_operation(
@@ -401,7 +479,7 @@ async fn run_operation(
         let mut process_tree = ProcessTreeGuard::attach(&child);
         if let Some(entry) = state.harness_jobs.0.lock().await.get_mut(&id) {
             entry.input = child.stdin.take().map(|stdin| Arc::new(Mutex::new(stdin)));
-            entry.snapshot.accepts_input = entry.input.is_some();
+            entry.snapshot.accepts_input = entry.input.is_some() && !entry.agy_code_flow;
         }
         let stdout = child
             .stdout
@@ -454,6 +532,7 @@ async fn run_operation(
     if let Some(job) = state.harness_jobs.0.lock().await.get_mut(&id) {
         job.input = None;
         job.snapshot.accepts_input = false;
+        job.snapshot.authorization_url = None;
         let summary = match result {
             Ok(()) => {
                 job.snapshot.status = "completed";
@@ -512,8 +591,8 @@ fn sign_in_failure(summary: String, transcript: &str) -> String {
     .any(|part| text.contains(part))
     {
         "The CLI could not reach the provider's sign-in service. Check its network, proxy, or certificate settings."
-    } else if text.contains("token exchange failed") {
-        "The provider could not exchange the browser authorization for credentials. Try the sign-in flow again."
+    } else if text.contains("invalid_grant") || text.contains("token exchange failed") {
+        "The provider rejected the sign-in exchange. Start a fresh attempt and use its newest authorization code or callback URL once."
     } else {
         return summary;
     };
@@ -523,6 +602,27 @@ fn sign_in_failure(summary: String, transcript: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn agy_sign_in_waits_for_a_complete_link_and_extracts_the_current_code() {
+        let link = "https://accounts.google.com/o/oauth2/auth?response_type=code&redirect_uri=https%3A%2F%2Fantigravity.google%2Foauth-callback&state=current";
+        assert!(agy_authorization_url(link).is_none());
+        let transcript = format!("Sign in with Google:\n  {link}\nPaste your authorization code:");
+        let authorization = agy_authorization_url(&transcript).unwrap();
+        let callback = "https://antigravity.google/oauth-callback?state=current&code=4%2Ffixture";
+        assert_eq!(
+            agy_authorization_code(callback, &authorization),
+            Ok("4/fixture".into())
+        );
+        assert!(
+            agy_authorization_code(
+                "https://antigravity.google/oauth-callback?state=old&code=old",
+                &authorization
+            )
+            .is_err()
+        );
+        assert!(agy_authorization_code("https://example.com/?code=other", &authorization).is_err());
+    }
 
     #[test]
     fn fixture_cli_subprocess() {
@@ -577,9 +677,11 @@ mod tests {
                     status: "running",
                     output: String::new(),
                     accepts_input: false,
+                    authorization_url: None,
                 },
                 input: None,
                 cancel,
+                agy_code_flow: false,
             },
         );
         let permit = state

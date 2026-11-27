@@ -14,6 +14,7 @@ import { FolderPickerModal } from "./components/modals/FolderPickerModal";
 import { MemoryModal } from "./components/modals/MemoryModal";
 import { SettingsDialog } from "./components/modals/SettingsDialog";
 import { AboutUpdates } from "./components/modals/AboutUpdates";
+import { NetworkSettings } from "./components/modals/NetworkSettings";
 import { PersonaModelFields } from "./components/modals/PersonaModelFields";
 import { Sidebar } from "./components/sidebar/Sidebar";
 import { cleanWorktreePath, groupTrajectoryEvents } from "./components/drawer/trajectory";
@@ -31,6 +32,18 @@ afterEach(() => {
 });
 
 describe("Opening project folders", () => {
+  it("uses the desktop directory picker and preserves cancellation", async () => {
+    const selectProjectFolder = vi.fn().mockResolvedValueOnce("C:\\Code\\Project").mockResolvedValueOnce(null);
+    vi.stubGlobal("metaHarnessDesktop", { selectProjectFolder });
+    const createAndSelectProject = vi.fn().mockResolvedValue(undefined);
+    useAppStore.setState({ createAndSelectProject });
+    const { openProjectWithNativeOrModal } = useAppStore.getState();
+    await openProjectWithNativeOrModal();
+    await openProjectWithNativeOrModal();
+    expect(createAndSelectProject).toHaveBeenCalledExactlyOnceWith("C:\\Code\\Project");
+    expect(useAppStore.getState().folderModalOpen).toBe(false);
+  });
+
   it("replaces a pending locations request when browsing to a typed path", async () => {
     const listing = vi.spyOn(api, "listFs")
       .mockImplementationOnce((_path, signal) => new Promise((_, reject) => {
@@ -62,6 +75,48 @@ describe("Opening project folders", () => {
     expect(selectProject).toHaveBeenCalledWith(project.id);
     expect(useAppStore.getState()).toMatchObject({ projects: [project], folderModalOpen: false });
   });
+});
+
+it("delivers enabled desktop notifications for activity in another session", () => {
+  const notify = vi.fn().mockResolvedValue(true);
+  vi.stubGlobal("metaHarnessDesktop", { notify });
+  useAppStore.setState({ notificationPreferences: { approval_requests: true, turn_completions: false } });
+  const store = useAppStore.getState();
+  store.handleWsEvent({ type: "activity.notification", session_id: "other", member_handle: "codex", kind: "approval_required", id: "approval" });
+  store.handleWsEvent({ type: "activity.notification", session_id: "other", member_handle: "claude", kind: "turn_completed", id: "turn" });
+  expect(notify).toHaveBeenCalledExactlyOnceWith("@codex is waiting for approval.");
+});
+
+it("shows an inactive proxy badge without an error when the saved proxy is unreachable", async () => {
+  vi.stubGlobal("metaHarnessDesktop", {
+    proxySettings: vi.fn().mockResolvedValue({ host: "proxy.example:8080", proxyNotUsed: true }),
+  });
+  render(<NetworkSettings />);
+  await screen.findByText("Proxy not used");
+  expect(screen.queryByRole("alert")).toBeNull();
+});
+
+it("switches away from a session while its background deletion is pending", async () => {
+  const session = {
+    id: "old", project_id: null, title: "Old session", base_branch: null, base_commit_sha: null,
+    integration_branch: null, integration_wt_path: null, isolation_mode: "shared_cwd" as const,
+    orchestrator_member: null, confirm_before_dispatch: false, max_hops: 6,
+    permission_policy: "require_approval" as const, working_summary: "", created_at: 0, updated_at: 0,
+  };
+  const next = { ...session, id: "next", title: "Next session" };
+  const selectSession = vi.fn().mockResolvedValue(undefined);
+  useAppStore.setState({ activeSession: session, sessions: [session, next], selectSession });
+  let complete!: () => void;
+  vi.spyOn(api, "deleteSession").mockImplementation(() => new Promise((resolve) => {
+    complete = () => resolve({ deleted: true });
+  }));
+  const deleting = useAppStore.getState().deleteSessionById(session.id);
+  expect(useAppStore.getState().deletingSessionIds).toEqual([session.id]);
+  expect(selectSession).toHaveBeenCalledWith(next.id);
+  complete();
+  await deleting;
+  expect(useAppStore.getState().deletingSessionIds).toEqual([]);
+  expect(useAppStore.getState().sessions).toEqual([next]);
 });
 
 describe("Chat approvals and image inputs", () => {

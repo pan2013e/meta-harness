@@ -1,9 +1,11 @@
 import { useEffect, useRef, useState } from "react";
 import {
   Archive,
+  Bell,
   Check,
   ChevronRight,
   Crown,
+  Globe,
   HardDrive,
   Info,
   Palette,
@@ -26,6 +28,8 @@ import { GlobalPersonas } from "./GlobalPersonas";
 import { SettingsBackup } from "./SettingsBackup";
 import { SkillsSettings } from "./SkillsSettings";
 import { AboutUpdates } from "./AboutUpdates";
+import { NotificationSettings } from "./NotificationSettings";
+import { NetworkSettings } from "./NetworkSettings";
 import { version } from "../../../package.json";
 
 function formatBytes(bytes: number): string {
@@ -43,7 +47,7 @@ function formatBytes(bytes: number): string {
 export function SettingsDialog({ onClose }: { onClose: () => void }) {
   const dialog = useRef<HTMLDialogElement>(null);
   const [section, setSection] = useState<
-    "harnesses" | "skills" | "session" | "personas" | "storage" | "appearance" | "about"
+    "harnesses" | "skills" | "session" | "personas" | "storage" | "appearance" | "about" | "notifications" | "network"
   >("harnesses");
   const [saving, setSaving] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -241,14 +245,16 @@ export function SettingsDialog({ onClose }: { onClose: () => void }) {
             {(
               [
                 ["appearance", "Appearance", Palette],
+                ["notifications", "Notifications", Bell],
                 ["harnesses", "Harnesses & Models", Terminal],
                 ["skills", "Skills", Sparkles],
                 ["personas", "Global Personas", UserPlus],
                 ["session", "Session", Sliders],
+                ["network", "Network", Globe],
                 ["storage", "Storage & Data", HardDrive],
                 ["about", "About", Info],
               ] as const
-            ).map(([id, label, Icon]) => (
+            ).filter(([id]) => id !== "network" || Boolean(window.metaHarnessDesktop?.saveProxy)).map(([id, label, Icon]) => (
               <button
                 key={id}
                 type="button"
@@ -276,6 +282,8 @@ export function SettingsDialog({ onClose }: { onClose: () => void }) {
               </p>
             )}
 
+            {section === "notifications" && <NotificationSettings />}
+            {section === "network" && <NetworkSettings />}
             {section === "about" && (
               <section className="space-y-5 text-sm">
                 <div className="flex items-center gap-3">

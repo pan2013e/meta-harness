@@ -15,6 +15,7 @@ import type {
   MemberRole,
   MemberStatus,
   MessageOptions,
+  NotificationPreferences,
   PendingPermissionView,
   PermissionPolicy,
   PermissionRule,
@@ -141,6 +142,9 @@ export const api = {
   probeAdapters: () =>
     apiFetch<{ probes: AdapterProbeStatus[] }>("/api/adapters/probe"),
   exportSettings: () => apiFetch<SettingsFile>("/api/settings"),
+  notificationPreferences: () => apiFetch<NotificationPreferences>("/api/settings/notifications"),
+  saveNotificationPreferences: (prefs: NotificationPreferences) =>
+    apiFetch<NotificationPreferences>("/api/settings/notifications", { method: "PUT", body: JSON.stringify(prefs) }),
   importSettings: (document: unknown) =>
     apiFetch<SettingsFile>("/api/settings", { method: "POST", body: JSON.stringify(document) }),
   listSkills: (projectId?: string | null) =>
@@ -479,6 +483,11 @@ export const api = {
     apiFetch<{ fact: ProjectFact }>(
       `/api/projects/${encodeURIComponent(projectId)}/memory/facts`,
       { method: "POST", body: JSON.stringify({ category, summary }) }
+    ),
+  reviseFact: (fact: ProjectFact, category: string, summary: string) =>
+    apiFetch<{ fact: ProjectFact }>(
+      `/api/projects/${encodeURIComponent(fact.project_id)}/memory/facts/${encodeURIComponent(fact.id)}`,
+      { method: "PATCH", body: JSON.stringify({ category, summary, expected_updated_at: fact.updated_at }) },
     ),
   deleteFact: (projectId: string, factId: string) =>
     apiFetch<{ deleted: boolean }>(

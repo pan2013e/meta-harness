@@ -1192,18 +1192,18 @@ pub async fn delete_session(
     State(state): State<AppState>,
     AxumPath(session_id): AxumPath<String>,
 ) -> ApiResult<Value> {
-    let runtime = state.switch.runtime(&session_id).await;
-    let _lifecycle = runtime.lifecycle_lock.lock().await;
-    let sess = state
-        .switch
-        .store
-        .get_session(&session_id)
-        .map_err(|e| err_resp(StatusCode::NOT_FOUND, e.to_string()))?;
-
-    let (_, harness_warnings) = remove_session(&state, &sess).await?;
-    Ok(Json(
-        json!({ "deleted": true, "harness_warnings": harness_warnings }),
-    ))
+    // Closing the browser or abandoning the request must not interrupt cleanup.
+    tokio::spawn(async move {
+        let runtime = state.switch.runtime(&session_id).await;
+        let _lifecycle = runtime.lifecycle_lock.lock().await;
+        let session = state.switch.store.get_session(&session_id)
+            .map_err(|error| err_resp(StatusCode::NOT_FOUND, error.to_string()))?;
+        let (removed_checkout, mut warnings) = remove_session(&state, &session).await?;
+        if !removed_checkout {
+            warnings.push("Some workspace files could not be removed. Storage & Data can retry orphan cleanup.".into());
+        }
+        Ok(Json(json!({ "deleted": true, "harness_warnings": warnings })))
+    }).await.map_err(|error| err_resp(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?
 }
 
 async fn remove_session(
@@ -1938,7 +1938,7 @@ pub async fn get_project_memory(
     let facts = state
         .switch
         .store
-        .list_facts(&project_id, 50)
+        .recall_facts(&project_id, q.q.as_deref(), 50)
         .map_err(|e| err_resp(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
     Ok(Json(json!({ "jobs": jobs, "facts": facts })))
 }
@@ -1964,17 +1964,56 @@ pub async fn create_project_fact(
             "user",
         )
         .map_err(|e| err_resp(StatusCode::BAD_REQUEST, e.to_string()))?;
+    let _ = state
+        .switch
+        .events_tx
+        .send(WsEvent::MemoryFactUpdated { fact: fact.clone() });
+    Ok(Json(json!({ "fact": fact })))
+}
+
+#[derive(Debug, Deserialize)]
+pub struct ReviseFactRequest {
+    category: Option<String>,
+    summary: String,
+    expected_updated_at: i64,
+}
+
+pub async fn revise_project_fact(
+    State(state): State<AppState>,
+    AxumPath((project_id, fact_id)): AxumPath<(String, String)>,
+    Json(body): Json<ReviseFactRequest>,
+) -> ApiResult<Value> {
+    let fact = state
+        .switch
+        .store
+        .revise_fact(
+            &project_id,
+            &fact_id,
+            body.category.as_deref(),
+            &body.summary,
+            None,
+            body.expected_updated_at,
+        )
+        .map_err(|error| match error {
+            mh_store::StoreError::NotFound(_) => err_resp(StatusCode::NOT_FOUND, error.to_string()),
+            mh_store::StoreError::Conflict(_) => err_resp(StatusCode::CONFLICT, error.to_string()),
+            error => err_resp(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()),
+        })?;
+    let _ = state
+        .switch
+        .events_tx
+        .send(WsEvent::MemoryFactUpdated { fact: fact.clone() });
     Ok(Json(json!({ "fact": fact })))
 }
 
 pub async fn delete_project_fact(
     State(state): State<AppState>,
-    AxumPath((_project_id, fact_id)): AxumPath<(String, String)>,
+    AxumPath((project_id, fact_id)): AxumPath<(String, String)>,
 ) -> ApiResult<Value> {
     state
         .switch
         .store
-        .delete_fact(&fact_id)
+        .delete_fact(&project_id, &fact_id)
         .map_err(|e| err_resp(StatusCode::NOT_FOUND, e.to_string()))?;
     Ok(Json(json!({ "deleted": true })))
 }

@@ -27,7 +27,9 @@ export function Sidebar() {
     activeSession,
     sidebarCollapsed,
     toggleSidebar,
-    setFolderModalOpen,
+    openProjectWithNativeOrModal,
+    pickingFolder,
+    deletingSessionIds,
     selectProject,
     gitInitActiveProject,
     selectSession,
@@ -44,8 +46,6 @@ export function Sidebar() {
   const [editingSessionId, setEditingSessionId] = useState<string | null>(null);
   const [editingTitle, setEditingTitle] = useState("");
   const [deleteTarget, setDeleteTarget] = useState<{ id: string; title: string } | null>(null);
-  const [deleting, setDeleting] = useState(false);
-  const [deleteError, setDeleteError] = useState<string | null>(null);
   const deleteDialog = useRef<HTMLDialogElement>(null);
   const [contextMenu, setContextMenu] = useState<{
     sessionId: string;
@@ -66,19 +66,14 @@ export function Sidebar() {
     if (deleteTarget && !deleteDialog.current?.open) deleteDialog.current?.showModal();
   }, [deleteTarget]);
 
-  const confirmDelete = async () => {
-    if (!deleteTarget || deleting) return;
-    setDeleting(true);
-    setDeleteError(null);
-    try {
-      await deleteSessionById(deleteTarget.id);
-      deleteDialog.current?.close();
-      setDeleteTarget(null);
-    } catch (error) {
-      setDeleteError(error instanceof Error ? error.message : String(error));
-    } finally {
-      setDeleting(false);
-    }
+  const confirmDelete = () => {
+    if (!deleteTarget) return;
+    const { id, title } = deleteTarget;
+    deleteDialog.current?.close();
+    setDeleteTarget(null);
+    void deleteSessionById(id).catch((error: unknown) => {
+      setError(`Could not delete “${title}”. ${error instanceof Error ? error.message : String(error)}`);
+    });
   };
 
   if (sidebarCollapsed) {
@@ -86,8 +81,9 @@ export function Sidebar() {
   }
 
   const activeProject = projects.find((p) => p.id === activeProjectId) ?? null;
-  const activeSessions = sessions.filter((s) => s.archived_at == null);
-  const archivedSessions = sessions.filter((s) => s.archived_at != null);
+  const visibleSessions = sessions.filter((s) => !deletingSessionIds.includes(s.id));
+  const activeSessions = visibleSessions.filter((s) => s.archived_at == null);
+  const archivedSessions = visibleSessions.filter((s) => s.archived_at != null);
   const contextTarget = contextMenu
     ? sessions.find((s) => s.id === contextMenu.sessionId) ?? null
     : null;
@@ -146,7 +142,8 @@ export function Sidebar() {
           </span>
           <button
             type="button"
-            onClick={() => setFolderModalOpen(true)}
+            disabled={pickingFolder}
+            onClick={() => void openProjectWithNativeOrModal()}
             className="inline-flex items-center gap-1 px-2 py-1 rounded-lg bg-brand-soft hover:bg-brand/25 border border-brand/25 text-[11px] font-medium text-brand-ink transition-colors"
           >
             <FolderOpen className="w-3.5 h-3.5" />
@@ -346,6 +343,11 @@ export function Sidebar() {
           )}
         </div>
 
+        {deletingSessionIds.length > 0 && (
+          <p role="status" className="px-3 py-1 text-xs text-ink-muted">
+            Removing {deletingSessionIds.length === 1 ? "session" : `${deletingSessionIds.length} sessions`}…
+          </p>
+        )}
         {archivedSessions.length > 0 && (
           <div className="pt-2 border-t border-line/70 space-y-1">
             <button
@@ -473,7 +475,6 @@ export function Sidebar() {
               role="menuitem"
               onClick={() => {
                 setContextMenu(null);
-                setDeleteError(null);
                 if (contextTarget) setDeleteTarget({ id: contextTarget.id, title: contextTarget.title });
               }}
               className="w-full flex items-center gap-2 px-2.5 py-1.5 rounded-lg text-left text-neg hover:bg-neg-soft transition-colors"
@@ -490,22 +491,20 @@ export function Sidebar() {
           aria-labelledby="delete-session-title"
           aria-describedby="delete-session-description"
           onClose={() => setDeleteTarget(null)}
-          onCancel={(event) => { if (deleting) event.preventDefault(); }}
           className="m-auto w-[calc(100%-2rem)] max-w-sm rounded-xl border border-line-strong bg-panel p-5 text-ink shadow-2xl"
         >
           <h2 id="delete-session-title" className="font-semibold">Delete session?</h2>
           <p id="delete-session-description" className="mt-2 break-words text-sm text-ink-soft">
             Delete “{deleteTarget.title}”, its worktrees, and linked conversations in supported harnesses?
           </p>
-          {deleteError && <p role="alert" className="mt-3 text-sm text-neg">{deleteError}</p>}
           <div className="mt-5 flex justify-end gap-2 text-sm">
-            <button type="button" autoFocus disabled={deleting} onClick={() => deleteDialog.current?.close()}
+            <button type="button" autoFocus onClick={() => deleteDialog.current?.close()}
               className="rounded-lg border border-line bg-elevated px-3 py-1.5 hover:bg-hover">
               Cancel
             </button>
-            <button type="button" disabled={deleting} onClick={() => void confirmDelete()}
-              className="rounded-lg bg-neg-soft px-3 py-1.5 font-medium text-neg hover:bg-neg/20 disabled:opacity-50">
-              {deleting ? "Deleting…" : "Delete session"}
+            <button type="button" onClick={confirmDelete}
+              className="rounded-lg bg-neg-soft px-3 py-1.5 font-medium text-neg hover:bg-neg/20">
+              Delete session
             </button>
           </div>
         </dialog>

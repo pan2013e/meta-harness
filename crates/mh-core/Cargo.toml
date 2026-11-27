@@ -13,6 +13,10 @@ toml = { workspace = true }
 thiserror = { workspace = true }
 dunce = { workspace = true }
 dirs = { workspace = true }
+url = "2"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_Networking_WinHttp"] }
 
 [dev-dependencies]
 uuid = { workspace = true }

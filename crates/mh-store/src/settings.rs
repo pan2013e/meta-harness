@@ -1,5 +1,5 @@
-use mh_core::{AdapterModelPref, GlobalPersona, SessionMember};
-use rusqlite::{Connection, params};
+use mh_core::{AdapterModelPref, GlobalPersona, NotificationPreferences, SessionMember};
+use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 
 use crate::{AdapterQuotaPref, Store, StoreError, memory};
@@ -9,9 +9,24 @@ pub struct AppPreferences {
     pub global_personas: Vec<GlobalPersona>,
     pub adapter_defaults: Vec<AdapterModelPref>,
     pub quota_preferences: Vec<AdapterQuotaPref>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub notifications: Option<NotificationPreferences>,
 }
 
 impl Store {
+    pub fn notification_preferences(&self) -> Result<NotificationPreferences, StoreError> {
+        let conn = self.conn()?;
+        Ok(read_notifications(&conn)?.unwrap_or_default())
+    }
+
+    pub fn set_notification_preferences(
+        &self,
+        prefs: NotificationPreferences,
+    ) -> Result<(), StoreError> {
+        let conn = self.conn()?;
+        write_notifications(&conn, prefs)
+    }
+
     pub fn list_global_personas(&self) -> Result<Vec<GlobalPersona>, StoreError> {
         let conn = self.conn()?;
         list_personas(&conn)
@@ -60,6 +75,7 @@ impl Store {
             global_personas: list_personas(&tx)?,
             adapter_defaults: memory::list_model_prefs(&tx)?,
             quota_preferences: memory::list_quota_prefs(&tx)?,
+            notifications: read_notifications(&tx)?,
         };
         tx.commit()?;
         Ok(prefs)
@@ -77,9 +93,31 @@ impl Store {
         for pref in &prefs.quota_preferences {
             memory::write_quota_pref(&tx, pref)?;
         }
+        if let Some(notifications) = prefs.notifications {
+            write_notifications(&tx, notifications)?;
+        }
         tx.commit()?;
         Ok(())
     }
+}
+
+fn read_notifications(conn: &Connection) -> Result<Option<NotificationPreferences>, StoreError> {
+    Ok(conn.query_row(
+        "SELECT approval_requests, turn_completions FROM notification_preferences WHERE singleton = 1",
+        [], |row| Ok(NotificationPreferences { approval_requests: row.get(0)?, turn_completions: row.get(1)? }),
+    ).optional()?)
+}
+
+fn write_notifications(
+    conn: &Connection,
+    prefs: NotificationPreferences,
+) -> Result<(), StoreError> {
+    conn.execute(
+        "INSERT INTO notification_preferences VALUES (1, ?1, ?2)
+         ON CONFLICT(singleton) DO UPDATE SET approval_requests = excluded.approval_requests, turn_completions = excluded.turn_completions",
+        params![prefs.approval_requests, prefs.turn_completions],
+    )?;
+    Ok(())
 }
 
 fn list_personas(conn: &Connection) -> Result<Vec<GlobalPersona>, StoreError> {

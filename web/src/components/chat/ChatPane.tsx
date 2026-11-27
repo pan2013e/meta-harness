@@ -51,7 +51,7 @@ export function ChatPane() {
     toggleSidebar,
     continueHopChain,
     stopAll,
-    setFolderModalOpen,
+    openProjectWithNativeOrModal,
     selectProject,
     gitInitActiveProject,
     probes,
@@ -398,7 +398,7 @@ export function ChatPane() {
                           type="button"
                           onClick={() => {
                             setProjPickerOpen(false);
-                            setFolderModalOpen(true);
+                            void openProjectWithNativeOrModal();
                           }}
                           className="w-full px-2.5 py-1.5 rounded-lg text-xs text-brand-ink hover:bg-hover flex items-center gap-2 font-medium border-t border-line mt-1 pt-2"
                         >

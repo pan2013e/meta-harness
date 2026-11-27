@@ -36,7 +36,7 @@ Injected into every `session/new` / `session/load` via `meta-harness mcp-bridge`
   - `chat_send_message` — Post a group-chat message and asynchronously wake `@to` recipients (consumes 1 hop).
   - `peer_consult` — Ask an idle peer a question synchronously mid-turn (`target`, `question`, optional `context_turn_id`). Protected by `WaitForGraph` deadlock detection; renders a collapsible **Sync Consult** thread in chat.
   - `trajectory_list` & `trajectory_read` — Inspect peer turn summaries, tool calls, diffs, or full paginated events (`16 KiB/page`). Emits an inline `ActivityPill` (`@a read @b's trajectory`).
-  - `memory_recall` & `memory_record_fact` — Search SQLite FTS5 `episodic_jobs` and record durable `project_facts`.
+  - `memory_recall` & `memory_record_fact` — Search historical jobs and current project facts. Revise an agent-authored fact in place using its `fact_id` and `expected_updated_at` from recall.
   - `quota_get_status` — Inspect adapter 5h/weekly quota windows and cooldowns.
   - `skill_list` & `skill_read` — List enabled skills and read `SKILL.md` / reference files with zero permission prompts.
 - **Orchestrator additional tools:**
@@ -77,11 +77,14 @@ Open **Settings** from the bottom-left sidebar:
 - **Session:** Reassign orchestrator, tune `max_hops` (`2–16`), edit member models/personas, adjust approval mode, prune session command allow-rules.
 - **Storage & Data:** Itemized disk usage breakdown, **Clear Caches & Orphans**, **Delete Archived Sessions**, and versioned JSON Settings export/import.
 - **About:** App version, six-character build commit, license and third-party notices, and release update checks.
+- **Notifications:** Opt in to approval and turn completion alerts. Electron uses system notifications and the standalone web app needs browser permission and an open tab.
+- **Network:** The desktop proxy applies after restart. An unreachable explicit proxy leaves connections direct and shows **Proxy not used**.
 
 ### CLI & Environment Overrides
 - Run as a standard user. Both app entry points refuse Unix root and elevated Windows launches.
 - `meta-harness [serve]` flags include `--bind <ADDR:PORT>` (default `127.0.0.1:4410`), `--tls-cert <PATH>`, `--tls-key <PATH>`, `--auth-token <TOKEN>`, `--no-open`, `--no-tray`, `--config <PATH>`, and `--data-dir <PATH>`.
 - Env overrides: `MH_CONFIG_DIR`, `MH_DATA_DIR`, `MH_WORKSPACE_DIR` (defaults Quick Sessions to `~/.meta-harness/workspaces`).
+- `--proxy <URL>` configures outbound connections from the standalone server and its harnesses. A browser uses its own network settings. Loopback remains direct.
 - Direct LAN binds require a trusted HTTPS certificate and key. Use `#token=<TOKEN>` pairing in browsers or `Authorization: Bearer <TOKEN>` for API clients. The browser receives a signed `HttpOnly; SameSite=Strict` session cookie that expires after 24 hours and is `Secure` over HTTPS. The chat and terminal sockets also close at expiry.
 - To use an HTTPS reverse proxy, bind Meta-Harness to loopback, configure a strong `--auth-token`, and forward the original `Host` and WebSocket upgrades. Pairing grants workspace and terminal access.
 - Standalone release binaries provide `install`, `update --check`, `update`, and `uninstall`. Desktop releases use the Windows installer or macOS disk image for updates. Uninstall keeps sessions and settings.

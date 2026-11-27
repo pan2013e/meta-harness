@@ -1351,6 +1351,27 @@ async fn settings_backup_and_global_personas_preserve_session_choices() {
         .await
         .unwrap();
     assert_eq!(exported["preferences"], imported["preferences"]);
+    let notification_prefs = json!({ "approval_requests": true, "turn_completions": false });
+    let notification_url = format!("{settings_url}/notifications");
+    http.put(&notification_url)
+        .json(&notification_prefs)
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap();
+    let restored: Value = http
+        .post(&settings_url)
+        .json(&expected)
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(restored["preferences"]["notifications"], notification_prefs);
     assert!(switch.store.get_member(existing_id, "reviewer").is_err());
 
     let add = || http.post(format!("{sessions_url}/{existing_id}/personas/reviewer"));

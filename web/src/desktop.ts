@@ -7,6 +7,10 @@ declare global {
       textMenu: (kind: "message" | "composer" | "terminal", selection: string, canPaste: boolean) => Promise<TextMenuAction>;
       windowsTitleBar: boolean;
       setTitleBarColors: (color: string, symbolColor: string) => Promise<void>;
+      selectProjectFolder: () => Promise<string | null>;
+      notify: (body: string) => Promise<boolean>;
+      proxySettings: () => Promise<{ host: string | null; proxyNotUsed: boolean }>;
+      saveProxy: (value: string | null) => Promise<void>;
     };
   }
 }

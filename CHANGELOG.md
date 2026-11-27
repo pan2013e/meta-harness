@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+- Use the desktop system proxy or an explicit desktop Network setting for the app and its harnesses. Add `--proxy` for the standalone server, keep loopback traffic direct, and fall back to a direct connection when an explicit proxy is unreachable.
+- Improve Antigravity sign-in with complete provider links, support for callback URLs, and clearer separate-profile and exchange status.
+- Add opt-in desktop and browser notifications for approval requests and finished turns.
+- Use the native directory picker in the desktop app and keep session cleanup running in the background.
+- Let users and agents revise project facts, hide duplicates, and search current facts alongside prior jobs.
+
 ## 0.8.0
 
 - Render Antigravity replies with nested lists, deeper headings, and bold text containing inline code. Preserve workspace file previews and expandable code and detail blocks.

@@ -1,5 +1,6 @@
 import { create } from "zustand";
 import { api, WsHubClient } from "../api/client";
+import { showNotification } from "../notifications";
 import type {
   AdapterConfig,
   AdapterModelCatalog,
@@ -11,6 +12,7 @@ import type {
   GlobalPersona,
   MemberStatus,
   MessageOptions,
+  NotificationPreferences,
   PendingPermissionView,
   PermissionPolicy,
   PermissionRule,
@@ -96,6 +98,7 @@ interface AppState {
   quotasRefreshing: boolean;
   promoteBanner: string | null;
   pendingPermissionPolicy: PermissionPolicy;
+  notificationPreferences: NotificationPreferences;
 
   adapters: Record<string, AdapterConfig>;
   adapterCatalogs: Record<string, AdapterModelCatalog>;
@@ -108,6 +111,7 @@ interface AppState {
   projects: Project[];
   activeProjectId: string | null;
   sessions: Session[];
+  deletingSessionIds: string[];
   activeSession: Session | null;
   members: SessionMember[];
   memberOptions: Record<string, DiscoveredConfigOption[]>;
@@ -157,6 +161,7 @@ interface AppState {
   setShellOpen: (open: boolean) => void;
   setPromoteBanner: (msg: string | null) => void;
   setPendingPermissionPolicy: (policy: PermissionPolicy) => void;
+  saveNotificationPreferences: (prefs: NotificationPreferences) => Promise<void>;
   resolvePermission: (sessionId: string, requestId: string, optionId: string, pattern?: string) => Promise<void>;
   openProjectWithNativeOrModal: () => Promise<void>;
 
@@ -294,6 +299,7 @@ export const useAppStore = create<AppState>((set, get) => {
     quotasRefreshing: false,
     promoteBanner: null,
     pendingPermissionPolicy: "require_approval",
+    notificationPreferences: { approval_requests: false, turn_completions: false },
 
     adapters: {},
     adapterCatalogs: {},
@@ -306,6 +312,7 @@ export const useAppStore = create<AppState>((set, get) => {
     projects: [],
     activeProjectId: null,
     sessions: [],
+    deletingSessionIds: [],
     activeSession: null,
     members: [],
     memberOptions: {},
@@ -353,13 +360,30 @@ export const useAppStore = create<AppState>((set, get) => {
     setShellOpen: (open) => set({ shellOpen: open }),
     setPromoteBanner: (msg) => set({ promoteBanner: msg }),
     setPendingPermissionPolicy: (policy) => set({ pendingPermissionPolicy: policy }),
+    saveNotificationPreferences: async (prefs) => {
+      set({ notificationPreferences: await api.saveNotificationPreferences(prefs) });
+    },
     resolvePermission: async (sessionId, requestId, optionId, pattern) => {
       await api.resolvePermission(sessionId, requestId, optionId, pattern);
       get().handleWsEvent({ type: "permission.resolved", session_id: sessionId, request_id: requestId, decision: "resolved" });
     },
 
     openProjectWithNativeOrModal: async () => {
-      set({ folderModalOpen: true });
+      const desktop = window.metaHarnessDesktop;
+      if (!desktop?.selectProjectFolder) {
+        set({ folderModalOpen: true });
+        return;
+      }
+      if (get().pickingFolder) return;
+      set({ pickingFolder: true });
+      try {
+        const path = await desktop.selectProjectFolder();
+        if (path) await get().createAndSelectProject(path);
+      } catch (error) {
+        reportError(error);
+      } finally {
+        set({ pickingFolder: false });
+      }
     },
 
     clearError: () => set({ errorBanner: null }),
@@ -403,6 +427,9 @@ export const useAppStore = create<AppState>((set, get) => {
         }
 
         set({ startupPhase: "detecting" });
+        void api.notificationPreferences().then((prefs) => {
+          if (startup === startupRequest) set({ notificationPreferences: prefs });
+        }).catch(() => undefined);
         const [adaptersRes, probeRes, projRes] = await Promise.all([
           api.listAdapters(false, true),
           api.probeAdapters(),
@@ -495,7 +522,7 @@ export const useAppStore = create<AppState>((set, get) => {
             memoryFacts: mem.facts,
           }),
         });
-        const firstActive = sessions.find((s) => s.archived_at == null);
+        const firstActive = sessions.find((s) => s.archived_at == null && !get().deletingSessionIds.includes(s.id));
         if (firstActive) await get().selectSession(firstActive.id);
       } catch (error) {
         if (request === projectRequest) reportError(error);
@@ -532,6 +559,7 @@ export const useAppStore = create<AppState>((set, get) => {
     },
 
     selectSession: async (sessionId: string) => {
+      if (get().deletingSessionIds.includes(sessionId)) return;
       const current = get().activeSession?.id === sessionId;
       if (!current && sessionLoad?.id !== sessionId) clearSession();
       const request = ++sessionRequest;
@@ -649,23 +677,21 @@ export const useAppStore = create<AppState>((set, get) => {
     },
 
     deleteSessionById: async (sessionId: string) => {
-      const pid = get().activeProjectId;
-      const request = projectRequest;
-      const { harness_warnings } = await api.deleteSession(sessionId);
-      const { sessions } = pid
-        ? await api.listSessions(pid, true)
-        : await api.listStandaloneSessions(true);
-      if (request !== projectRequest) return;
-      set({ sessions });
+      if (get().deletingSessionIds.includes(sessionId)) return;
+      set((state) => ({ deletingSessionIds: [...state.deletingSessionIds, sessionId] }));
       if (get().activeSession?.id === sessionId || sessionLoad?.id === sessionId) {
-        const nextActive = sessions.find((s) => s.archived_at == null);
-        if (nextActive) {
-          await get().selectSession(nextActive.id);
-        } else {
-          clearSession();
-        }
+        clearSession();
+        const { sessions, deletingSessionIds } = get();
+        const next = sessions.find((session) => session.archived_at == null && !deletingSessionIds.includes(session.id));
+        if (next) void get().selectSession(next.id);
       }
-      if (harness_warnings?.length) get().setError(harness_warnings.join(" "));
+      try {
+        const { harness_warnings } = await api.deleteSession(sessionId);
+        set((state) => ({ sessions: state.sessions.filter((session) => session.id !== sessionId) }));
+        if (harness_warnings?.length) get().setError(harness_warnings.join(" "));
+      } finally {
+        set((state) => ({ deletingSessionIds: state.deletingSessionIds.filter((id) => id !== sessionId) }));
+      }
     },
 
     compactActiveSession: async () => {
@@ -770,6 +796,7 @@ export const useAppStore = create<AppState>((set, get) => {
       set({
         globalPersonas: preferences.global_personas,
         adapterDefaults: Object.fromEntries(preferences.adapter_defaults.map((pref) => [pref.adapter_id, pref])),
+        ...(preferences.notifications && { notificationPreferences: preferences.notifications }),
       });
       if (theme) get().setTheme(theme);
       void get().refreshQuotas();
@@ -961,6 +988,17 @@ export const useAppStore = create<AppState>((set, get) => {
     },
 
     handleWsEvent: (ev: WsEvent) => {
+      if (ev.type === "activity.notification") {
+        const { notificationPreferences: prefs, activeSession } = get();
+        const approval = ev.kind === "approval_required";
+        const enabled = approval ? prefs.approval_requests : prefs.turn_completions;
+        const viewingSession = activeSession?.id === ev.session_id && document.visibilityState === "visible" && document.hasFocus();
+        if (enabled && !viewingSession) {
+          const status = approval ? "is waiting for approval" : ev.kind === "turn_failed" ? "could not finish a turn" : "finished a turn";
+          void showNotification(`@${ev.member_handle} ${status}.`, ev.id).catch(() => undefined);
+        }
+        return;
+      }
       const eventSessionId =
         "message" in ev
           ? ev.message.session_id
@@ -1140,6 +1178,17 @@ export const useAppStore = create<AppState>((set, get) => {
             set((s) => ({
               memoryJobs: [ev.job, ...s.memoryJobs.filter((j) => j.id !== ev.job.id)],
             }));
+          }
+          break;
+        }
+        case "memory.fact_updated": {
+          if (get().activeProjectId === ev.fact.project_id) {
+            set((state) => {
+              const current = state.memoryFacts.find((fact) => fact.id === ev.fact.id);
+              if (current && current.updated_at > ev.fact.updated_at) return state;
+              return { memoryFacts: [ev.fact, ...state.memoryFacts.filter((fact) => fact.id !== ev.fact.id)]
+                .sort((a, b) => b.updated_at - a.updated_at).slice(0, 50) };
+            });
           }
           break;
         }

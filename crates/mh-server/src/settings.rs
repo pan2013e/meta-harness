@@ -5,7 +5,7 @@ use axum::{
     extract::{Path, State},
     http::StatusCode,
 };
-use mh_core::{AppConfig, GlobalPersona};
+use mh_core::{AppConfig, GlobalPersona, NotificationPreferences};
 use mh_store::{StoreError, settings::AppPreferences};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -35,6 +35,29 @@ pub async fn export_settings(State(state): State<AppState>) -> ApiResult<Setting
         preferences,
         theme: None,
     }))
+}
+
+pub async fn notification_preferences(
+    State(state): State<AppState>,
+) -> ApiResult<NotificationPreferences> {
+    state
+        .switch
+        .store
+        .notification_preferences()
+        .map(Json)
+        .map_err(store_error)
+}
+
+pub async fn save_notification_preferences(
+    State(state): State<AppState>,
+    Json(prefs): Json<NotificationPreferences>,
+) -> ApiResult<NotificationPreferences> {
+    state
+        .switch
+        .store
+        .set_notification_preferences(prefs)
+        .map_err(store_error)?;
+    Ok(Json(prefs))
 }
 
 pub async fn import_settings(

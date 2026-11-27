@@ -1227,7 +1227,7 @@ pub(crate) fn has_google_cli_auth(profile: Option<&Path>, agy: bool) -> bool {
             ["antigravity-cli", "antigravity-acp"]
                 .iter()
                 .any(|dir| root.join(dir).join("antigravity-oauth-token").is_file())
-        }) || has_agy_keyring_entry();
+        }) || (profile.is_none() && has_agy_keyring_entry());
     }
     let home = profile_home(profile, "GEMINI_CLI_HOME", "");
     home.is_some_and(|root| root.join(".gemini/oauth_creds.json").is_file())
@@ -1279,6 +1279,9 @@ pub fn probe_installed_adapters(config: &AppConfig) -> Vec<AdapterProbeStatus> {
                     (true, true, _) => "Antigravity sign-in detected",
                     (true, false, _) => "Gemini CLI credentials detected",
                     (_, _, true) => "Gemini API key detected",
+                    (false, true, _) if profile.is_some() && has_agy_keyring_entry() => {
+                        "Shared Windows credentials found. Separate profile sign-in is unverified."
+                    }
                     _ => "CLI sign-in status unavailable",
                 };
                 (signed_in || has_key, hint)

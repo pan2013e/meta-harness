@@ -4,6 +4,7 @@ pub mod dag;
 pub mod domain;
 pub mod error;
 pub mod mention;
+pub mod outbound_proxy;
 pub mod paths;
 pub mod skills;
 pub mod tokens;
